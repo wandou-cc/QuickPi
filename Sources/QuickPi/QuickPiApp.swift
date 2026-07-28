@@ -3,6 +3,8 @@ import Carbon
 import Sparkle
 import SwiftUI
 
+private let panelMinimumWidth: CGFloat = 520
+
 private let hotKeyHandler: EventHandlerUPP = { _, _, userData in
     guard let userData else {
         return OSStatus(eventNotHandledErr)
@@ -107,10 +109,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         userDriverDelegate: nil
     )
     private var panel: QuickPanel?
+    private var settingsWindow: NSWindow?
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
     private var shortcut: GlobalShortcut?
     private var state: AppState?
+    private var resultContentHeight: CGFloat = 441
 
     // Creates the menu-bar app, native panel, global shortcut, and managed Pi runtime.
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -130,10 +134,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 applicationSupportDirectory: baseDirectory.appendingPathComponent("Quick Pi", isDirectory: true),
                 checkForUpdates: { [unowned self] in
                     self.updaterController.checkForUpdates(nil)
+                },
+                presentSettings: { [unowned self] in
+                    self.showSettings()
                 }
             )
             state = appState
             createPanel(state: appState)
+            createSettingsWindow(state: appState)
             createStatusItem()
             shortcut = try GlobalShortcut { [weak self] in
                 self?.togglePanel()
@@ -151,9 +159,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 try shortcut?.register(appState.settings.shortcut)
             } catch {
                 appState.shortcutError = error.localizedDescription
-                appState.settingsPresented = true
             }
             showPanel()
+            if appState.shortcutError != nil {
+                showSettings()
+            }
             Task { await appState.start() }
         } catch {
             presentFatalError(error.localizedDescription)
@@ -169,6 +179,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
         return false
+    }
+
+    // Preserves only user-driven result height changes while streamed events continue updating the panel.
+    func windowDidResize(_ notification: Notification) {
+        guard let panel,
+              let state,
+              let resizedWindow = notification.object as? NSWindow,
+              resizedWindow === panel,
+              panel.inLiveResize,
+              state.showsResultPanel else {
+            return
+        }
+        let inputHeight: CGFloat = state.attachments.isEmpty ? 102 : 140
+        resultContentHeight = panel.contentLayoutRect.height - inputHeight
     }
 
     // Installs standard text actions so every native text field supports normal shortcuts.
@@ -193,8 +217,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Hosts the compact SwiftUI launcher in a borderless floating AppKit panel.
     private func createPanel(state: AppState) {
         let panel = QuickPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 64),
-            styleMask: [.borderless],
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 102),
+            styleMask: [.borderless, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -206,9 +230,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
+        panel.contentMinSize = NSSize(width: panelMinimumWidth, height: 102)
         panel.delegate = self
         panel.contentView = NSHostingView(rootView: ChatView(state: state))
         self.panel = panel
+    }
+
+    // Hosts settings in a titled standalone window so it remains draggable and non-modal.
+    private func createSettingsWindow(state: AppState) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 600),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "设置"
+        window.titleVisibility = .hidden
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.tabbingMode = .disallowed
+        window.contentView = NSHostingView(
+            rootView: SettingsView(state: state) { [unowned window] in
+                window.close()
+            }
+        )
+        window.center()
+        settingsWindow = window
     }
 
     // Creates a left-click launcher and a right-click application menu.
@@ -257,8 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // Opens settings from the menu-bar command.
     @objc private func openSettings() {
-        showPanel()
-        state?.settingsPresented = true
+        showSettings()
     }
 
     // Opens Sparkle's standard user-initiated update flow.
@@ -288,12 +335,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NotificationCenter.default.post(name: .quickPiFocusInput, object: nil)
     }
 
+    // Activates and focuses the independent settings window without changing the launcher.
+    private func showSettings() {
+        guard let settingsWindow else {
+            preconditionFailure("设置窗口必须在打开前创建")
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow.makeKeyAndOrderFront(nil)
+    }
+
     // Expands results downward while keeping the input bar's top edge stationary.
     private func updatePanelSize() {
         guard let panel, let state else {
             return
         }
-        let targetHeight: CGFloat = state.showsResultPanel ? 505 : 64
+        let inputHeight: CGFloat = state.attachments.isEmpty ? 102 : 140
+        let targetHeight: CGFloat
+        if state.showsResultPanel {
+            panel.contentMinSize = NSSize(width: panelMinimumWidth, height: inputHeight + 241)
+            targetHeight = inputHeight + resultContentHeight
+        } else {
+            panel.contentMinSize = NSSize(width: panelMinimumWidth, height: inputHeight)
+            targetHeight = inputHeight
+        }
         guard panel.frame.height != targetHeight else {
             return
         }

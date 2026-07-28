@@ -15,6 +15,8 @@ enum PiRuntimeEvent {
     case authEvent(AuthEvent)
     case authCompleted(String)
     case logoutCompleted(String)
+    case extensionNotice(String)
+    case extensionPrompt(ExtensionPrompt)
     case operationFailed(String)
     case runtimeExited(String)
 }
@@ -33,6 +35,7 @@ final class PiRuntime {
         let images: [ImagePayload]?
         let provider: String?
         let modelId: String?
+        let sessionPath: String?
 
         // Builds one command from the fields defined by Pi's RPC protocol.
         init(
@@ -41,7 +44,8 @@ final class PiRuntime {
             message: String? = nil,
             images: [ImagePayload]? = nil,
             provider: String? = nil,
-            modelId: String? = nil
+            modelId: String? = nil,
+            sessionPath: String? = nil
         ) {
             self.id = id
             self.type = type
@@ -49,6 +53,7 @@ final class PiRuntime {
             self.images = images
             self.provider = provider
             self.modelId = modelId
+            self.sessionPath = sessionPath
         }
     }
 
@@ -56,6 +61,7 @@ final class PiRuntime {
         let type = "extension_ui_response"
         let id: String
         let value: String?
+        let confirmed: Bool?
         let cancelled: Bool?
     }
 
@@ -103,6 +109,7 @@ final class PiRuntime {
             let model: String?
             let usage: Usage?
             let stopReason: String?
+            let errorMessage: String?
         }
 
         let message: Message
@@ -151,6 +158,9 @@ final class PiRuntime {
         let method: String
         let message: String?
         let title: String?
+        let placeholder: String?
+        let options: [String]?
+        let prefill: String?
     }
 
     private struct ExtensionPayload: Decodable {
@@ -184,62 +194,10 @@ final class PiRuntime {
 
         let kind: String
         let snapshot: RuntimeSnapshot?
+        let sessionSnapshot: SessionSnapshot?
         let event: WireAuthEvent?
         let prompt: WirePrompt?
         let providerId: String?
-    }
-
-    private enum JSONValue: Codable {
-        case object([String: JSONValue])
-        case array([JSONValue])
-        case string(String)
-        case integer(Int)
-        case number(Double)
-        case boolean(Bool)
-        case null
-
-        // Decodes the arbitrary JSON value used for tool arguments.
-        init(from decoder: Decoder) throws {
-            let container = try decoder.singleValueContainer()
-            if container.decodeNil() {
-                self = .null
-            } else if let value = try? container.decode([String: JSONValue].self) {
-                self = .object(value)
-            } else if let value = try? container.decode([JSONValue].self) {
-                self = .array(value)
-            } else if let value = try? container.decode(String.self) {
-                self = .string(value)
-            } else if let value = try? container.decode(Int.self) {
-                self = .integer(value)
-            } else if let value = try? container.decode(Double.self) {
-                self = .number(value)
-            } else if let value = try? container.decode(Bool.self) {
-                self = .boolean(value)
-            } else {
-                throw DecodingError.dataCorruptedError(in: container, debugDescription: "未知 JSON 值")
-            }
-        }
-
-        // Encodes tool arguments for stable, readable display in the result panel.
-        func encode(to encoder: Encoder) throws {
-            var container = encoder.singleValueContainer()
-            switch self {
-            case .object(let value):
-                try container.encode(value)
-            case .array(let value):
-                try container.encode(value)
-            case .string(let value):
-                try container.encode(value)
-            case .integer(let value):
-                try container.encode(value)
-            case .number(let value):
-                try container.encode(value)
-            case .boolean(let value):
-                try container.encode(value)
-            case .null:
-                try container.encodeNil()
-            }
-        }
     }
 
     private let applicationSupportDirectory: URL
@@ -253,6 +211,8 @@ final class PiRuntime {
     private var errorOutput: [String] = []
     private var commandContinuations: [String: CheckedContinuation<Void, Error>] = [:]
     private var snapshotContinuation: CheckedContinuation<RuntimeSnapshot, Error>?
+    private var sessionSnapshotContinuation: CheckedContinuation<SessionSnapshot, Error>?
+    private var deleteSessionsContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var logoutContinuation: CheckedContinuation<String, Error>?
 
     var onEvent: ((PiRuntimeEvent) -> Void)?
@@ -272,13 +232,27 @@ final class PiRuntime {
             throw QuickPiError.message("应用内的 Pi 运行文件不完整")
         }
 
+        let currentDirectoryURL: URL
+        if let workspaceURL = settings.workspaceURL {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(
+                atPath: workspaceURL.path,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue else {
+                throw QuickPiError.message("工作区不存在或已不再是目录：\(workspaceURL.path)")
+            }
+            currentDirectoryURL = workspaceURL
+        } else {
+            currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        }
+
         let runId = UUID()
         let nextProcess = Process()
         let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
         nextProcess.executableURL = piURL
-        nextProcess.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        nextProcess.currentDirectoryURL = currentDirectoryURL
         nextProcess.arguments = arguments(settings: settings, extensionURL: extensionURL)
         nextProcess.standardInput = inputPipe
         nextProcess.standardOutput = outputPipe
@@ -363,6 +337,22 @@ final class PiRuntime {
         }
     }
 
+    // Reads the saved sessions and active branch for the process working directory.
+    func sessionSnapshot() async throws -> SessionSnapshot {
+        guard sessionSnapshotContinuation == nil else {
+            throw QuickPiError.message("会话状态正在读取")
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            sessionSnapshotContinuation = continuation
+            do {
+                try sendWithoutResponse(type: "prompt", message: "/quick-session-snapshot")
+            } catch {
+                sessionSnapshotContinuation = nil
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
     // Selects the exact Provider and model persisted by the native app.
     func selectModel(_ selection: ModelSelection) async throws {
         try await sendCommand(
@@ -401,16 +391,32 @@ final class PiRuntime {
         let response = ExtensionUIResponse(
             id: requestId,
             value: value,
+            confirmed: nil,
             cancelled: value == nil ? true : nil
         )
         try write(response)
     }
 
-    // Prefixes user content so a leading slash cannot enter Pi's extension-command namespace.
+    // Returns one native response to an interactive prompt opened by a loaded extension.
+    func respondToExtensionPrompt(
+        requestId: String,
+        value: String? = nil,
+        confirmed: Bool? = nil,
+        cancelled: Bool? = nil
+    ) throws {
+        try write(ExtensionUIResponse(
+            id: requestId,
+            value: value,
+            confirmed: confirmed,
+            cancelled: cancelled
+        ))
+    }
+
+    // Sends registered slash commands unchanged while keeping normal questions outside that namespace.
     func prompt(message: String, images: [ImagePayload]) async throws {
         try await sendCommand(
             type: "prompt",
-            message: "User request:\n\(message)",
+            message: message,
             images: images
         )
     }
@@ -425,32 +431,47 @@ final class PiRuntime {
         try await sendCommand(type: "new_session")
     }
 
-    // Builds Pi's command line from the two permissions explicitly stored by the user.
+    // Loads one session selected from the current working-directory snapshot.
+    func switchSession(path: String) async throws {
+        try await sendCommand(type: "switch_session", sessionPath: path)
+    }
+
+    // Replaces the active session, removes every older Pi session, and returns the new state.
+    func deleteAllSessions() async throws -> SessionSnapshot {
+        guard deleteSessionsContinuation == nil else {
+            throw QuickPiError.message("会话正在删除")
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            deleteSessionsContinuation = continuation
+            do {
+                try sendWithoutResponse(type: "prompt", message: "/quick-delete-all-sessions")
+            } catch {
+                deleteSessionsContinuation = nil
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    // Enables Pi's native tools and resource discovery in the selected working directory.
     private func arguments(settings: AppSettings, extensionURL: URL) -> [String] {
         var values = [
             "--mode", "rpc",
-            "--no-session",
-            "--no-extensions",
+            "--continue",
             "--extension", extensionURL.path,
-            "--no-skills",
-            "--no-prompt-templates",
-            "--no-themes",
-            "--no-context-files",
             "--offline",
-            "--system-prompt",
-            "You are a concise, accurate general-purpose assistant. Answer in the user's language and use Markdown when it improves clarity.",
         ]
-        var tools: [String] = []
-        if settings.terminalAccess {
-            tools.append("bash")
-        }
-        if settings.fileSystemAccess {
-            tools.append(contentsOf: ["read", "edit", "write", "grep", "find", "ls"])
-        }
-        if tools.isEmpty {
-            values.append("--no-tools")
+        if settings.workspacePath != nil {
+            values.append(contentsOf: [
+                "--approve",
+                "--append-system-prompt",
+                "The user selected the current working directory as the project workspace. Inspect the project before editing, keep file operations inside this workspace unless the user explicitly asks otherwise, and answer in the user's language.",
+            ])
         } else {
-            values.append(contentsOf: ["--tools", tools.joined(separator: ",")])
+            values.append(contentsOf: [
+                "--no-context-files",
+                "--system-prompt",
+                "You are a concise, accurate general-purpose assistant. Answer in the user's language and use Markdown when it improves clarity.",
+            ])
         }
         return values
     }
@@ -461,7 +482,8 @@ final class PiRuntime {
         message: String? = nil,
         images: [ImagePayload]? = nil,
         provider: String? = nil,
-        modelId: String? = nil
+        modelId: String? = nil,
+        sessionPath: String? = nil
     ) async throws {
         let id = UUID().uuidString
         try await withCheckedThrowingContinuation { continuation in
@@ -473,7 +495,8 @@ final class PiRuntime {
                     message: message,
                     images: images,
                     provider: provider,
-                    modelId: modelId
+                    modelId: modelId,
+                    sessionPath: sessionPath
                 ))
             } catch {
                 commandContinuations[id] = nil
@@ -674,6 +697,12 @@ final class PiRuntime {
             ),
             stopReason: stopReason
         ))
+        if stopReason == "error" {
+            guard let errorMessage = message.errorMessage, !errorMessage.isEmpty else {
+                throw QuickPiError.message("Pi 助手错误消息缺少说明")
+            }
+            onEvent?(.turnFailed(message: errorMessage, aborted: false))
+        }
     }
 
     // Publishes a readable, stable representation of a tool call and its arguments.
@@ -721,36 +750,83 @@ final class PiRuntime {
         }.joined(separator: "\n")
     }
 
-    // Decodes extension notifications and authentication prompts owned by Quick Pi.
+    // Decodes Quick Pi control messages and public interaction requests from loaded extensions.
     private func consumeExtensionRequest(_ record: Data) throws {
         let envelope = try JSONDecoder().decode(ExtensionRequestEnvelope.self, from: record)
-        if envelope.method == "notify",
-           let message = envelope.message,
-           message.hasPrefix("quickpi:") {
-            let payload = try decodeExtensionPayload(String(message.dropFirst("quickpi:".count)))
-            try consumeExtensionPayload(payload)
+        if envelope.method == "notify" {
+            guard let message = envelope.message else {
+                throw QuickPiError.message("Pi 扩展通知缺少内容")
+            }
+            if message.hasPrefix("quickpi:") {
+                let payload = try decodeExtensionPayload(String(message.dropFirst("quickpi:".count)))
+                try consumeExtensionPayload(payload)
+            } else {
+                onEvent?(.extensionNotice(message))
+            }
             return
         }
         if envelope.method == "input" || envelope.method == "select" {
-            guard let requestId = envelope.id,
-                  let title = envelope.title,
-                  title.hasPrefix("quickpi:") else {
+            if let requestId = envelope.id,
+               let title = envelope.title,
+               title.hasPrefix("quickpi:") {
+                let payload = try decodeExtensionPayload(String(title.dropFirst("quickpi:".count)))
+                guard payload.kind == "authPrompt", let prompt = payload.prompt else {
+                    throw QuickPiError.message("Pi 登录提示无效")
+                }
+                let options: [AuthPrompt.Option]
+                if prompt.type == "select" {
+                    guard let promptOptions = prompt.options else {
+                        throw QuickPiError.message("Pi 登录选择提示缺少选项")
+                    }
+                    options = promptOptions.map {
+                        AuthPrompt.Option(id: $0.id, label: $0.label, description: $0.description)
+                    }
+                } else {
+                    options = []
+                }
+                onEvent?(.authPrompt(AuthPrompt(
+                    requestId: requestId,
+                    type: prompt.type,
+                    message: prompt.message,
+                    placeholder: prompt.placeholder,
+                    options: options
+                )))
                 return
             }
-            let payload = try decodeExtensionPayload(String(title.dropFirst("quickpi:".count)))
-            guard payload.kind == "authPrompt", let prompt = payload.prompt else {
-                throw QuickPiError.message("Pi 登录提示无效")
-            }
-            onEvent?(.authPrompt(AuthPrompt(
-                requestId: requestId,
-                type: prompt.type,
-                message: prompt.message,
-                placeholder: prompt.placeholder,
-                options: (prompt.options ?? []).map {
-                    AuthPrompt.Option(id: $0.id, label: $0.label, description: $0.description)
-                }
-            )))
         }
+
+        guard ["input", "select", "confirm", "editor"].contains(envelope.method) else {
+            return
+        }
+        guard let requestId = envelope.id, let title = envelope.title else {
+            throw QuickPiError.message("Pi 扩展交互请求不完整")
+        }
+        let options: [String]
+        switch envelope.method {
+        case "input", "editor":
+            options = []
+        case "select":
+            guard let requestOptions = envelope.options else {
+                throw QuickPiError.message("Pi 扩展选择提示缺少选项")
+            }
+            options = requestOptions
+        case "confirm":
+            guard envelope.message != nil else {
+                throw QuickPiError.message("Pi 扩展确认提示缺少说明")
+            }
+            options = []
+        default:
+            return
+        }
+        onEvent?(.extensionPrompt(ExtensionPrompt(
+            requestId: requestId,
+            method: envelope.method,
+            title: title,
+            message: envelope.message,
+            placeholder: envelope.placeholder,
+            options: options,
+            prefill: envelope.prefill
+        )))
     }
 
     // Decodes one JSON payload sent through the extension notification prefix.
@@ -766,6 +842,18 @@ final class PiRuntime {
                 throw QuickPiError.message("Pi Provider 状态响应无效")
             }
             snapshotContinuation = nil
+            continuation.resume(returning: snapshot)
+        case "sessionSnapshot":
+            guard let snapshot = payload.sessionSnapshot, let continuation = sessionSnapshotContinuation else {
+                throw QuickPiError.message("Pi 会话状态响应无效")
+            }
+            sessionSnapshotContinuation = nil
+            continuation.resume(returning: snapshot)
+        case "sessionsDeleted":
+            guard let snapshot = payload.sessionSnapshot, let continuation = deleteSessionsContinuation else {
+                throw QuickPiError.message("Pi 会话删除响应无效")
+            }
+            deleteSessionsContinuation = nil
             continuation.resume(returning: snapshot)
         case "authEvent":
             guard let event = payload.event else {
@@ -826,6 +914,14 @@ final class PiRuntime {
             snapshotContinuation = nil
             continuation.resume(throwing: error)
         }
+        if let continuation = sessionSnapshotContinuation {
+            sessionSnapshotContinuation = nil
+            continuation.resume(throwing: error)
+        }
+        if let continuation = deleteSessionsContinuation {
+            deleteSessionsContinuation = nil
+            continuation.resume(throwing: error)
+        }
         if let continuation = logoutContinuation {
             logoutContinuation = nil
             continuation.resume(throwing: error)
@@ -841,6 +937,14 @@ final class PiRuntime {
         commandContinuations.removeAll()
         if let continuation = snapshotContinuation {
             snapshotContinuation = nil
+            continuation.resume(throwing: error)
+        }
+        if let continuation = sessionSnapshotContinuation {
+            sessionSnapshotContinuation = nil
+            continuation.resume(throwing: error)
+        }
+        if let continuation = deleteSessionsContinuation {
+            deleteSessionsContinuation = nil
             continuation.resume(throwing: error)
         }
         if let continuation = logoutContinuation {

@@ -18,7 +18,7 @@ enum ProviderKind: String, Codable, CaseIterable, Identifiable {
     var piAPI: String {
         switch self {
         case .openAI:
-            "openai-completions"
+            "openai-responses"
         case .claudeCode:
             "anthropic-messages"
         }
@@ -49,16 +49,22 @@ struct ProviderConfiguration: Codable, Equatable, Identifiable {
 struct AppSettings: Codable, Equatable {
     var shortcut: String
     var launchAtLogin: Bool
-    var terminalAccess: Bool
-    var fileSystemAccess: Bool
+    var workspacePath: String?
     var selectedModel: ModelSelection?
     var providers: [ProviderConfiguration]
+
+    // Converts the persisted project root into the directory URL used by the native picker and Pi.
+    var workspaceURL: URL? {
+        guard let workspacePath else {
+            return nil
+        }
+        return URL(fileURLWithPath: workspacePath, isDirectory: true)
+    }
 
     static let defaults = AppSettings(
         shortcut: "commandShiftSpace",
         launchAtLogin: false,
-        terminalAccess: false,
-        fileSystemAccess: false,
+        workspacePath: nil,
         selectedModel: nil,
         providers: []
     )
@@ -91,6 +97,141 @@ struct ModelOption: Codable, Identifiable, Equatable {
 struct RuntimeSnapshot: Codable, Equatable {
     let providers: [ProviderStatus]
     let models: [ModelOption]
+    let commands: [SlashCommand]
+}
+
+struct SlashCommand: Codable, Equatable {
+    enum Source: String, Codable {
+        case `extension`
+        case prompt
+        case skill
+    }
+
+    let name: String
+    let source: Source
+}
+
+enum JSONValue: Codable, Equatable {
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case string(String)
+    case integer(Int)
+    case number(Double)
+    case boolean(Bool)
+    case null
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode([String: JSONValue].self) {
+            self = .object(value)
+        } else if let value = try? container.decode([JSONValue].self) {
+            self = .array(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode(Int.self) {
+            self = .integer(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(Bool.self) {
+            self = .boolean(value)
+        } else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "未知 JSON 值")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .object(let value):
+            try container.encode(value)
+        case .array(let value):
+            try container.encode(value)
+        case .string(let value):
+            try container.encode(value)
+        case .integer(let value):
+            try container.encode(value)
+        case .number(let value):
+            try container.encode(value)
+        case .boolean(let value):
+            try container.encode(value)
+        case .null:
+            try container.encodeNil()
+        }
+    }
+}
+
+struct ConversationSession: Codable, Equatable, Identifiable {
+    let path: String
+    let id: String
+    let cwd: String
+    let name: String?
+    let created: Double
+    let modified: Double
+    let messageCount: Int
+    let firstMessage: String
+
+    var title: String {
+        let explicitName = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !explicitName.isEmpty {
+            return explicitName
+        }
+        let firstLine = firstMessage
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: { $0.isNewline })
+            .first
+            .map(String.init) ?? ""
+        return firstLine.isEmpty ? "新会话" : firstLine
+    }
+
+    var modifiedAt: Date {
+        Date(timeIntervalSince1970: modified / 1_000)
+    }
+}
+
+struct SessionSnapshot: Codable, Equatable {
+    let cwd: String
+    let activeSessionPath: String
+    let activeSessionId: String
+    let sessions: [ConversationSession]
+    let messages: [SavedSessionMessage]
+}
+
+struct SavedSessionMessage: Codable, Equatable {
+    enum Role: String, Codable {
+        case user
+        case assistant
+        case toolResult
+    }
+
+    let role: Role
+    let timestamp: Double
+    let text: String?
+    let content: [SavedAssistantContent]?
+    let provider: String?
+    let model: String?
+    let usage: PiUsage?
+    let stopReason: String?
+    let errorMessage: String?
+    let toolCallId: String?
+    let toolName: String?
+    let isError: Bool?
+}
+
+struct SavedAssistantContent: Codable, Equatable {
+    enum Kind: String, Codable {
+        case text
+        case thinking
+        case toolCall
+    }
+
+    let type: Kind
+    let text: String?
+    let thinking: String?
+    let toolCallId: String?
+    let toolName: String?
+    let arguments: JSONValue?
 }
 
 struct ImagePayload: Encodable, Equatable {
@@ -113,6 +254,7 @@ struct PendingAttachment: Identifiable, Equatable {
 struct SubmittedQuestion: Equatable {
     let text: String
     let attachmentNames: [String]
+    let workspacePath: String?
 }
 
 enum AnswerStatus: Equatable {
@@ -169,7 +311,8 @@ struct AnswerUsage: Equatable {
     }
 }
 
-struct AnswerSession: Equatable {
+struct AnswerSession: Identifiable, Equatable {
+    let id: UUID = UUID()
     let question: SubmittedQuestion
     let startedAt: Date
     var sections: [AnswerSection]
@@ -191,7 +334,7 @@ struct AnswerSession: Equatable {
     }
 }
 
-struct PiUsage: Equatable {
+struct PiUsage: Codable, Equatable {
     let input: Int
     let output: Int
     let cacheRead: Int
@@ -243,6 +386,16 @@ struct AuthSession: Equatable {
     var event: AuthEvent?
     var prompt: AuthPrompt?
     var error: String?
+}
+
+struct ExtensionPrompt: Equatable {
+    let requestId: String
+    let method: String
+    let title: String
+    let message: String?
+    let placeholder: String?
+    let options: [String]
+    let prefill: String?
 }
 
 struct ModelCatalogResponse: Decodable {

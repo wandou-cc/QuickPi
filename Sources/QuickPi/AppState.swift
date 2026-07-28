@@ -7,19 +7,26 @@ final class AppState: ObservableObject {
     @Published private(set) var settings: AppSettings
     @Published private(set) var builtInProviders: [ProviderStatus] = []
     @Published private(set) var builtInModels: [ModelOption] = []
+    @Published private(set) var slashCommands: [SlashCommand] = []
     @Published private(set) var runtimeReady = false
     @Published private(set) var runtimeStarting = false
+    @Published private(set) var sessions: [ConversationSession] = []
+    @Published private(set) var activeSessionID: String?
+    @Published private(set) var sessionChanging = false
+    @Published private(set) var previousAnswers: [AnswerSession] = []
     @Published private(set) var answer: AnswerSession?
+    @Published private(set) var resultPresented = false
     @Published var draft = ""
     @Published var attachments: [PendingAttachment] = []
     @Published var runtimeError: String?
     @Published var shortcutError: String?
-    @Published var settingsPresented = false
     @Published var authSession: AuthSession?
+    @Published private(set) var extensionPrompt: ExtensionPrompt?
 
     private let store: ConfigurationStore
     private let runtime: PiRuntime
     let checkForUpdates: () -> Void
+    let presentSettings: () -> Void
     private var runtimeGeneration = 0
     private var answerGeneration = 0
 
@@ -69,16 +76,45 @@ final class AppState: ObservableObject {
         answer?.status == .waiting || answer?.status == .running
     }
 
-    var showsResultPanel: Bool {
-        answer != nil || runtimeError != nil
+    var conversationAnswers: [AnswerSession] {
+        previousAnswers + (answer.map { [$0] } ?? [])
     }
 
-    // Loads the only business settings document and binds the managed Pi process events.
-    init(applicationSupportDirectory: URL, checkForUpdates: @escaping () -> Void) throws {
+    var activeSession: ConversationSession? {
+        guard let activeSessionID else {
+            return nil
+        }
+        return sessions.first { $0.id == activeSessionID }
+    }
+
+    var scopeTitle: String {
+        settings.workspaceURL?.lastPathComponent ?? "主目录"
+    }
+
+    func title(for session: ConversationSession) -> String {
+        if session.id == activeSessionID,
+           session.firstMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let question = conversationAnswers.first?.question.text {
+            return question
+        }
+        return session.title
+    }
+
+    var showsResultPanel: Bool {
+        runtimeError != nil || (resultPresented && !conversationAnswers.isEmpty)
+    }
+
+    // Loads the settings document and binds desktop actions plus managed Pi process events.
+    init(
+        applicationSupportDirectory: URL,
+        checkForUpdates: @escaping () -> Void,
+        presentSettings: @escaping () -> Void
+    ) throws {
         store = ConfigurationStore(applicationSupportDirectory: applicationSupportDirectory)
         settings = try store.load()
         runtime = PiRuntime(applicationSupportDirectory: applicationSupportDirectory)
         self.checkForUpdates = checkForUpdates
+        self.presentSettings = presentSettings
         runtime.onEvent = { [weak self] event in
             self?.consume(event)
         }
@@ -148,6 +184,44 @@ final class AppState: ObservableObject {
     // Removes one attachment before the question is submitted.
     func removeAttachment(id: UUID) {
         attachments.removeAll { $0.id == id }
+        notifyPanel()
+    }
+
+    // Persists the explicitly selected project root and restarts Pi in that directory.
+    func setWorkspace(_ url: URL?) {
+        guard !isAnswering else {
+            runtimeError = "回答期间不能切换工作区"
+            notifyPanel()
+            return
+        }
+        guard !sessionChanging else {
+            runtimeError = "会话切换期间不能切换工作区"
+            notifyPanel()
+            return
+        }
+
+        do {
+            var next = settings
+            if let url {
+                let workspaceURL = url.standardizedFileURL.resolvingSymlinksInPath()
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(
+                    atPath: workspaceURL.path,
+                    isDirectory: &isDirectory
+                ), isDirectory.boolValue else {
+                    throw QuickPiError.message("所选工作区不是有效目录")
+                }
+                next.workspacePath = workspaceURL.path
+            } else {
+                next.workspacePath = nil
+            }
+            settings = try store.save(next)
+            runtimeError = nil
+            scheduleRuntimeRestart()
+        } catch {
+            runtimeError = error.localizedDescription
+            notifyPanel()
+        }
     }
 
     // Creates one visible answer session and submits its text, documents, and images to Pi.
@@ -163,8 +237,20 @@ final class AppState: ObservableObject {
             notifyPanel()
             return
         }
-        guard let model = selectedModel else {
-            settingsPresented = true
+        guard !sessionChanging else {
+            runtimeError = "会话正在切换"
+            notifyPanel()
+            return
+        }
+        let commandName = question.hasPrefix("/")
+            ? question.dropFirst().split(separator: " ", maxSplits: 1).first.map(String.init)
+            : nil
+        let isExtensionCommand = slashCommands.contains {
+            $0.source == .extension && $0.name == commandName
+        }
+        let model = selectedModel
+        guard isExtensionCommand || model != nil else {
+            presentSettings()
             runtimeError = "请先配置 Provider 并选择模型"
             notifyPanel()
             return
@@ -179,7 +265,7 @@ final class AppState: ObservableObject {
             }
             return nil
         }
-        guard images.isEmpty || model.supportsImages else {
+        if let model, !images.isEmpty && !model.supportsImages {
             runtimeError = "\(model.name) 不支持图片输入"
             notifyPanel()
             return
@@ -197,11 +283,19 @@ final class AppState: ObservableObject {
 
         answerGeneration += 1
         let generation = answerGeneration
+        if let answer {
+            previousAnswers.append(answer)
+        }
         draft = ""
         attachments = []
         runtimeError = nil
+        resultPresented = true
         answer = AnswerSession(
-            question: SubmittedQuestion(text: question, attachmentNames: attachmentNames),
+            question: SubmittedQuestion(
+                text: question,
+                attachmentNames: attachmentNames,
+                workspacePath: settings.workspacePath
+            ),
             startedAt: Date(),
             sections: [],
             status: .waiting
@@ -209,11 +303,29 @@ final class AppState: ObservableObject {
         notifyPanel()
 
         do {
-            try await runtime.newSession()
+            try await runtime.prompt(message: prompt, images: images)
             guard generation == answerGeneration else {
                 return
             }
-            try await runtime.prompt(message: prompt, images: images)
+            if isExtensionCommand {
+                let snapshot = try await runtime.snapshot()
+                guard generation == answerGeneration else {
+                    return
+                }
+                let customIds = Set(settings.providers.map(\.id))
+                builtInProviders = snapshot.providers.filter { !customIds.contains($0.id) }
+                builtInModels = snapshot.models.filter { !customIds.contains($0.providerId) }
+                slashCommands = snapshot.commands
+                if answer?.status == .waiting {
+                    if answer?.sections.isEmpty == true {
+                        appendText("命令已执行")
+                    }
+                    if answer?.error == nil {
+                        answer?.status = .completed
+                    }
+                }
+                notifyPanel()
+            }
         } catch {
             guard generation == answerGeneration else {
                 return
@@ -229,6 +341,10 @@ final class AppState: ObservableObject {
         answerGeneration += 1
         let generation = answerGeneration
         do {
+            if let prompt = extensionPrompt {
+                try runtime.respondToExtensionPrompt(requestId: prompt.requestId, cancelled: true)
+                extensionPrompt = nil
+            }
             try await runtime.abort()
             guard generation == answerGeneration else {
                 return
@@ -245,18 +361,22 @@ final class AppState: ObservableObject {
         notifyPanel()
     }
 
-    // Clears the visible result after stopping an active turn; every new question creates its own session.
+    // Hides the result while retaining the active session and its complete conversation.
     func clearAnswer() async {
         answerGeneration += 1
         let generation = answerGeneration
         do {
+            if let prompt = extensionPrompt {
+                try runtime.respondToExtensionPrompt(requestId: prompt.requestId, cancelled: true)
+                extensionPrompt = nil
+            }
             if isAnswering {
                 try await runtime.abort()
             }
             guard generation == answerGeneration else {
                 return
             }
-            answer = nil
+            resultPresented = false
             runtimeError = nil
         } catch {
             guard generation == answerGeneration else {
@@ -267,16 +387,94 @@ final class AppState: ObservableObject {
         notifyPanel()
     }
 
-    // Saves general settings and restarts Pi only when tool permissions changed.
+    // Creates a persistent empty session in the current main-directory or workspace scope.
+    func createSession() async {
+        guard runtimeReady, !isAnswering, !sessionChanging else {
+            return
+        }
+        sessionChanging = true
+        runtimeError = nil
+        let previousSessionID = activeSessionID
+        notifyPanel()
+        do {
+            try await runtime.newSession()
+            let snapshot = try await runtime.sessionSnapshot()
+            guard snapshot.activeSessionId != previousSessionID else {
+                throw QuickPiError.message("Pi 没有创建新会话")
+            }
+            try applySessionSnapshot(snapshot)
+            resultPresented = false
+        } catch {
+            sessionChanging = false
+            scheduleRuntimeRestart(reporting: error.localizedDescription)
+            return
+        }
+        sessionChanging = false
+        notifyPanel()
+    }
+
+    // Switches only to a session returned for the active working-directory scope.
+    func switchSession(id: String) async {
+        guard runtimeReady, !isAnswering, !sessionChanging else {
+            return
+        }
+        guard id != activeSessionID else {
+            return
+        }
+        guard let target = sessions.first(where: { $0.id == id }) else {
+            runtimeError = "所选会话不属于当前目录"
+            notifyPanel()
+            return
+        }
+        sessionChanging = true
+        runtimeError = nil
+        notifyPanel()
+        do {
+            try await runtime.switchSession(path: target.path)
+            let snapshot = try await runtime.sessionSnapshot()
+            guard snapshot.activeSessionId == target.id,
+                  snapshot.activeSessionPath == target.path else {
+                throw QuickPiError.message("Pi 切换后的会话与所选会话不一致")
+            }
+            try applySessionSnapshot(snapshot)
+        } catch {
+            sessionChanging = false
+            scheduleRuntimeRestart(reporting: error.localizedDescription)
+            return
+        }
+        sessionChanging = false
+        notifyPanel()
+    }
+
+    // Deletes normal and workspace sessions, leaving one new empty session in the current scope.
+    func deleteAllSessions() async {
+        guard runtimeReady, !isAnswering, !sessionChanging else {
+            return
+        }
+        sessionChanging = true
+        runtimeError = nil
+        notifyPanel()
+        do {
+            let snapshot = try await runtime.deleteAllSessions()
+            guard snapshot.sessions.count == 1 else {
+                throw QuickPiError.message("删除后当前目录仍存在旧会话")
+            }
+            try applySessionSnapshot(snapshot)
+            resultPresented = false
+        } catch {
+            sessionChanging = false
+            scheduleRuntimeRestart(reporting: error.localizedDescription)
+            return
+        }
+        sessionChanging = false
+        notifyPanel()
+    }
+
+    // Saves the desktop shortcut and login-item settings immediately.
     func saveDesktopSettings(
         shortcut: String,
-        launchAtLogin: Bool,
-        terminalAccess: Bool,
-        fileSystemAccess: Bool
+        launchAtLogin: Bool
     ) async throws {
-        guard !terminalAccess || fileSystemAccess else {
-            throw QuickPiError.message("终端权限必须同时开启文件系统权限")
-        }
         if shortcut != settings.shortcut {
             try applyShortcut?(shortcut)
             shortcutError = nil
@@ -289,18 +487,10 @@ final class AppState: ObservableObject {
             }
         }
 
-        let permissionsChanged = terminalAccess != settings.terminalAccess
-            || fileSystemAccess != settings.fileSystemAccess
         var next = settings
         next.shortcut = shortcut
         next.launchAtLogin = launchAtLogin
-        next.terminalAccess = terminalAccess
-        next.fileSystemAccess = fileSystemAccess
         settings = try store.save(next)
-
-        if permissionsChanged {
-            scheduleRuntimeRestart()
-        }
     }
 
     // Fetches a model catalog directly from the configured OpenAI or Anthropic-compatible endpoint.
@@ -450,6 +640,40 @@ final class AppState: ObservableObject {
         }
     }
 
+    // Returns a value or confirmation to the extension request shown by the native UI.
+    func respondToExtensionPrompt(value: String? = nil, confirmed: Bool? = nil) {
+        guard let prompt = extensionPrompt else {
+            return
+        }
+        do {
+            try runtime.respondToExtensionPrompt(
+                requestId: prompt.requestId,
+                value: value,
+                confirmed: confirmed
+            )
+            extensionPrompt = nil
+        } catch {
+            answer?.status = .failed
+            answer?.error = error.localizedDescription
+        }
+        notifyPanel()
+    }
+
+    // Cancels the current extension interaction so its command handler can finish.
+    func cancelExtensionPrompt() {
+        guard let prompt = extensionPrompt else {
+            return
+        }
+        do {
+            try runtime.respondToExtensionPrompt(requestId: prompt.requestId, cancelled: true)
+            extensionPrompt = nil
+        } catch {
+            answer?.status = .failed
+            answer?.error = error.localizedDescription
+        }
+        notifyPanel()
+    }
+
     // Cancels authentication by replacing the process that owns the pending prompt.
     func cancelAuth() {
         authSession = nil
@@ -497,6 +721,13 @@ final class AppState: ObservableObject {
         runtimeError = nil
         builtInProviders = []
         builtInModels = []
+        slashCommands = []
+        extensionPrompt = nil
+        sessions = []
+        activeSessionID = nil
+        previousAnswers = []
+        answer = nil
+        resultPresented = false
         notifyPanel()
 
         do {
@@ -526,6 +757,7 @@ final class AppState: ObservableObject {
                 let customIds = Set(settings.providers.map(\.id))
                 builtInProviders = snapshot.providers.filter { !customIds.contains($0.id) }
                 builtInModels = snapshot.models.filter { !customIds.contains($0.providerId) }
+                slashCommands = snapshot.commands
             } catch {
                 guard generation == runtimeGeneration else {
                     return
@@ -550,6 +782,11 @@ final class AppState: ObservableObject {
                     runtimeError = "已保存的模型不可用，请重新选择模型"
                 }
             }
+            let sessionSnapshot = try await runtime.sessionSnapshot()
+            guard generation == runtimeGeneration else {
+                return
+            }
+            try applySessionSnapshot(sessionSnapshot)
             runtimeReady = true
         } catch {
             guard generation == runtimeGeneration else {
@@ -564,19 +801,32 @@ final class AppState: ObservableObject {
     }
 
     // Invalidates earlier launches, stops their process, and starts Pi from the newest disk settings.
-    private func scheduleRuntimeRestart() {
+    private func scheduleRuntimeRestart(reporting message: String? = nil) {
         runtimeGeneration += 1
         runtimeReady = false
         runtimeStarting = true
+        extensionPrompt = nil
         if isAnswering {
             answerGeneration += 1
             answer?.status = .stopped
             answer?.retryMessage = nil
         }
+        sessions = []
+        activeSessionID = nil
+        previousAnswers = []
+        answer = nil
+        resultPresented = false
         runtime.stop()
         notifyPanel()
         let generation = runtimeGeneration
-        Task { await launchRuntime(generation: generation) }
+        Task {
+            await launchRuntime(generation: generation)
+            guard generation == runtimeGeneration, runtimeReady, let message else {
+                return
+            }
+            runtimeError = message
+            notifyPanel()
+        }
     }
 
     // Converts and validates the Base URL contract shared by synchronization and persistence.
@@ -594,11 +844,185 @@ final class AppState: ObservableObject {
         return url
     }
 
+    // Accepts session state only when every path belongs to the process working directory.
+    func applySessionSnapshot(_ snapshot: SessionSnapshot) throws {
+        let expectedCwd = (settings.workspaceURL ?? FileManager.default.homeDirectoryForCurrentUser)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        guard snapshot.cwd == expectedCwd else {
+            throw QuickPiError.message("Pi 会话目录与当前范围不一致")
+        }
+        guard snapshot.sessions.allSatisfy({ $0.cwd == expectedCwd }) else {
+            throw QuickPiError.message("会话列表包含其他目录的会话")
+        }
+        guard Set(snapshot.sessions.map(\.id)).count == snapshot.sessions.count,
+              Set(snapshot.sessions.map(\.path)).count == snapshot.sessions.count else {
+            throw QuickPiError.message("Pi 会话列表包含重复项")
+        }
+        guard snapshot.sessions.contains(where: {
+            $0.id == snapshot.activeSessionId && $0.path == snapshot.activeSessionPath
+        }) else {
+            throw QuickPiError.message("活动会话不在当前目录的会话列表中")
+        }
+
+        let answers = try restoredAnswers(from: snapshot.messages)
+        sessions = snapshot.sessions
+        activeSessionID = snapshot.activeSessionId
+        previousAnswers = answers
+        answer = nil
+        resultPresented = !previousAnswers.isEmpty
+    }
+
+    // Reconstructs visible turns from Pi's active branch without changing the saved context.
+    private func restoredAnswers(from messages: [SavedSessionMessage]) throws -> [AnswerSession] {
+        var answers: [AnswerSession] = []
+        var current: AnswerSession?
+
+        for message in messages {
+            switch message.role {
+            case .user:
+                guard let text = message.text else {
+                    throw QuickPiError.message("Pi 用户消息缺少文本")
+                }
+                if var answer = current {
+                    finishInterruptedAnswer(&answer)
+                    answers.append(answer)
+                }
+                current = AnswerSession(
+                    question: SubmittedQuestion(
+                        text: text,
+                        attachmentNames: [],
+                        workspacePath: settings.workspacePath
+                    ),
+                    startedAt: Date(timeIntervalSince1970: message.timestamp / 1_000),
+                    sections: [],
+                    status: .waiting
+                )
+            case .assistant:
+                guard var answer = current,
+                      let content = message.content,
+                      let provider = message.provider,
+                      let model = message.model,
+                      let usage = message.usage,
+                      let stopReason = message.stopReason else {
+                    throw QuickPiError.message("Pi 助手历史消息不完整")
+                }
+                for block in content {
+                    switch block.type {
+                    case .text:
+                        guard let text = block.text else {
+                            throw QuickPiError.message("Pi 助手历史文本缺少内容")
+                        }
+                        appendRestoredSection(.markdown(text), to: &answer)
+                    case .thinking:
+                        guard let thinking = block.thinking else {
+                            throw QuickPiError.message("Pi 助手历史思考缺少内容")
+                        }
+                        appendRestoredSection(.thinking(thinking), to: &answer)
+                    case .toolCall:
+                        guard let callId = block.toolCallId,
+                              let name = block.toolName,
+                              let arguments = block.arguments else {
+                            throw QuickPiError.message("Pi 历史工具调用不完整")
+                        }
+                        let encoder = JSONEncoder()
+                        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+                        answer.sections.append(AnswerSection(
+                            id: UUID(),
+                            content: .tool(ToolActivity(
+                                callId: callId,
+                                name: name,
+                                input: String(decoding: try encoder.encode(arguments), as: UTF8.self),
+                                output: "",
+                                status: .running
+                            ))
+                        ))
+                    }
+                }
+                answer.provider = provider
+                answer.model = model
+                answer.usage.add(usage)
+                answer.stopReason = stopReason
+                switch stopReason {
+                case "stop", "length":
+                    answer.status = .completed
+                    answer.error = nil
+                case "toolUse":
+                    answer.status = .running
+                    answer.error = nil
+                case "aborted":
+                    answer.status = .stopped
+                    answer.error = nil
+                case "error":
+                    guard let error = message.errorMessage, !error.isEmpty else {
+                        throw QuickPiError.message("Pi 助手历史错误缺少说明")
+                    }
+                    answer.status = .failed
+                    answer.error = error
+                default:
+                    throw QuickPiError.message("未知的 Pi 助手停止原因：\(stopReason)")
+                }
+                current = answer
+            case .toolResult:
+                guard var answer = current,
+                      let callId = message.toolCallId,
+                      let name = message.toolName,
+                      let output = message.text,
+                      let isError = message.isError,
+                      let index = answer.sections.firstIndex(where: { section in
+                          if case .tool(let tool) = section.content {
+                              return tool.callId == callId && tool.name == name
+                          }
+                          return false
+                      }), case .tool(var tool) = answer.sections[index].content else {
+                    throw QuickPiError.message("Pi 历史工具结果没有对应调用")
+                }
+                tool.output = output
+                tool.status = isError ? .failed : .completed
+                answer.sections[index].content = .tool(tool)
+                current = answer
+            }
+        }
+
+        if var answer = current {
+            finishInterruptedAnswer(&answer)
+            answers.append(answer)
+        }
+        return answers
+    }
+
+    // Merges adjacent restored text blocks to match the live streaming representation.
+    private func appendRestoredSection(_ content: AnswerSectionContent, to answer: inout AnswerSession) {
+        if let index = answer.sections.indices.last {
+            switch (answer.sections[index].content, content) {
+            case let (.markdown(existing), .markdown(text)):
+                answer.sections[index].content = .markdown(existing + text)
+                return
+            case let (.thinking(existing), .thinking(text)):
+                answer.sections[index].content = .thinking(existing + text)
+                return
+            default:
+                break
+            }
+        }
+        answer.sections.append(AnswerSection(id: UUID(), content: content))
+    }
+
+    // A persisted turn without a terminal assistant message was interrupted before restart.
+    private func finishInterruptedAnswer(_ answer: inout AnswerSession) {
+        if answer.status == .waiting || answer.status == .running {
+            answer.status = .stopped
+        }
+    }
+
     // Applies every Pi event to the current answer, authentication sheet, or runtime status.
     private func consume(_ event: PiRuntimeEvent) {
         switch event {
         case .agentStarted:
-            if answer?.status == .waiting || answer?.status == .running {
+            if answer?.status == .waiting
+                || answer?.status == .running
+                || answer?.status == .completed {
                 answer?.status = .running
                 answer?.retryMessage = nil
                 answer?.error = nil
@@ -649,6 +1073,12 @@ final class AppState: ObservableObject {
             scheduleRuntimeRestart()
         case .logoutCompleted:
             break
+        case .extensionNotice(let message):
+            if answer?.status == .waiting || answer?.status == .running {
+                appendText(message)
+            }
+        case .extensionPrompt(let prompt):
+            extensionPrompt = prompt
         case .operationFailed(let message):
             if authSession != nil {
                 authSession?.error = message
@@ -661,6 +1091,7 @@ final class AppState: ObservableObject {
         case .runtimeExited(let message):
             runtimeReady = false
             runtimeStarting = false
+            extensionPrompt = nil
             runtimeError = message
             if isAnswering {
                 answer?.status = .failed

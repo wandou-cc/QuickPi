@@ -1,5 +1,27 @@
 .build/
 .cache/
 release/
+.swiftpm/
 .DS_Store
 *.log
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+auth.json
+settings.json
+models.json
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+*.cer
+*.der
+*.mobileprovision
+
+# Xcode user data
+DerivedData/
+xcuserdata/
+*.xcuserstate

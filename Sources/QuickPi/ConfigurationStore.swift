@@ -9,6 +9,7 @@ final class ConfigurationStore {
         let name: String
         let baseUrl: String
         let api: String
+        let headers: [String: String]?
         let models: [PiModel]
     }
 
@@ -43,18 +44,11 @@ final class ConfigurationStore {
         guard FileManager.default.fileExists(atPath: settingsURL.path) else {
             return .defaults
         }
-        let settings = try JSONDecoder().decode(AppSettings.self, from: Data(contentsOf: settingsURL))
-        guard !settings.terminalAccess || settings.fileSystemAccess else {
-            throw QuickPiError.message("设置无效：终端权限必须同时开启文件系统权限")
-        }
-        return settings
+        return try JSONDecoder().decode(AppSettings.self, from: Data(contentsOf: settingsURL))
     }
 
     // Atomically replaces settings.json and then verifies it by decoding the stored bytes.
     func save(_ settings: AppSettings) throws -> AppSettings {
-        guard !settings.terminalAccess || settings.fileSystemAccess else {
-            throw QuickPiError.message("设置无效：终端权限必须同时开启文件系统权限")
-        }
         try createDirectories()
         let data = try Self.encoder.encode(settings)
         try data.write(to: settingsURL, options: .atomic)
@@ -74,6 +68,9 @@ final class ConfigurationStore {
                 name: provider.name,
                 baseUrl: provider.baseURL,
                 api: provider.kind.piAPI,
+                headers: provider.kind == .openAI
+                    ? ["User-Agent": "codex_cli_rs/0.145.0"]
+                    : nil,
                 models: provider.models.map { PiModel(id: $0, name: $0) }
             )
         }

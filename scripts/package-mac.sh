@@ -37,6 +37,7 @@ OUTPUT_DIRECTORY="$PROJECT_ROOT/release/native-$MACHINE_ARCH"
 APP_PATH="$OUTPUT_DIRECTORY/Quick Pi.app"
 CONTENTS_PATH="$APP_PATH/Contents"
 FRAMEWORKS_PATH="$CONTENTS_PATH/Frameworks"
+LICENSES_PATH="$CONTENTS_PATH/Resources/Licenses"
 ICONSET_PATH="$PROJECT_ROOT/.build/AppIcon.iconset"
 APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PROJECT_ROOT/resources/Info.plist")
 UPDATE_ARCHIVE_PATH="$OUTPUT_DIRECTORY/Quick-Pi-$APP_VERSION-$MACHINE_ARCH.zip"
@@ -80,6 +81,7 @@ mkdir -p \
   "$CONTENTS_PATH/MacOS" \
   "$CONTENTS_PATH/Resources/pi-runtime/theme" \
   "$FRAMEWORKS_PATH" \
+  "$LICENSES_PATH" \
   "$ICONSET_PATH"
 cp "$PROJECT_ROOT/.build/release/QuickPi" "$CONTENTS_PATH/MacOS/QuickPi"
 cp "$PROJECT_ROOT/resources/Info.plist" "$CONTENTS_PATH/Info.plist"
@@ -93,6 +95,9 @@ cp "$RUNTIME_DIRECTORY/photon_rs_bg.wasm" "$CONTENTS_PATH/Resources/pi-runtime/p
 cp "$RUNTIME_DIRECTORY/theme/dark.json" "$CONTENTS_PATH/Resources/pi-runtime/theme/dark.json"
 cp "$RUNTIME_DIRECTORY/theme/light.json" "$CONTENTS_PATH/Resources/pi-runtime/theme/light.json"
 cp "$RUNTIME_DIRECTORY/theme/theme-schema.json" "$CONTENTS_PATH/Resources/pi-runtime/theme/theme-schema.json"
+cp "$PROJECT_ROOT/LICENSE" "$CONTENTS_PATH/Resources/LICENSE.txt"
+cp "$PROJECT_ROOT/THIRD_PARTY_NOTICES.md" "$CONTENTS_PATH/Resources/THIRD_PARTY_NOTICES.md"
+ditto "$PROJECT_ROOT/licenses" "$LICENSES_PATH"
 if [ ! -d "$PROJECT_ROOT/.build/release/Sparkle.framework" ]; then
   echo "Swift build did not produce Sparkle.framework" >&2
   exit 1

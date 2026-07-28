@@ -1,5 +1,6 @@
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 const prefix = "quickpi:";
 
@@ -29,6 +30,159 @@ async function writeCredentials(directory, credentials) {
 // Sends one structured native-app event through Pi's public extension UI channel.
 function notify(ctx, payload) {
   ctx.ui.notify(`${prefix}${JSON.stringify(payload)}`, "info");
+}
+
+function normalizeUserText(text) {
+  const oldPrefix = "User request:\n";
+  return text.startsWith(oldPrefix) ? text.slice(oldPrefix.length) : text;
+}
+
+function textContent(content) {
+  if (typeof content === "string") {
+    return content;
+  }
+  return content.map((block) => {
+    if (block.type === "text") {
+      return block.text;
+    }
+    if (block.type === "image") {
+      return `[图片：${block.mimeType}]`;
+    }
+    throw new Error(`未知的消息内容类型: ${block.type}`);
+  }).join("\n");
+}
+
+function assistantContent(content) {
+  return content.map((block) => {
+    if (block.type === "text") {
+      return { type: "text", text: block.text };
+    }
+    if (block.type === "thinking") {
+      return { type: "thinking", thinking: block.thinking };
+    }
+    if (block.type === "toolCall") {
+      return {
+        type: "toolCall",
+        toolCallId: block.id,
+        toolName: block.name,
+        arguments: block.arguments,
+      };
+    }
+    throw new Error(`未知的助手内容类型: ${block.type}`);
+  });
+}
+
+function savedMessage(entry) {
+  if (entry.type !== "message") {
+    return undefined;
+  }
+  const message = entry.message;
+  if (message.role === "user") {
+    return {
+      role: "user",
+      timestamp: message.timestamp,
+      text: normalizeUserText(textContent(message.content)),
+    };
+  }
+  if (message.role === "assistant") {
+    return {
+      role: "assistant",
+      timestamp: message.timestamp,
+      content: assistantContent(message.content),
+      provider: message.provider,
+      model: message.model,
+      usage: {
+        input: message.usage.input,
+        output: message.usage.output,
+        cacheRead: message.usage.cacheRead,
+        cacheWrite: message.usage.cacheWrite,
+        cost: message.usage.cost.total,
+      },
+      stopReason: message.stopReason,
+      errorMessage: message.errorMessage,
+    };
+  }
+  if (message.role === "toolResult") {
+    return {
+      role: "toolResult",
+      timestamp: message.timestamp,
+      text: textContent(message.content),
+      toolCallId: message.toolCallId,
+      toolName: message.toolName,
+      isError: message.isError,
+    };
+  }
+  return undefined;
+}
+
+async function sessionSnapshot(ctx) {
+  const activeSessionPath = ctx.sessionManager.getSessionFile();
+  if (!activeSessionPath) {
+    throw new Error("当前会话没有持久化文件");
+  }
+  const activeSessionId = ctx.sessionManager.getSessionId();
+  const savedSessions = await SessionManager.list(ctx.cwd);
+  const savedActiveSession = savedSessions.find((session) => session.id === activeSessionId);
+  if (savedActiveSession && savedActiveSession.path !== activeSessionPath) {
+    throw new Error("当前会话路径与磁盘记录不一致");
+  }
+  let sessions = savedSessions;
+  if (!savedActiveSession) {
+    if (savedSessions.some((session) => session.path === activeSessionPath)) {
+      throw new Error("当前会话与磁盘会话冲突");
+    }
+    const header = ctx.sessionManager.getHeader();
+    if (!header || header.id !== activeSessionId || header.cwd !== ctx.cwd) {
+      throw new Error("当前会话元数据无效");
+    }
+    const entries = ctx.sessionManager.getEntries();
+    let firstMessage = "";
+    let messageCount = 0;
+    let modified = new Date(header.timestamp);
+    for (const entry of entries) {
+      if (entry.type !== "message") {
+        continue;
+      }
+      messageCount += 1;
+      const message = entry.message;
+      if (message.role === "user" || message.role === "assistant") {
+        modified = new Date(Math.max(modified.getTime(), message.timestamp));
+      }
+      if (!firstMessage && message.role === "user") {
+        firstMessage = normalizeUserText(textContent(message.content));
+      }
+    }
+    sessions = [{
+      path: activeSessionPath,
+      id: activeSessionId,
+      cwd: ctx.cwd,
+      name: ctx.sessionManager.getSessionName(),
+      created: new Date(header.timestamp),
+      modified,
+      messageCount,
+      firstMessage,
+    }, ...savedSessions];
+  }
+  return {
+    cwd: ctx.cwd,
+    activeSessionPath,
+    activeSessionId,
+    sessions: sessions.map((session) => ({
+      path: session.path,
+      id: session.id,
+      cwd: session.cwd,
+      name: session.name,
+      created: session.created.getTime(),
+      modified: session.modified.getTime(),
+      messageCount: session.messageCount,
+      firstMessage: session.messageCount === 0 ? "" : normalizeUserText(session.firstMessage),
+    })),
+    messages: ctx.sessionManager.getBranch().map(savedMessage).filter((message) => message !== undefined),
+  };
+}
+
+async function sendSessionSnapshot(ctx, kind) {
+  notify(ctx, { kind, sessionSnapshot: await sessionSnapshot(ctx) });
 }
 
 // Bridges the Provider's typed login prompt to a native RPC dialog.
@@ -61,7 +215,7 @@ async function promptForAuth(ctx, prompt) {
 }
 
 // Reports Provider authentication state and currently available models from Pi.
-function sendSnapshot(ctx) {
+function sendSnapshot(pi, ctx) {
   const allModels = ctx.modelRegistry.getAll();
   const providerIds = [...new Set(allModels.map((model) => model.provider))];
   const providers = providerIds
@@ -99,15 +253,51 @@ function sendSnapshot(ctx) {
       const providerOrder = left.providerName.localeCompare(right.providerName);
       return providerOrder === 0 ? left.name.localeCompare(right.name) : providerOrder;
     });
-  notify(ctx, { kind: "snapshot", snapshot: { providers, models } });
+  const commands = pi
+    .getCommands()
+    .filter((command) => !command.name.startsWith("quick-"))
+    .map((command) => ({ name: command.name, source: command.source }));
+  notify(ctx, { kind: "snapshot", snapshot: { providers, models, commands } });
 }
 
-// Registers the three native-app commands used for snapshots and built-in Provider login state.
+// Registers native-app control commands plus RPC-mode resource reload.
 export default function quickPiExtension(pi) {
   pi.registerCommand("quick-snapshot", {
     description: "Return Provider and model state to Quick Pi",
     handler: async (_args, ctx) => {
-      sendSnapshot(ctx);
+      sendSnapshot(pi, ctx);
+    },
+  });
+
+  pi.registerCommand("quick-session-snapshot", {
+    description: "Return session state to Quick Pi",
+    handler: async (_args, ctx) => {
+      await sendSessionSnapshot(ctx, "sessionSnapshot");
+    },
+  });
+
+  pi.registerCommand("quick-delete-all-sessions", {
+    description: "Delete every saved Quick Pi session",
+    handler: async (_args, ctx) => {
+      const result = await ctx.newSession({
+        withSession: async (nextCtx) => {
+          const currentPath = nextCtx.sessionManager.getSessionFile();
+          if (!currentPath) {
+            throw new Error("新会话没有持久化文件");
+          }
+          const currentId = nextCtx.sessionManager.getSessionId();
+          const sessions = await SessionManager.listAll();
+          for (const session of sessions) {
+            if (session.id !== currentId) {
+              await unlink(session.path);
+            }
+          }
+          await sendSessionSnapshot(nextCtx, "sessionsDeleted");
+        },
+      });
+      if (result.cancelled) {
+        throw new Error("新建会话已取消");
+      }
     },
   });
 
@@ -156,6 +346,13 @@ export default function quickPiExtension(pi) {
       delete credentials[id];
       await writeCredentials(directory, credentials);
       notify(ctx, { kind: "logoutComplete", providerId: id });
+    },
+  });
+
+  pi.registerCommand("reload", {
+    description: "Reload extensions, skills, prompts, themes, and context files",
+    handler: async (_args, ctx) => {
+      await ctx.reload();
     },
   });
 }

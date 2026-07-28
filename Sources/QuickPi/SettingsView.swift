@@ -2,11 +2,10 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var state: AppState
-    @Environment(\.dismiss) private var dismiss
+    let close: () -> Void
     @State private var shortcut: String
     @State private var launchAtLogin: Bool
-    @State private var terminalAccess: Bool
-    @State private var fileSystemAccess: Bool
+    @State private var savingGeneral = false
     @State private var generalMessage: String?
     @State private var showingProviderForm = false
     @State private var provider = ProviderConfiguration(
@@ -22,13 +21,12 @@ struct SettingsView: View {
     @State private var savingProvider = false
     @State private var providerMessage: String?
 
-    // Seeds editable controls from the settings document loaded from disk.
-    init(state: AppState) {
+    // Seeds editable controls and binds the standalone window's close action.
+    init(state: AppState, close: @escaping () -> Void) {
         self.state = state
+        self.close = close
         _shortcut = State(initialValue: state.settings.shortcut)
         _launchAtLogin = State(initialValue: state.settings.launchAtLogin)
-        _terminalAccess = State(initialValue: state.settings.terminalAccess)
-        _fileSystemAccess = State(initialValue: state.settings.fileSystemAccess)
     }
 
     private var isEditingProvider: Bool {
@@ -40,12 +38,16 @@ struct SettingsView: View {
             HStack {
                 Text("设置")
                     .font(.headline)
+                if savingGeneral {
+                    ProgressView()
+                        .controlSize(.small)
+                }
                 Spacer()
                 Button("完成") {
-                    dismiss()
+                    close()
                 }
                 .keyboardShortcut(.cancelAction)
-                .disabled(syncingModels || savingProvider)
+                .disabled(savingGeneral || syncingModels || savingProvider)
             }
             .padding(.horizontal, 18)
             .frame(height: 52)
@@ -61,7 +63,9 @@ struct SettingsView: View {
             .padding(16)
         }
         .frame(width: 520, height: 600)
-        .interactiveDismissDisabled(syncingModels || savingProvider)
+        .background(Color.white)
+        .preferredColorScheme(.light)
+        .interactiveDismissDisabled(savingGeneral || syncingModels || savingProvider)
         .sheet(isPresented: Binding(
             get: { state.authSession != nil },
             set: { presented in
@@ -77,38 +81,29 @@ struct SettingsView: View {
     private var generalTab: some View {
         Form {
             Section("快速启动") {
-                Picker("全局快捷键", selection: $shortcut) {
+                Picker("全局快捷键", selection: Binding(
+                    get: { shortcut },
+                    set: { value in
+                        persistGeneralSettings(
+                            shortcut: value,
+                            launchAtLogin: launchAtLogin
+                        )
+                    }
+                )) {
                     Text("⌘ ⇧ Space").tag("commandShiftSpace")
                     Text("⌥ Space").tag("optionSpace")
                     Text("⌃ Space").tag("controlSpace")
                     Text("⌘ ⌥ Space").tag("commandOptionSpace")
                 }
-                Toggle("登录后自动启动", isOn: $launchAtLogin)
-            }
-
-            Section("Pi 权限") {
-                Toggle(isOn: $terminalAccess) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("终端")
-                        Text("允许 Pi 执行 shell 命令，终端本身包含文件系统访问")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                Toggle("登录后自动启动", isOn: Binding(
+                    get: { launchAtLogin },
+                    set: { enabled in
+                        persistGeneralSettings(
+                            shortcut: shortcut,
+                            launchAtLogin: enabled
+                        )
                     }
-                }
-                .onChange(of: terminalAccess) { _, enabled in
-                    if enabled {
-                        fileSystemAccess = true
-                    }
-                }
-                Toggle(isOn: $fileSystemAccess) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("文件系统")
-                        Text("允许 Pi 使用专用工具读取、搜索和修改文件")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .disabled(terminalAccess)
+                ))
             }
 
             Section("软件更新") {
@@ -119,27 +114,27 @@ struct SettingsView: View {
                 }
             }
 
-            Section {
-                HStack {
-                    Button("保存") {
-                        Task { await saveGeneralSettings() }
-                    }
-                    .buttonStyle(.borderedProminent)
+            if generalMessage != nil || state.shortcutError != nil {
+                Section {
                     if let generalMessage {
                         Text(generalMessage)
                             .font(.caption)
-                            .foregroundStyle(generalMessage == "已保存" ? Color.secondary : Color.red)
+                            .foregroundStyle(.red)
+                            .textSelection(.enabled)
                     }
-                }
-                if let shortcutError = state.shortcutError {
-                    Text(shortcutError)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .textSelection(.enabled)
+                    if let shortcutError = state.shortcutError {
+                        Text(shortcutError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .textSelection(.enabled)
+                    }
                 }
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+        .background(Color.white)
+        .disabled(savingGeneral)
     }
 
     private var providersTab: some View {
@@ -190,6 +185,8 @@ struct SettingsView: View {
                 }
             }
             .listStyle(.inset)
+            .scrollContentBackground(.hidden)
+            .background(Color.white)
             .overlay {
                 if state.providerOptions.isEmpty {
                     ContentUnavailableView("没有可用 Provider", systemImage: "server.rack")
@@ -282,24 +279,37 @@ struct SettingsView: View {
             )
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+        .background(Color.white)
         .onChange(of: provider.kind) { _, _ in resetSyncedModels() }
         .onChange(of: provider.baseURL) { _, _ in resetSyncedModels() }
         .onChange(of: apiKey) { _, _ in resetSyncedModels() }
     }
 
-    // Saves general settings and reports disk or macOS service errors in the same form.
-    private func saveGeneralSettings() async {
+    // Persists one control change immediately and restores the disk values if macOS rejects it.
+    private func persistGeneralSettings(
+        shortcut nextShortcut: String,
+        launchAtLogin nextLaunchAtLogin: Bool
+    ) {
+        guard !savingGeneral else {
+            return
+        }
+        shortcut = nextShortcut
+        launchAtLogin = nextLaunchAtLogin
+        savingGeneral = true
         generalMessage = nil
-        do {
-            try await state.saveDesktopSettings(
-                shortcut: shortcut,
-                launchAtLogin: launchAtLogin,
-                terminalAccess: terminalAccess,
-                fileSystemAccess: fileSystemAccess
-            )
-            generalMessage = "已保存"
-        } catch {
-            generalMessage = error.localizedDescription
+        Task {
+            do {
+                try await state.saveDesktopSettings(
+                    shortcut: nextShortcut,
+                    launchAtLogin: nextLaunchAtLogin
+                )
+            } catch {
+                shortcut = state.settings.shortcut
+                launchAtLogin = state.settings.launchAtLogin
+                generalMessage = error.localizedDescription
+            }
+            savingGeneral = false
         }
     }
 
@@ -495,6 +505,8 @@ private struct AuthView: View {
             }
         }
         .frame(width: 400, height: 330)
+        .background(Color.white)
+        .preferredColorScheme(.light)
         .onChange(of: state.authSession?.prompt) { _, _ in
             value = ""
         }
