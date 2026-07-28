@@ -1,0 +1,5 @@
+.build/
+.cache/
+release/
+.DS_Store
+*.log
