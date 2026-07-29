@@ -1,9 +1,19 @@
 import AppKit
+import Combine
+import CoreImage
+import CoreImage.CIFilterBuiltins
+import Darwin
 import MarkdownUI
 import SwiftUI
 import UniformTypeIdentifiers
 
 private let chatMessageFontSize: CGFloat = 13
+private let qrCodeContext = CIContext()
+
+private struct SlashCommandScrollRequest: Equatable {
+    let id = UUID()
+    let commandName: String
+}
 
 extension Notification.Name {
     static let quickPiFocusInput = Notification.Name("quickPiFocusInput")
@@ -11,14 +21,20 @@ extension Notification.Name {
 
 struct ChatView: View {
     @ObservedObject var state: AppState
+    @AppStorage("showSystemStatus") private var showSystemStatus = true
     @FocusState private var promptFocused: Bool
     @State private var confirmsDeletingSessions = false
     @State private var sessionsPresented = false
+    @State private var selectedSlashCommandIndex = 0
+    @State private var slashCommandScrollRequest: SlashCommandScrollRequest?
+    @State private var modelMenuPresented = false
 
     var body: some View {
         VStack(spacing: 0) {
             inputBar
-            if state.showsResultPanel {
+            if !state.slashCommandSuggestions.isEmpty {
+                slashCommandMenu
+            } else if state.showsResultPanel {
                 Divider()
                     .padding(.horizontal, 14)
                 resultPanel
@@ -49,17 +65,45 @@ struct ChatView: View {
                 Task { await state.deleteAllSessions() }
             }
         } message: {
-            Text("这会删除主目录以及所有工作区中的全部会话，且无法撤销。")
+            Text("这会删除主空间以及所有工作区中的全部会话，且无法撤销。")
         }
         .preferredColorScheme(.light)
         .onReceive(NotificationCenter.default.publisher(for: .quickPiFocusInput)) { _ in
             promptFocused = true
+        }
+        .onChange(of: state.draft) { _, _ in
+            selectedSlashCommandIndex = 0
+            if !state.slashCommandSuggestions.isEmpty {
+                modelMenuPresented = false
+            }
+        }
+        .onChange(of: state.slashCommands) { _, _ in
+            if !state.slashCommandSuggestions.isEmpty {
+                modelMenuPresented = false
+            }
         }
     }
 
     private var inputBar: some View {
         VStack(spacing: 0) {
             contextBar
+
+            ForEach(state.extensionWidgets.filter { $0.placement == .aboveEditor }) { widget in
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(widget.lines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(size: 12, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, minHeight: 16, maxHeight: 16, alignment: .leading)
+                            .help(line)
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 6)
+                .frame(height: CGFloat(widget.lines.count * 16 + 12))
+                .background(.primary.opacity(0.025))
+            }
 
             if !state.attachments.isEmpty {
                 ScrollView(.horizontal) {
@@ -96,13 +140,50 @@ struct ChatView: View {
             }
 
             HStack(spacing: 8) {
-                TextField("问点什么", text: $state.draft)
+                TextField(
+                    "问点什么",
+                    text: Binding(
+                        get: { state.draft },
+                        set: { state.draft = $0 }
+                    )
+                )
                     .textFieldStyle(.plain)
                     .font(.system(size: 16))
                     .frame(minWidth: 120)
                     .focused($promptFocused)
                     .onSubmit {
-                        Task { await state.send() }
+                        let suggestions = state.slashCommandSuggestions
+                        if suggestions.isEmpty {
+                            Task { await state.send() }
+                        } else if state.draftMatchesSlashCommand {
+                            Task { await state.send() }
+                        } else {
+                            selectSlashCommand(
+                                suggestions[min(selectedSlashCommandIndex, suggestions.count - 1)]
+                            )
+                        }
+                    }
+                    .onKeyPress(keys: [.upArrow, .downArrow]) { keyPress in
+                        guard keyPress.modifiers.isEmpty else {
+                            return .ignored
+                        }
+                        let suggestions = state.slashCommandSuggestions
+                        guard !suggestions.isEmpty else {
+                            return .ignored
+                        }
+                        let nextIndex: Int
+                        if keyPress.key == .upArrow {
+                            nextIndex = (
+                                selectedSlashCommandIndex + suggestions.count - 1
+                            ) % suggestions.count
+                        } else {
+                            nextIndex = (selectedSlashCommandIndex + 1) % suggestions.count
+                        }
+                        selectedSlashCommandIndex = nextIndex
+                        slashCommandScrollRequest = SlashCommandScrollRequest(
+                            commandName: suggestions[nextIndex].name
+                        )
+                        return .handled
                     }
 
                 Button {
@@ -115,65 +196,76 @@ struct ChatView: View {
                 .foregroundStyle(.secondary)
                 .help("添加附件")
 
-                Menu {
-                    if state.modelOptions.isEmpty {
-                        Text("未配置模型")
-                    } else {
-                        ForEach(state.modelOptions, id: \.selectionKey) { model in
-                            Button {
-                                Task { await state.selectModel(selectionKey: model.selectionKey) }
-                            } label: {
-                                if state.settings.selectedModel == model.selection {
-                                    Label("\(model.providerName) · \(model.name)", systemImage: "checkmark")
-                                } else {
-                                    Text("\(model.providerName) · \(model.name)")
-                                }
-                            }
-                        }
-                    }
+                Button {
+                    modelMenuPresented.toggle()
                 } label: {
                     HStack(spacing: 4) {
                         if state.runtimeStarting {
                             ProgressView()
                                 .controlSize(.mini)
                         }
-                        (
-                            Text(state.selectedModel?.name ?? "选择模型")
-                                + Text(" ")
-                                + Text(Image(systemName: "chevron.down"))
-                                .font(.system(size: 9, weight: .semibold))
-                        )
+                        Text(state.selectedModel?.name ?? "选择模型")
                             .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 108)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
                     }
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 9)
+                    .padding(.horizontal, 8)
                     .frame(height: 30)
                     .background(
                         .primary.opacity(0.055),
                         in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                     )
                 }
-                .menuIndicator(.hidden)
-                .menuStyle(.borderlessButton)
-                .frame(maxWidth: 170)
-                .disabled(!state.runtimeReady || state.isAnswering || state.sessionChanging)
+                .buttonStyle(.plain)
+                .disabled(!state.runtimeReady || state.hasRunningSessions || state.sessionChanging)
+                .help(
+                    state.selectedModel.map { "\($0.providerName) · \($0.name)" }
+                        ?? "选择模型"
+                )
+                .popover(
+                    isPresented: $modelMenuPresented,
+                    attachmentAnchor: .rect(.bounds),
+                    arrowEdge: .top
+                ) {
+                    modelMenu
+                }
 
                 Button {
                     Task { await state.send() }
                 } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 20))
+                    if state.extensionCommandRunning {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 20))
+                    }
                 }
                 .buttonStyle(.plain)
                 .frame(width: 30, height: 30)
                 .disabled(
                     state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         || !state.runtimeReady
-                        || state.isAnswering
+                        || state.isBusy
                         || state.sessionChanging
                 )
                 .help("发送")
+
+                if !state.showsResultPanel && state.hasResultPanelContent {
+                    Button {
+                        state.toggleResultPanel()
+                    } label: {
+                        Image(systemName: "chevron.down")
+                    }
+                    .buttonStyle(.plain)
+                    .frame(width: 30, height: 30)
+                    .foregroundStyle(.secondary)
+                    .help("展开结果")
+                }
 
                 Button {
                     state.presentSettings()
@@ -187,8 +279,150 @@ struct ChatView: View {
             }
             .padding(.horizontal, 18)
             .frame(height: 64)
+
+            ForEach(state.extensionWidgets.filter { $0.placement == .belowEditor }) { widget in
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(widget.lines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(size: 12, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, minHeight: 16, maxHeight: 16, alignment: .leading)
+                            .help(line)
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 6)
+                .frame(height: CGFloat(widget.lines.count * 16 + 12))
+                .background(.primary.opacity(0.025))
+            }
         }
-        .frame(height: state.attachments.isEmpty ? 102 : 140)
+        .frame(height: state.inputBarHeight)
+    }
+
+    private var slashCommandMenu: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical) {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(state.slashCommandSuggestions.enumerated()), id: \.element.name) { index, command in
+                        Button {
+                            selectSlashCommand(command)
+                        } label: {
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("/\(command.name)")
+                                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                    if let description = command.description, !description.isEmpty {
+                                        Text(description)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                Spacer(minLength: 12)
+                                Text(command.source.title)
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.horizontal, 10)
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .background(
+                                index == selectedSlashCommandIndex
+                                    ? Color.accentColor.opacity(0.08)
+                                    : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .id(command.name)
+                        .onHover { hovering in
+                            if hovering {
+                                selectedSlashCommandIndex = index
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+            }
+            .scrollIndicators(.visible)
+            .onChange(of: slashCommandScrollRequest) { _, request in
+                guard let request else {
+                    return
+                }
+                proxy.scrollTo(request.commandName, anchor: .center)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: state.slashCommandMenuHeight)
+        .overlay(alignment: .top) {
+            Divider()
+                .padding(.horizontal, 14)
+        }
+    }
+
+    private var modelMenuHeight: CGFloat {
+        guard !state.modelOptions.isEmpty else {
+            return 56
+        }
+        return min(CGFloat(state.modelOptions.count) * 38 + 8, 240)
+    }
+
+    private var modelMenu: some View {
+        ScrollView(.vertical) {
+            if state.modelOptions.isEmpty {
+                Text("未配置模型")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 48)
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(state.modelOptions, id: \.selectionKey) { model in
+                        Button {
+                            modelMenuPresented = false
+                            Task { await state.selectModel(selectionKey: model.selectionKey) }
+                        } label: {
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(model.name)
+                                        .font(.system(size: 13, weight: .medium))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                    Text(model.providerName)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 8)
+                                if state.settings.selectedModel == model.selection {
+                                    Image(systemName: "checkmark")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                            }
+                            .padding(.horizontal, 10)
+                            .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+            }
+        }
+        .scrollIndicators(.visible)
+        .frame(width: 280, height: modelMenuHeight)
+    }
+
+    // Inserts a Pi command and leaves the cursor ready for any command arguments.
+    private func selectSlashCommand(_ command: SlashCommand) {
+        state.draft = "/\(command.name) "
+        selectedSlashCommandIndex = 0
+        promptFocused = true
     }
 
     private var contextBar: some View {
@@ -207,21 +441,22 @@ struct ChatView: View {
                     Button {
                         state.setWorkspace(nil)
                     } label: {
-                        Label("返回主目录", systemImage: "house")
+                        Label("返回主空间", systemImage: "house")
                     }
                 }
             } label: {
                 HStack(spacing: 5) {
-                    Image(systemName: state.settings.workspacePath == nil ? "house" : "folder.fill")
+                    Image(systemName: "folder")
                     Text(state.scopeTitle)
                         .lineLimit(1)
+                        .truncationMode(.middle)
                     Image(systemName: "chevron.down")
                         .font(.system(size: 9, weight: .semibold))
                 }
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 9)
-                .frame(width: 150, height: 28, alignment: .leading)
+                .frame(width: 116, height: 28, alignment: .leading)
                 .background(
                     .primary.opacity(0.055),
                     in: RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -229,11 +464,9 @@ struct ChatView: View {
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
-            .frame(width: 150)
-            .disabled(state.isAnswering || state.sessionChanging)
-            .help(state.settings.workspacePath ?? "主目录")
-
-            Spacer(minLength: 40)
+            .frame(width: 116)
+            .disabled(state.hasRunningSessions || state.sessionChanging)
+            .help(state.settings.workspacePath ?? "主空间")
 
             Button {
                 sessionsPresented.toggle()
@@ -245,24 +478,23 @@ struct ChatView: View {
                     } else {
                         Image(systemName: "bubble.left.and.bubble.right")
                     }
-                    Text(state.activeSession.map { state.title(for: $0) } ?? "会话")
-                        .lineLimit(1)
+                    Text("会话记录")
                     Image(systemName: "chevron.down")
                         .font(.system(size: 9, weight: .semibold))
                 }
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 9)
-                .frame(width: 180, height: 28, alignment: .leading)
+                .frame(width: 116, height: 28, alignment: .leading)
                 .background(
                     .primary.opacity(0.055),
                     in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                 )
             }
             .buttonStyle(.plain)
-            .frame(width: 180)
-            .disabled(!state.runtimeReady || state.isAnswering || state.sessionChanging)
-            .help("切换会话")
+            .frame(width: 116)
+            .disabled(state.sessions.isEmpty || state.sessionChanging)
+            .help("查看会话记录")
             .popover(isPresented: $sessionsPresented, arrowEdge: .top) {
                 VStack(spacing: 0) {
                     if state.sessions.isEmpty {
@@ -279,9 +511,20 @@ struct ChatView: View {
                                         Task { await state.switchSession(id: session.id) }
                                     } label: {
                                         HStack(spacing: 8) {
-                                            Image(systemName: "checkmark")
-                                                .opacity(session.id == state.activeSessionID ? 1 : 0)
-                                                .frame(width: 12)
+                                            Group {
+                                                if state.isSessionRunning(id: session.id) {
+                                                    ProgressView()
+                                                        .controlSize(.mini)
+                                                } else if state.hasUnreadCompletion(id: session.id) {
+                                                    Circle()
+                                                        .fill(Color.blue)
+                                                        .frame(width: 8, height: 8)
+                                                } else {
+                                                    Image(systemName: "checkmark")
+                                                        .opacity(session.id == state.activeSessionID ? 1 : 0)
+                                                }
+                                            }
+                                            .frame(width: 12, height: 12)
                                             Text(state.title(for: session))
                                                 .lineLimit(1)
                                             Spacer(minLength: 8)
@@ -312,9 +555,26 @@ struct ChatView: View {
                     .foregroundStyle(.red)
                     .padding(.horizontal, 10)
                     .frame(height: 36)
+                    .disabled(state.hasRunningSessions)
                 }
                 .frame(width: 260)
             }
+
+            if !state.extensionStatuses.isEmpty {
+                let statusText = state.extensionStatuses.map(\.text).joined(separator: " · ")
+                Label(statusText, systemImage: "puzzlepiece.extension")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: 160, alignment: .leading)
+                    .help(statusText)
+            }
+
+            if showSystemStatus {
+                SystemStatusView()
+            }
+
+            Spacer(minLength: 0)
 
             Button {
                 Task { await state.createSession() }
@@ -324,7 +584,7 @@ struct ChatView: View {
             .buttonStyle(.plain)
             .frame(width: 30, height: 28)
             .foregroundStyle(.secondary)
-            .disabled(!state.runtimeReady || state.isAnswering || state.sessionChanging)
+            .disabled(state.activeSessionID == nil || state.runtimeStarting || state.sessionChanging)
             .help("新建会话")
         }
         .padding(.horizontal, 18)
@@ -335,7 +595,7 @@ struct ChatView: View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(state.conversationAnswers) { answer in
                             let tools = answer.sections.compactMap { section in
                                 if case .tool(let tool) = section.content {
@@ -344,7 +604,9 @@ struct ChatView: View {
                                 return nil
                             }
 
-                            questionView(answer.question)
+                            if let question = answer.question {
+                                questionView(question)
+                            }
 
                             ForEach(answer.sections) { section in
                                 AnswerSectionView(section: section, tools: tools)
@@ -377,6 +639,42 @@ struct ChatView: View {
                             }
 
                             answerMetadata(answer)
+
+                            if answer.forkEntryId != nil || !answer.answerText.isEmpty {
+                                HStack(spacing: 12) {
+                                    if let entryId = answer.forkEntryId {
+                                        Button {
+                                            Task {
+                                                await state.forkSession(from: entryId)
+                                                promptFocused = true
+                                            }
+                                        } label: {
+                                            Image(systemName: "arrow.triangle.branch")
+                                        }
+                                        .buttonStyle(.plain)
+                                        .frame(width: 24, height: 24)
+                                        .disabled(
+                                            !state.runtimeReady
+                                                || state.isBusy
+                                                || state.sessionChanging
+                                        )
+                                        .help("从此回复分叉")
+                                    }
+
+                                    if !answer.answerText.isEmpty {
+                                        Button {
+                                            copy(answer.answerText)
+                                        } label: {
+                                            Image(systemName: "doc.on.doc")
+                                        }
+                                        .buttonStyle(.plain)
+                                        .frame(width: 24, height: 24)
+                                        .help("复制此回复")
+                                    }
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
                         }
 
                         if let runtimeError = state.runtimeError {
@@ -414,20 +712,10 @@ struct ChatView: View {
 
                 Spacer()
 
-                if let text = state.conversationAnswers.last?.answerText, !text.isEmpty {
-                    Button {
-                        copy(text)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                    }
-                    .buttonStyle(.plain)
-                    .help("复制回答")
-                }
-
                 Button {
-                    Task { await state.clearAnswer() }
+                    state.toggleResultPanel()
                 } label: {
-                    Image(systemName: "xmark")
+                    Image(systemName: "chevron.up")
                 }
                 .buttonStyle(.plain)
                 .help("收起结果")
@@ -443,24 +731,34 @@ struct ChatView: View {
     private func questionView(_ question: SubmittedQuestion) -> some View {
         HStack {
             Spacer(minLength: 72)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(question.text)
-                    .font(.system(size: chatMessageFontSize))
-                    .textSelection(.enabled)
-                if let workspacePath = question.workspacePath {
-                    Label(
-                        URL(fileURLWithPath: workspacePath, isDirectory: true).lastPathComponent,
-                        systemImage: "folder"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .help(workspacePath)
-                }
-                if !question.attachmentNames.isEmpty {
-                    Label(question.attachmentNames.joined(separator: " · "), systemImage: "paperclip")
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(question.text)
+                        .font(.system(size: chatMessageFontSize))
+                    if let workspacePath = question.workspacePath {
+                        Label(
+                            URL(fileURLWithPath: workspacePath, isDirectory: true).lastPathComponent,
+                            systemImage: "folder"
+                        )
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .help(workspacePath)
+                    }
+                    if !question.attachmentNames.isEmpty {
+                        Label(question.attachmentNames.joined(separator: " · "), systemImage: "paperclip")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                Button {
+                    copy(question.text)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.plain)
+                .frame(width: 24, height: 24)
+                .foregroundStyle(.secondary)
+                .help("复制问题")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
@@ -527,6 +825,260 @@ struct ChatView: View {
     private func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+}
+
+private struct SystemStatusSnapshot {
+    let cpuUsage: Double?
+    let memoryUsage: Double
+    let usedMemory: UInt64
+    let totalMemory: UInt64
+    let storageUsage: Double
+    let usedStorage: UInt64
+    let totalStorage: UInt64
+    let uptime: TimeInterval
+}
+
+private struct HostCPUTicks {
+    let user: UInt32
+    let system: UInt32
+    let idle: UInt32
+    let nice: UInt32
+}
+
+@MainActor
+private final class SystemStatusMonitor: ObservableObject {
+    @Published private(set) var snapshot: SystemStatusSnapshot?
+    @Published private(set) var errorMessage: String?
+    private var previousCPUTicks: HostCPUTicks?
+
+    // Samples host-wide CPU, memory, and startup-volume usage for the status display.
+    func refresh() {
+        var cpuInfo = host_cpu_load_info_data_t()
+        var cpuInfoCount = mach_msg_type_number_t(
+            MemoryLayout<host_cpu_load_info_data_t>.stride / MemoryLayout<integer_t>.stride
+        )
+        let cpuResult = withUnsafeMutablePointer(to: &cpuInfo) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(cpuInfoCount)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &cpuInfoCount)
+            }
+        }
+        guard cpuResult == KERN_SUCCESS else {
+            snapshot = nil
+            errorMessage = "无法读取 CPU 状态（\(cpuResult)）"
+            return
+        }
+
+        let currentCPUTicks = HostCPUTicks(
+            user: cpuInfo.cpu_ticks.0,
+            system: cpuInfo.cpu_ticks.1,
+            idle: cpuInfo.cpu_ticks.2,
+            nice: cpuInfo.cpu_ticks.3
+        )
+        let cpuUsage: Double?
+        if let previousCPUTicks {
+            let userDelta = UInt64(currentCPUTicks.user &- previousCPUTicks.user)
+            let systemDelta = UInt64(currentCPUTicks.system &- previousCPUTicks.system)
+            let idleDelta = UInt64(currentCPUTicks.idle &- previousCPUTicks.idle)
+            let niceDelta = UInt64(currentCPUTicks.nice &- previousCPUTicks.nice)
+            let totalDelta = userDelta + systemDelta + idleDelta + niceDelta
+            guard totalDelta > 0 else {
+                snapshot = nil
+                errorMessage = "CPU 计数器未产生新数据"
+                return
+            }
+            cpuUsage = Double(userDelta + systemDelta + niceDelta) / Double(totalDelta)
+        } else {
+            cpuUsage = nil
+        }
+
+        var memoryInfo = vm_statistics64_data_t()
+        var memoryInfoCount = mach_msg_type_number_t(
+            MemoryLayout<vm_statistics64_data_t>.stride / MemoryLayout<integer_t>.stride
+        )
+        let memoryResult = withUnsafeMutablePointer(to: &memoryInfo) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(memoryInfoCount)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &memoryInfoCount)
+            }
+        }
+        guard memoryResult == KERN_SUCCESS else {
+            snapshot = nil
+            errorMessage = "无法读取内存状态（\(memoryResult)）"
+            return
+        }
+        guard memoryInfo.purgeable_count <= memoryInfo.internal_page_count else {
+            snapshot = nil
+            errorMessage = "内存统计数据不一致"
+            return
+        }
+
+        // Used memory is anonymous non-purgeable memory plus wired and compressed pages.
+        let usedPages = UInt64(memoryInfo.internal_page_count - memoryInfo.purgeable_count)
+            + UInt64(memoryInfo.wire_count)
+            + UInt64(memoryInfo.compressor_page_count)
+        let memoryProduct = usedPages.multipliedReportingOverflow(by: UInt64(vm_kernel_page_size))
+        let totalMemory = ProcessInfo.processInfo.physicalMemory
+        guard !memoryProduct.overflow, memoryProduct.partialValue <= totalMemory else {
+            snapshot = nil
+            errorMessage = "内存统计数据超出物理内存"
+            return
+        }
+
+        let storageAttributes: [FileAttributeKey: Any]
+        do {
+            storageAttributes = try FileManager.default.attributesOfFileSystem(forPath: "/")
+        } catch {
+            snapshot = nil
+            errorMessage = "无法读取磁盘状态：\(error.localizedDescription)"
+            return
+        }
+        guard let totalStorage = (storageAttributes[.systemSize] as? NSNumber)?.uint64Value,
+              let freeStorage = (storageAttributes[.systemFreeSize] as? NSNumber)?.uint64Value,
+              totalStorage > 0,
+              freeStorage <= totalStorage else {
+            snapshot = nil
+            errorMessage = "磁盘统计数据不一致"
+            return
+        }
+        let usedStorage = totalStorage - freeStorage
+
+        previousCPUTicks = currentCPUTicks
+        snapshot = SystemStatusSnapshot(
+            cpuUsage: cpuUsage,
+            memoryUsage: Double(memoryProduct.partialValue) / Double(totalMemory),
+            usedMemory: memoryProduct.partialValue,
+            totalMemory: totalMemory,
+            storageUsage: Double(usedStorage) / Double(totalStorage),
+            usedStorage: usedStorage,
+            totalStorage: totalStorage,
+            uptime: ProcessInfo.processInfo.systemUptime
+        )
+        errorMessage = nil
+    }
+}
+
+private struct SystemStatusView: View {
+    @StateObject private var monitor = SystemStatusMonitor()
+    @State private var detailsPresented = false
+    private let refreshTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Button {
+            detailsPresented.toggle()
+        } label: {
+            Group {
+                if let snapshot = monitor.snapshot {
+                    let memoryText = snapshot.memoryUsage.formatted(
+                        .percent.precision(.fractionLength(0))
+                    )
+                    let storageText = snapshot.storageUsage.formatted(
+                        .percent.precision(.fractionLength(0))
+                    )
+                    Group {
+                        if let cpuUsage = snapshot.cpuUsage {
+                            let cpuText = cpuUsage.formatted(
+                                .percent.precision(.fractionLength(0))
+                            )
+                            Text("CPU \(cpuText) · 内存 \(memoryText) · 磁盘 \(storageText)")
+                        } else {
+                            Text("CPU 采集中 · 内存 \(memoryText) · 磁盘 \(storageText)")
+                        }
+                    }
+                    .foregroundStyle(.secondary)
+                } else if let errorMessage = monitor.errorMessage {
+                    Text("系统状态读取失败")
+                        .foregroundStyle(.red)
+                        .help(errorMessage)
+                } else {
+                    Text("系统状态采集中")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption2.weight(.medium))
+            .monospacedDigit()
+            .lineLimit(1)
+            .padding(.horizontal, 8)
+            .frame(width: 190, height: 28, alignment: .leading)
+            .background(
+                .primary.opacity(0.055),
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
+        .frame(width: 190)
+        .help("查看系统状态详情")
+        .popover(isPresented: $detailsPresented, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("系统状态", systemImage: "gauge")
+                    .font(.headline)
+
+                if let snapshot = monitor.snapshot {
+                    let uptimeMinutes = Int(snapshot.uptime / 60)
+                    let systemVersion = ProcessInfo.processInfo.operatingSystemVersion
+                    let memoryText = snapshot.memoryUsage.formatted(
+                        .percent.precision(.fractionLength(0))
+                    )
+                    let storageText = snapshot.storageUsage.formatted(
+                        .percent.precision(.fractionLength(0))
+                    )
+
+                    LabeledContent("CPU") {
+                        if let cpuUsage = snapshot.cpuUsage {
+                            Text(cpuUsage, format: .percent.precision(.fractionLength(0)))
+                        } else {
+                            Text("采集中")
+                        }
+                    }
+                    LabeledContent("内存") {
+                        Text(
+                            "\(memoryText) · "
+                                + "\(snapshot.usedMemory.formatted(.byteCount(style: .memory))) / "
+                                + snapshot.totalMemory.formatted(.byteCount(style: .memory))
+                        )
+                    }
+                    LabeledContent("磁盘") {
+                        Text(
+                            "\(storageText) · "
+                                + "\(snapshot.usedStorage.formatted(.byteCount(style: .file))) / "
+                                + snapshot.totalStorage.formatted(.byteCount(style: .file))
+                        )
+                    }
+
+                    Divider()
+
+                    LabeledContent("处理器核心", value: "\(ProcessInfo.processInfo.activeProcessorCount) 个")
+                    LabeledContent("系统运行") {
+                        Text(
+                            uptimeMinutes >= 1_440
+                                ? "\(uptimeMinutes / 1_440) 天 \((uptimeMinutes % 1_440) / 60) 小时"
+                                : "\(uptimeMinutes / 60) 小时 \(uptimeMinutes % 60) 分钟"
+                        )
+                    }
+                    LabeledContent("操作系统") {
+                        Text(
+                            "macOS \(systemVersion.majorVersion)."
+                                + "\(systemVersion.minorVersion).\(systemVersion.patchVersion)"
+                        )
+                    }
+                } else if let errorMessage = monitor.errorMessage {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                } else {
+                    Text("采集中")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption)
+            .monospacedDigit()
+            .padding(16)
+            .frame(width: 330)
+        }
+        .onAppear {
+            monitor.refresh()
+        }
+        .onReceive(refreshTimer) { _ in
+            monitor.refresh()
+        }
     }
 }
 
@@ -628,6 +1180,91 @@ private struct AnswerSectionView: View {
         switch section.content {
         case .markdown(let text):
             AnswerMarkdownView(source: text)
+        case .extensionMessage(let text):
+            AnswerMarkdownView(source: text)
+        case .customMessage(let message):
+            VStack(alignment: .leading, spacing: 8) {
+                Text("[\(message.customType)]")
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                switch message.content {
+                case .string(let content):
+                    AnswerMarkdownView(source: content)
+                default:
+                    Text(message.content.formattedJSON)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                switch message.qrCode {
+                case .absent:
+                    EmptyView()
+                case .invalid:
+                    Label("插件提供的 details.qrUrl 无效", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                case .url(let qrURL):
+                    let qrImage: CGImage? = {
+                        let filter = CIFilter.qrCodeGenerator()
+                        filter.message = Data(qrURL.absoluteString.utf8)
+                        filter.correctionLevel = "M"
+                        guard let output = filter.outputImage else {
+                            return nil
+                        }
+                        let scale = max(CGFloat(1), floor(220 / output.extent.width))
+                        let scaled = output.transformed(
+                            by: CGAffineTransform(scaleX: scale, y: scale)
+                        )
+                        return qrCodeContext.createCGImage(scaled, from: scaled.extent)
+                    }()
+
+                    if let qrImage {
+                        Image(decorative: qrImage, scale: 1)
+                            .interpolation(.none)
+                            .padding(12)
+                            .background(Color.white, in: RoundedRectangle(cornerRadius: 4))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(.primary.opacity(0.12))
+                            }
+                            .accessibilityLabel("登录二维码")
+                    } else {
+                        Label("无法生成二维码", systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+
+                    Link(destination: qrURL) {
+                        Label("打开备用地址", systemImage: "arrow.up.right.square")
+                    }
+                    .font(.caption)
+                }
+                if let details = message.details {
+                    DisclosureGroup {
+                        Text(details.formattedJSON)
+                            .font(.system(size: 12, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 6)
+                    } label: {
+                        Text("插件详情")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        case .extensionNotification(let notification):
+            let presentation: (color: Color, symbol: String) = switch notification.kind {
+            case .info:
+                (Color.accentColor, "info.circle.fill")
+            case .warning:
+                (.orange, "exclamationmark.triangle.fill")
+            case .error:
+                (.red, "xmark.circle.fill")
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: presentation.symbol)
+                    .foregroundStyle(presentation.color)
+                AnswerMarkdownView(source: notification.message)
+            }
         case .thinking(let text):
             DisclosureGroup {
                 AnswerMarkdownView(source: text)
@@ -703,11 +1340,25 @@ private struct ToolActivityGroupView: View {
 
     // Displays tool JSON and output in a stable horizontally scrollable monospace region.
     private func monospaced(_ text: String) -> some View {
-        ScrollView(.horizontal) {
-            Text(text)
-                .font(.system(size: 12, design: .monospaced))
-                .textSelection(.enabled)
-                .padding(9)
+        ZStack(alignment: .topTrailing) {
+            ScrollView(.horizontal) {
+                Text(text)
+                    .font(.system(size: 12, design: .monospaced))
+                    .padding(9)
+                    .padding(.trailing, 30)
+            }
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+            } label: {
+                Image(systemName: "doc.on.doc")
+            }
+            .buttonStyle(.plain)
+            .frame(width: 24, height: 24)
+            .foregroundStyle(.secondary)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 4))
+            .padding(5)
+            .help("复制内容")
         }
         .background(.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
     }
@@ -723,7 +1374,6 @@ private struct AnswerMarkdownView: View {
             .markdownTheme(.gitHub)
             .markdownImageProvider(AssetImageProvider())
             .markdownInlineImageProvider(AssetInlineImageProvider())
-            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

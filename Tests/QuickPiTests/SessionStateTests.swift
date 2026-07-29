@@ -4,6 +4,145 @@ import XCTest
 
 final class SessionStateTests: XCTestCase {
     @MainActor
+    func testNativeCommandsAreAvailableBeforeRuntimeStarts() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+
+        state.draft = "/"
+
+        XCTAssertEqual(
+            state.slashCommandSuggestions.map(\.name),
+            ["new", "settings", "copy", "name", "session", "compact", "clone", "export"]
+        )
+        XCTAssertTrue(state.slashCommandSuggestions.allSatisfy { $0.source == .app })
+        XCTAssertEqual(state.inputBarHeight, 102)
+        XCTAssertEqual(state.slashCommandMenuHeight, 185)
+
+        state.draft = "/settings"
+        XCTAssertTrue(state.draftMatchesSlashCommand)
+    }
+
+    // Confirms command search is case-insensitive and matches beyond the beginning of the name.
+    @MainActor
+    func testSlashCommandsSupportFuzzyNameMatching() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+
+        state.draft = "/TTI"
+
+        XCTAssertEqual(state.slashCommandSuggestions.map(\.name), ["settings"])
+    }
+
+    func testRuntimeSnapshotDecodesCommandDescriptions() throws {
+        let data = Data(
+            #"{"providers":[],"models":[],"commands":[{"name":"review","description":"Review changes","source":"extension"},{"name":"skill:search","source":"skill"}]}"#.utf8
+        )
+
+        let snapshot = try JSONDecoder().decode(RuntimeSnapshot.self, from: data)
+
+        XCTAssertEqual(snapshot.commands.count, 2)
+        XCTAssertEqual(snapshot.commands[0].description, "Review changes")
+        XCTAssertNil(snapshot.commands[1].description)
+    }
+
+    func testForkRPCDataDecodesPersistedEntryIDs() throws {
+        let messages = try JSONDecoder().decode(
+            PiForkMessages.self,
+            from: Data(#"{"messages":[{"entryId":"entry-1","text":"原始问题"}]}"#.utf8)
+        )
+        let result = try JSONDecoder().decode(
+            PiForkResult.self,
+            from: Data(#"{"text":"原始问题","cancelled":false}"#.utf8)
+        )
+
+        XCTAssertEqual(messages.messages, [PiForkMessage(entryId: "entry-1", text: "原始问题")])
+        XCTAssertEqual(result, PiForkResult(text: "原始问题", cancelled: false))
+    }
+
+    func testAnswerTextIncludesExtensionMessages() {
+        let answer = AnswerSession(
+            question: SubmittedQuestion(text: "/status", attachmentNames: [], workspacePath: nil),
+            startedAt: Date(timeIntervalSince1970: 0),
+            sections: [
+                AnswerSection(id: UUID(), content: .extensionMessage("插件反馈")),
+                AnswerSection(id: UUID(), content: .markdown("模型回答")),
+            ],
+            status: .completed
+        )
+
+        XCTAssertEqual(answer.answerText, "插件反馈\n\n模型回答")
+    }
+
+    func testPiCustomMessagePreservesRawProtocolFields() throws {
+        let data = Data(
+            #"{"role":"custom","customType":"plugin-data","content":{"items":[1,true,null],"label":"raw"},"display":true,"details":{"nested":{"value":42}},"timestamp":1234}"#.utf8
+        )
+
+        let message = try JSONDecoder().decode(PiCustomMessage.self, from: data)
+
+        XCTAssertEqual(message.customType, "plugin-data")
+        XCTAssertEqual(message.content, .object([
+            "items": .array([.integer(1), .boolean(true), .null]),
+            "label": .string("raw"),
+        ]))
+        XCTAssertEqual(message.details, .object([
+            "nested": .object(["value": .integer(42)]),
+        ]))
+        XCTAssertTrue(message.display)
+        XCTAssertEqual(message.timestamp, 1_234)
+
+        let nullDetailsMessage = try JSONDecoder().decode(
+            PiCustomMessage.self,
+            from: Data(
+                #"{"customType":"plugin-null","content":"raw","display":true,"details":null,"timestamp":5678}"#.utf8
+            )
+        )
+        XCTAssertEqual(nullDetailsMessage.details, .null)
+        XCTAssertEqual(
+            try JSONDecoder().decode(PiCustomMessage.self, from: JSONEncoder().encode(nullDetailsMessage)),
+            nullDetailsMessage
+        )
+    }
+
+    // Applies the portable qrUrl hint to every plugin type while rejecting non-web URL schemes.
+    func testCustomMessageQRCodeHintIsPluginIndependent() throws {
+        let url = "https://example.com/login?token=abc&source=plugin"
+        let message = PiCustomMessage(
+            customType: "another-login-plugin",
+            content: .string("Scan to log in"),
+            display: true,
+            details: .object(["qrUrl": .string(url)]),
+            timestamp: 1_000
+        )
+        let invalidMessage = PiCustomMessage(
+            customType: "another-login-plugin",
+            content: .string("Invalid QR payload"),
+            display: true,
+            details: .object(["qrUrl": .string("file:///tmp/login")]),
+            timestamp: 2_000
+        )
+
+        XCTAssertEqual(message.qrCode, .url(try XCTUnwrap(URL(string: url))))
+        XCTAssertEqual(invalidMessage.qrCode, .invalid)
+        XCTAssertEqual(
+            PiCustomMessage(
+                customType: "plain-plugin",
+                content: .string("No QR"),
+                display: true,
+                details: .object(["value": .integer(1)]),
+                timestamp: 3_000
+            ).qrCode,
+            .absent
+        )
+    }
+
+    @MainActor
     func testSessionSnapshotRestoresConversationAndToolActivity() throws {
         let directory = try temporaryDirectory()
         let state = try AppState(
@@ -22,8 +161,9 @@ final class SessionStateTests: XCTestCase {
             activeSessionId: session.id,
             sessions: [session],
             messages: [
-                message(role: .user, timestamp: 1_000, text: "检查项目"),
+                message(entryId: "user-1", role: .user, timestamp: 1_000, text: "检查项目"),
                 message(
+                    entryId: "assistant-1",
                     role: .assistant,
                     timestamp: 2_000,
                     content: [
@@ -41,6 +181,7 @@ final class SessionStateTests: XCTestCase {
                     stopReason: "toolUse"
                 ),
                 message(
+                    entryId: "tool-1",
                     role: .toolResult,
                     timestamp: 3_000,
                     text: "file contents",
@@ -49,6 +190,7 @@ final class SessionStateTests: XCTestCase {
                     isError: false
                 ),
                 message(
+                    entryId: "assistant-2",
                     role: .assistant,
                     timestamp: 4_000,
                     content: [content(type: .text, text: "检查完成。")],
@@ -57,8 +199,9 @@ final class SessionStateTests: XCTestCase {
                     usage: PiUsage(input: 20, output: 8, cacheRead: 0, cacheWrite: 0, cost: 0.02),
                     stopReason: "stop"
                 ),
-                message(role: .user, timestamp: 5_000, text: "继续处理"),
+                message(entryId: "user-2", role: .user, timestamp: 5_000, text: "继续处理"),
                 message(
+                    entryId: "assistant-3",
                     role: .assistant,
                     timestamp: 6_000,
                     content: [content(type: .text, text: "第二轮完成。")],
@@ -75,7 +218,8 @@ final class SessionStateTests: XCTestCase {
         XCTAssertEqual(state.activeSessionID, session.id)
         XCTAssertEqual(state.conversationAnswers.count, 2)
         let answer = try XCTUnwrap(state.conversationAnswers.first)
-        XCTAssertEqual(answer.question.text, "检查项目")
+        XCTAssertEqual(answer.question?.text, "检查项目")
+        XCTAssertEqual(answer.forkEntryId, "user-1")
         XCTAssertEqual(answer.status, .completed)
         XCTAssertEqual(answer.answerText, "开始检查。\n\n检查完成。")
         XCTAssertEqual(answer.usage.totalTokens, 45)
@@ -84,8 +228,331 @@ final class SessionStateTests: XCTestCase {
         }
         XCTAssertEqual(tool.output, "file contents")
         XCTAssertEqual(tool.status, .completed)
-        XCTAssertEqual(state.conversationAnswers[1].question.text, "继续处理")
+        XCTAssertEqual(state.conversationAnswers[1].question?.text, "继续处理")
+        XCTAssertEqual(state.conversationAnswers[1].forkEntryId, "user-2")
         XCTAssertEqual(state.conversationAnswers[1].answerText, "第二轮完成。")
+
+        state.toggleResultPanel()
+        XCTAssertFalse(state.showsResultPanel)
+        state.toggleResultPanel()
+        XCTAssertTrue(state.showsResultPanel)
+    }
+
+    @MainActor
+    func testRuntimeErrorCanBeCollapsedAndReopened() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+
+        state.runtimeError = "运行失败"
+        XCTAssertTrue(state.showsResultPanel)
+
+        state.toggleResultPanel()
+        XCTAssertFalse(state.showsResultPanel)
+        state.toggleResultPanel()
+        XCTAssertTrue(state.showsResultPanel)
+    }
+
+    // Keeps a plugin command and its fire-and-forget notification in the same visible conversation turn.
+    @MainActor
+    func testExtensionNotificationAppearsUnderVisiblePluginCommand() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        _ = try applyEmptySession(to: state, id: "session-notify")
+
+        state.consume(.userMessage("/weixin-login"))
+        state.consume(.extensionNotification(ExtensionNotification(
+            message: "✅ WeChat session restored from cache",
+            kind: .info
+        )))
+        state.consume(.settled)
+
+        let answer = try XCTUnwrap(state.answer)
+        XCTAssertEqual(answer.question?.text, "/weixin-login")
+        XCTAssertEqual(answer.answerText, "✅ WeChat session restored from cache")
+        XCTAssertEqual(answer.status, .completed)
+        guard case .extensionNotification(let notification) = answer.sections.first?.content else {
+            return XCTFail("插件通知应作为正文区块显示")
+        }
+        XCTAssertEqual(notification.kind, .info)
+        XCTAssertTrue(state.showsResultPanel)
+        XCTAssertEqual(state.inputBarHeight, 102)
+    }
+
+    // Keeps fire-and-forget plugin output when an idle session later receives a fresh Pi process.
+    @MainActor
+    func testRebindingLoadedSessionPreservesTransientPluginConversation() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        let session = try applyEmptySession(to: state, id: "session-rebind")
+        state.consume(.userMessage("/weixin-login"))
+        state.consume(.extensionNotification(ExtensionNotification(
+            message: "Session restored",
+            kind: .info
+        )))
+        state.consume(.settled)
+
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: session.cwd,
+            activeSessionPath: session.path,
+            activeSessionId: session.id,
+            sessions: [session],
+            messages: []
+        ), preservingInput: true)
+
+        XCTAssertEqual(state.answer?.question?.text, "/weixin-login")
+        XCTAssertEqual(state.answer?.answerText, "Session restored")
+        XCTAssertEqual(state.answer?.status, .completed)
+    }
+
+    // Shows persistent custom messages as standalone entries when no user turn owns them.
+    @MainActor
+    func testDisplayableExtensionMessageHasNoSyntheticQuestion() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        _ = try applyEmptySession(to: state, id: "session-message")
+
+        let message = PiCustomMessage(
+            customType: "plugin-data",
+            content: .object([
+                "items": .array([.integer(1), .boolean(true), .null]),
+                "label": .string("raw"),
+            ]),
+            display: true,
+            details: .object(["nested": .object(["value": .integer(42)])]),
+            timestamp: 1_000
+        )
+        state.consume(.customMessage(message))
+
+        let answer = try XCTUnwrap(state.answer)
+        XCTAssertNil(answer.question)
+        guard case .customMessage(let restoredMessage) = answer.sections.first?.content else {
+            return XCTFail("插件消息应按原始自定义消息显示")
+        }
+        XCTAssertEqual(restoredMessage, message)
+        XCTAssertTrue(answer.answerText.contains("[plugin-data]"))
+        XCTAssertTrue(answer.answerText.contains("\"items\""))
+        XCTAssertTrue(answer.answerText.contains("\"nested\""))
+        XCTAssertTrue(state.showsResultPanel)
+    }
+
+    // Exercises every fire-and-forget field that Pi documents for RPC extension clients.
+    @MainActor
+    func testRuntimeExtensionUIProtocolUpdatesNativeStateByKey() throws {
+        let directory = try temporaryDirectory()
+        let state = try AppState(
+            applicationSupportDirectory: directory,
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        _ = try applyEmptySession(to: state, id: "session-ui")
+        let runtime = PiRuntime(applicationSupportDirectory: directory)
+        runtime.onEvent = { state.consume($0) }
+
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"1","method":"notify","message":"Saved","notifyType":"warning"}"#.utf8
+        ))
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"2","method":"setStatus","statusKey":"sync","statusText":"Syncing"}"#.utf8
+        ))
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"3","method":"setWidget","widgetKey":"tasks","widgetLines":["Task 1","Task 2"],"widgetPlacement":"belowEditor"}"#.utf8
+        ))
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"4","method":"setTitle","title":"Plugin workspace"}"#.utf8
+        ))
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"5","method":"set_editor_text","text":"prefilled"}"#.utf8
+        ))
+
+        XCTAssertEqual(state.answer?.answerText, "Saved")
+        guard case .extensionNotification(let notification) = state.answer?.sections.first?.content else {
+            return XCTFail("notify 应进入正文")
+        }
+        XCTAssertEqual(notification.kind, .warning)
+        XCTAssertEqual(state.extensionStatuses, [ExtensionStatus(key: "sync", text: "Syncing")])
+        XCTAssertEqual(
+            state.extensionWidgets,
+            [ExtensionWidget(key: "tasks", lines: ["Task 1", "Task 2"], placement: .belowEditor)]
+        )
+        XCTAssertEqual(state.extensionTitle, "Plugin workspace")
+        XCTAssertEqual(state.draft, "prefilled")
+        XCTAssertEqual(state.inputBarHeight, 146)
+
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"6","method":"setStatus","statusKey":"sync","statusText":"Done"}"#.utf8
+        ))
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"7","method":"setWidget","widgetKey":"tasks","widgetLines":["Done"]}"#.utf8
+        ))
+
+        XCTAssertEqual(state.extensionStatuses, [ExtensionStatus(key: "sync", text: "Done")])
+        XCTAssertEqual(
+            state.extensionWidgets,
+            [ExtensionWidget(key: "tasks", lines: ["Done"], placement: .aboveEditor)]
+        )
+
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"8","method":"setStatus","statusKey":"sync"}"#.utf8
+        ))
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"9","method":"setWidget","widgetKey":"tasks"}"#.utf8
+        ))
+
+        XCTAssertTrue(state.extensionStatuses.isEmpty)
+        XCTAssertTrue(state.extensionWidgets.isEmpty)
+    }
+
+    // Keeps concurrent event streams isolated and marks only unseen background completion.
+    @MainActor
+    func testParallelSessionsExposeRunningAndUnreadCompletionStates() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        let cwd = FileManager.default.homeDirectoryForCurrentUser
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        let foreground = conversationSession(id: "foreground", cwd: cwd, firstMessage: "前台会话")
+        let background = conversationSession(id: "background", cwd: cwd, firstMessage: "")
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: foreground.path,
+            activeSessionId: foreground.id,
+            sessions: [foreground, background],
+            messages: []
+        ))
+
+        state.consume(.userMessage("后台任务"), sessionID: background.id)
+        state.consume(.agentStarted, sessionID: background.id)
+        state.consume(.textDelta("后台回答"), sessionID: background.id)
+
+        XCTAssertEqual(state.activeSessionID, foreground.id)
+        XCTAssertTrue(state.isSessionRunning(id: background.id))
+        XCTAssertFalse(state.hasUnreadCompletion(id: background.id))
+        XCTAssertTrue(state.conversationAnswers.isEmpty)
+
+        state.consume(.settled, sessionID: background.id)
+
+        XCTAssertFalse(state.isSessionRunning(id: background.id))
+        XCTAssertTrue(state.hasUnreadCompletion(id: background.id))
+        XCTAssertEqual(state.title(for: background), "后台任务")
+
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: background.path,
+            activeSessionId: background.id,
+            sessions: [foreground, background],
+            messages: [
+                message(entryId: "user-bg", role: .user, timestamp: 1_000, text: "后台任务"),
+                message(
+                    entryId: "assistant-bg",
+                    role: .assistant,
+                    timestamp: 2_000,
+                    content: [content(type: .text, text: "后台回答")],
+                    provider: "provider",
+                    model: "model",
+                    usage: PiUsage(input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0),
+                    stopReason: "stop"
+                ),
+            ]
+        ))
+
+        XCTAssertEqual(state.activeSessionID, background.id)
+        XCTAssertFalse(state.hasUnreadCompletion(id: background.id))
+        XCTAssertEqual(state.conversationAnswers.first?.answerText, "后台回答")
+    }
+
+    // Restores displayable custom messages from the active Pi branch after a runtime restart.
+    @MainActor
+    func testSessionSnapshotRestoresDisplayableExtensionMessage() throws {
+        let directory = try temporaryDirectory()
+        let state = try AppState(
+            applicationSupportDirectory: directory,
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        let cwd = FileManager.default.homeDirectoryForCurrentUser
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        let session = conversationSession(id: "session-custom", cwd: cwd, firstMessage: "")
+        let snapshot = SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: session.path,
+            activeSessionId: session.id,
+            sessions: [session],
+            messages: [
+                message(
+                    entryId: "custom-hidden",
+                    role: .custom,
+                    timestamp: 500,
+                    customMessage: PiCustomMessage(
+                        customType: "plugin-hidden",
+                        content: .string("Hidden plugin output"),
+                        display: false,
+                        details: .null,
+                        timestamp: 500
+                    )
+                ),
+                message(
+                    entryId: "custom-1",
+                    role: .custom,
+                    timestamp: 1_000,
+                    customMessage: PiCustomMessage(
+                        customType: "plugin-output",
+                        content: .string("Persistent plugin output"),
+                        display: true,
+                        details: .object(["nested": .object(["enabled": .boolean(true)])]),
+                        timestamp: 1_000
+                    )
+                ),
+            ]
+        )
+
+        try state.applySessionSnapshot(snapshot)
+
+        let answer = try XCTUnwrap(state.conversationAnswers.first)
+        XCTAssertNil(answer.question)
+        XCTAssertEqual(answer.sections.count, 1)
+        guard case .customMessage(let message) = answer.sections[0].content else {
+            return XCTFail("历史插件消息应保留原始结构")
+        }
+        XCTAssertEqual(message, PiCustomMessage(
+            customType: "plugin-output",
+            content: .string("Persistent plugin output"),
+            display: true,
+            details: .object(["nested": .object(["enabled": .boolean(true)])]),
+            timestamp: 1_000
+        ))
+        XCTAssertEqual(
+            answer.answerText,
+            """
+            [plugin-output]
+            Persistent plugin output
+
+            details:
+            {
+              "nested" : {
+                "enabled" : true
+              }
+            }
+            """
+        )
+        XCTAssertEqual(answer.status, .completed)
     }
 
     @MainActor
@@ -136,6 +603,23 @@ final class SessionStateTests: XCTestCase {
         )
     }
 
+    @MainActor
+    private func applyEmptySession(to state: AppState, id: String) throws -> ConversationSession {
+        let cwd = FileManager.default.homeDirectoryForCurrentUser
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        let session = conversationSession(id: id, cwd: cwd, firstMessage: "")
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: session.path,
+            activeSessionId: session.id,
+            sessions: [session],
+            messages: []
+        ))
+        return session
+    }
+
     private func content(
         type: SavedAssistantContent.Kind,
         text: String? = nil,
@@ -155,6 +639,7 @@ final class SessionStateTests: XCTestCase {
     }
 
     private func message(
+        entryId: String,
         role: SavedSessionMessage.Role,
         timestamp: Double,
         text: String? = nil,
@@ -166,9 +651,11 @@ final class SessionStateTests: XCTestCase {
         errorMessage: String? = nil,
         toolCallId: String? = nil,
         toolName: String? = nil,
-        isError: Bool? = nil
+        isError: Bool? = nil,
+        customMessage: PiCustomMessage? = nil
     ) -> SavedSessionMessage {
         SavedSessionMessage(
+            entryId: entryId,
             role: role,
             timestamp: timestamp,
             text: text,
@@ -180,7 +667,8 @@ final class SessionStateTests: XCTestCase {
             errorMessage: errorMessage,
             toolCallId: toolCallId,
             toolName: toolName,
-            isError: isError
+            isError: isError,
+            customMessage: customMessage
         )
     }
 

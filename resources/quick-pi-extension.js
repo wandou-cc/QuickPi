@@ -79,6 +79,7 @@ function savedMessage(entry) {
   const message = entry.message;
   if (message.role === "user") {
     return {
+      entryId: entry.id,
       role: "user",
       timestamp: message.timestamp,
       text: normalizeUserText(textContent(message.content)),
@@ -86,6 +87,7 @@ function savedMessage(entry) {
   }
   if (message.role === "assistant") {
     return {
+      entryId: entry.id,
       role: "assistant",
       timestamp: message.timestamp,
       content: assistantContent(message.content),
@@ -104,12 +106,27 @@ function savedMessage(entry) {
   }
   if (message.role === "toolResult") {
     return {
+      entryId: entry.id,
       role: "toolResult",
       timestamp: message.timestamp,
       text: textContent(message.content),
       toolCallId: message.toolCallId,
       toolName: message.toolName,
       isError: message.isError,
+    };
+  }
+  if (message.role === "custom") {
+    return {
+      entryId: entry.id,
+      role: "custom",
+      timestamp: message.timestamp,
+      customMessage: {
+        customType: message.customType,
+        content: message.content,
+        display: message.display,
+        details: message.details,
+        timestamp: message.timestamp,
+      },
     };
   }
   return undefined;
@@ -121,7 +138,7 @@ async function sessionSnapshot(ctx) {
     throw new Error("当前会话没有持久化文件");
   }
   const activeSessionId = ctx.sessionManager.getSessionId();
-  const savedSessions = await SessionManager.list(ctx.cwd);
+  const savedSessions = await SessionManager.list(ctx.cwd, ctx.sessionManager.getSessionDir());
   const savedActiveSession = savedSessions.find((session) => session.id === activeSessionId);
   if (savedActiveSession && savedActiveSession.path !== activeSessionPath) {
     throw new Error("当前会话路径与磁盘记录不一致");
@@ -256,12 +273,37 @@ function sendSnapshot(pi, ctx) {
   const commands = pi
     .getCommands()
     .filter((command) => !command.name.startsWith("quick-"))
-    .map((command) => ({ name: command.name, source: command.source }));
+    .map((command) => ({
+      name: command.name,
+      description: command.description,
+      source: command.source,
+    }));
   notify(ctx, { kind: "snapshot", snapshot: { providers, models, commands } });
 }
 
-// Registers native-app control commands plus RPC-mode resource reload.
-export default function quickPiExtension(pi) {
+// Registers app-owned Providers before Pi resolves models, then adds native control commands.
+export default async function quickPiExtension(pi) {
+  const dataDirectory = process.env.QUICK_PI_DATA_DIR;
+  if (!dataDirectory) {
+    throw new Error("QUICK_PI_DATA_DIR 未配置");
+  }
+  const modelDocument = JSON.parse(await readFile(join(dataDirectory, "models.json"), "utf8"));
+  const credentials = await readCredentials(join(dataDirectory, "auth.json"));
+  let providerIndex = 0;
+  for (const [providerId, provider] of Object.entries(modelDocument.providers)) {
+    const credential = credentials[providerId];
+    if (credential?.type !== "api_key" || !credential.key) {
+      throw new Error(`Provider 凭证无效: ${providerId}`);
+    }
+    const environmentName = `QUICK_PI_PROVIDER_KEY_${providerIndex}`;
+    process.env[environmentName] = credential.key;
+    pi.registerProvider(providerId, {
+      ...provider,
+      apiKey: `$${environmentName}`,
+    });
+    providerIndex += 1;
+  }
+
   pi.registerCommand("quick-snapshot", {
     description: "Return Provider and model state to Quick Pi",
     handler: async (_args, ctx) => {
@@ -286,7 +328,7 @@ export default function quickPiExtension(pi) {
             throw new Error("新会话没有持久化文件");
           }
           const currentId = nextCtx.sessionManager.getSessionId();
-          const sessions = await SessionManager.listAll();
+          const sessions = await SessionManager.listAll(nextCtx.sessionManager.getSessionDir());
           for (const session of sessions) {
             if (session.id !== currentId) {
               await unlink(session.path);

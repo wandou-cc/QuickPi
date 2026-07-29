@@ -35,10 +35,14 @@ ARCHIVE_PATH="$CACHE_DIRECTORY/$ARCHIVE_NAME"
 RUNTIME_DIRECTORY="$PROJECT_ROOT/.build/pi-runtime-$PI_ARCH"
 OUTPUT_DIRECTORY="$PROJECT_ROOT/release/native-$MACHINE_ARCH"
 APP_PATH="$OUTPUT_DIRECTORY/Quick Pi.app"
-CONTENTS_PATH="$APP_PATH/Contents"
+STAGING_APP_PATH="$OUTPUT_DIRECTORY/.Quick Pi.app.staging"
+CONTENTS_PATH="$STAGING_APP_PATH/Contents"
 FRAMEWORKS_PATH="$CONTENTS_PATH/Frameworks"
 LICENSES_PATH="$CONTENTS_PATH/Resources/Licenses"
-ICONSET_PATH="$PROJECT_ROOT/.build/AppIcon.iconset"
+ASSET_CATALOG_PATH="$PROJECT_ROOT/.build/QuickPiAssets.xcassets"
+ICONSET_PATH="$ASSET_CATALOG_PATH/AppIcon.appiconset"
+ASSET_OUTPUT_PATH="$PROJECT_ROOT/.build/QuickPiAssets"
+ASSET_INFO_PATH="$PROJECT_ROOT/.build/QuickPiAssets.plist"
 APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PROJECT_ROOT/resources/Info.plist")
 UPDATE_ARCHIVE_PATH="$OUTPUT_DIRECTORY/Quick-Pi-$APP_VERSION-$MACHINE_ARCH.zip"
 
@@ -76,13 +80,14 @@ env \
   -Xswiftc -Wwarning \
   -Xswiftc ImplementationOnlyDeprecated
 
-rm -rf "$APP_PATH" "$ICONSET_PATH"
+rm -rf "$STAGING_APP_PATH" "$ASSET_CATALOG_PATH" "$ASSET_OUTPUT_PATH" "$ASSET_INFO_PATH"
 mkdir -p \
   "$CONTENTS_PATH/MacOS" \
   "$CONTENTS_PATH/Resources/pi-runtime/theme" \
   "$FRAMEWORKS_PATH" \
   "$LICENSES_PATH" \
-  "$ICONSET_PATH"
+  "$ICONSET_PATH" \
+  "$ASSET_OUTPUT_PATH"
 cp "$PROJECT_ROOT/.build/release/QuickPi" "$CONTENTS_PATH/MacOS/QuickPi"
 cp "$PROJECT_ROOT/resources/Info.plist" "$CONTENTS_PATH/Info.plist"
 /usr/libexec/PlistBuddy -c \
@@ -92,6 +97,7 @@ cp "$PROJECT_ROOT/resources/quick-pi-extension.js" "$CONTENTS_PATH/Resources/qui
 cp "$RUNTIME_DIRECTORY/pi" "$CONTENTS_PATH/Resources/pi-runtime/pi"
 cp "$RUNTIME_DIRECTORY/package.json" "$CONTENTS_PATH/Resources/pi-runtime/package.json"
 cp "$RUNTIME_DIRECTORY/photon_rs_bg.wasm" "$CONTENTS_PATH/Resources/pi-runtime/photon_rs_bg.wasm"
+ditto "$RUNTIME_DIRECTORY/export-html" "$CONTENTS_PATH/Resources/pi-runtime/export-html"
 cp "$RUNTIME_DIRECTORY/theme/dark.json" "$CONTENTS_PATH/Resources/pi-runtime/theme/dark.json"
 cp "$RUNTIME_DIRECTORY/theme/light.json" "$CONTENTS_PATH/Resources/pi-runtime/theme/light.json"
 cp "$RUNTIME_DIRECTORY/theme/theme-schema.json" "$CONTENTS_PATH/Resources/pi-runtime/theme/theme-schema.json"
@@ -115,12 +121,22 @@ sips -z 256 256 "$PROJECT_ROOT/resources/icon.png" --out "$ICONSET_PATH/icon_256
 sips -z 512 512 "$PROJECT_ROOT/resources/icon.png" --out "$ICONSET_PATH/icon_256x256@2x.png" >/dev/null
 sips -z 512 512 "$PROJECT_ROOT/resources/icon.png" --out "$ICONSET_PATH/icon_512x512.png" >/dev/null
 cp "$PROJECT_ROOT/resources/icon.png" "$ICONSET_PATH/icon_512x512@2x.png"
-iconutil -c icns "$ICONSET_PATH" -o "$CONTENTS_PATH/Resources/AppIcon.icns"
-rm -rf "$ICONSET_PATH"
+cp "$PROJECT_ROOT/resources/AppIcon.appiconset/Contents.json" "$ICONSET_PATH/Contents.json"
+DEVELOPER_DIR="$DEVELOPER_DIRECTORY" xcrun actool \
+  --compile "$ASSET_OUTPUT_PATH" \
+  --platform macosx \
+  --minimum-deployment-target 14.0 \
+  --app-icon AppIcon \
+  --output-partial-info-plist "$ASSET_INFO_PATH" \
+  "$ASSET_CATALOG_PATH" >/dev/null
+cp "$ASSET_OUTPUT_PATH/AppIcon.icns" "$CONTENTS_PATH/Resources/AppIcon.icns"
+rm -rf "$ASSET_CATALOG_PATH" "$ASSET_OUTPUT_PATH" "$ASSET_INFO_PATH"
 
 chmod 755 "$CONTENTS_PATH/MacOS/QuickPi" "$CONTENTS_PATH/Resources/pi-runtime/pi"
-codesign --force --deep --sign - "$APP_PATH"
-codesign --verify --deep --strict "$APP_PATH"
+codesign --force --deep --sign - "$STAGING_APP_PATH"
+codesign --verify --deep --strict "$STAGING_APP_PATH"
+rm -rf "$APP_PATH"
+mv "$STAGING_APP_PATH" "$APP_PATH"
 ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$UPDATE_ARCHIVE_PATH"
 
 du -sh "$APP_PATH"

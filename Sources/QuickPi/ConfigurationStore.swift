@@ -33,7 +33,7 @@ final class ConfigurationStore {
     private let settingsURL: URL
     private let piDirectory: URL
 
-    // Defines the app-owned files used by the native UI and Pi runtime.
+    // Defines the app-owned settings, custom Provider catalog, and custom credentials.
     init(applicationSupportDirectory: URL) {
         settingsURL = applicationSupportDirectory.appendingPathComponent("settings.json")
         piDirectory = applicationSupportDirectory.appendingPathComponent("pi", isDirectory: true)
@@ -97,7 +97,7 @@ final class ConfigurationStore {
         return key
     }
 
-    // Writes a custom Provider key while preserving documented credentials owned by built-in Providers.
+    // Writes one custom Provider key while preserving the other app-owned custom credentials.
     func saveAPIKey(_ key: String, providerId: String) throws {
         try createDirectories()
         let url = piDirectory.appendingPathComponent("auth.json")

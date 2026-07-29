@@ -188,10 +188,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
               let resizedWindow = notification.object as? NSWindow,
               resizedWindow === panel,
               panel.inLiveResize,
+              state.slashCommandMenuHeight == 0,
               state.showsResultPanel else {
             return
         }
-        let inputHeight: CGFloat = state.attachments.isEmpty ? 102 : 140
+        let inputHeight = state.inputBarHeight
         resultContentHeight = panel.contentLayoutRect.height - inputHeight
     }
 
@@ -239,22 +240,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Hosts settings in a titled standalone window so it remains draggable and non-modal.
     private func createSettingsWindow(state: AppState) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 600),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
         window.title = "设置"
-        window.titleVisibility = .hidden
         window.isReleasedWhenClosed = false
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.tabbingMode = .disallowed
-        window.contentView = NSHostingView(
-            rootView: SettingsView(state: state) { [unowned window] in
-                window.close()
-            }
-        )
+        window.contentView = NSHostingView(rootView: SettingsView(state: state))
         window.center()
         settingsWindow = window
     }
@@ -266,10 +262,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             presentFatalError("无法创建菜单栏入口")
             return
         }
-        button.image = NSImage(
-            systemSymbolName: "bubble.left.and.bubble.right.fill",
-            accessibilityDescription: "Quick Pi"
-        )
+        let menuBarIcon = NSApp.applicationIconImage.copy() as! NSImage
+        menuBarIcon.size = NSSize(width: 18, height: 18)
+        menuBarIcon.accessibilityDescription = "Quick Pi"
+        button.image = menuBarIcon
         button.target = self
         button.action = #selector(statusItemClicked(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -320,7 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // Switches between the hidden and focused launcher states.
     private func togglePanel() {
-        if panel?.isVisible == true {
+        if panel?.isKeyWindow == true {
             panel?.orderOut(nil)
         } else {
             showPanel()
@@ -349,9 +345,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let panel, let state else {
             return
         }
-        let inputHeight: CGFloat = state.attachments.isEmpty ? 102 : 140
+        panel.title = state.extensionTitle ?? "Quick Pi"
+        let inputHeight = state.inputBarHeight
         let targetHeight: CGFloat
-        if state.showsResultPanel {
+        if state.slashCommandMenuHeight > 0 {
+            panel.contentMinSize = NSSize(
+                width: panelMinimumWidth,
+                height: inputHeight + state.slashCommandMenuHeight
+            )
+            targetHeight = inputHeight + state.slashCommandMenuHeight
+        } else if state.showsResultPanel {
             panel.contentMinSize = NSSize(width: panelMinimumWidth, height: inputHeight + 241)
             targetHeight = inputHeight + resultContentHeight
         } else {

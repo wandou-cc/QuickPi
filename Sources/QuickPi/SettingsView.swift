@@ -1,8 +1,14 @@
 import SwiftUI
 
+private enum SettingsPane {
+    case general
+    case providers
+}
+
 struct SettingsView: View {
     @ObservedObject var state: AppState
-    let close: () -> Void
+    @AppStorage("showSystemStatus") private var showSystemStatus = true
+    @State private var selectedPane: SettingsPane = .general
     @State private var shortcut: String
     @State private var launchAtLogin: Bool
     @State private var savingGeneral = false
@@ -21,10 +27,9 @@ struct SettingsView: View {
     @State private var savingProvider = false
     @State private var providerMessage: String?
 
-    // Seeds editable controls and binds the standalone window's close action.
-    init(state: AppState, close: @escaping () -> Void) {
+    // Seeds editable controls from the persisted desktop settings.
+    init(state: AppState) {
         self.state = state
-        self.close = close
         _shortcut = State(initialValue: state.settings.shortcut)
         _launchAtLogin = State(initialValue: state.settings.launchAtLogin)
     }
@@ -34,35 +39,116 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("设置")
-                    .font(.headline)
-                if savingGeneral {
-                    ProgressView()
-                        .controlSize(.small)
+        HStack(spacing: 0) {
+            VStack(spacing: 6) {
+                Button {
+                    selectedPane = .general
+                } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: "gearshape")
+                            .frame(width: 18)
+                        Text("通用")
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
+                    .contentShape(Rectangle())
+                    .background(
+                        selectedPane == .general ? Color.accentColor.opacity(0.12) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(selectedPane == .general ? Color.accentColor : Color.primary)
+
+                Button {
+                    selectedPane = .providers
+                } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: "server.rack")
+                            .frame(width: 18)
+                        Text("Provider")
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
+                    .contentShape(Rectangle())
+                    .background(
+                        selectedPane == .providers ? Color.accentColor.opacity(0.12) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(selectedPane == .providers ? Color.accentColor : Color.primary)
+
                 Spacer()
-                Button("完成") {
-                    close()
-                }
-                .keyboardShortcut(.cancelAction)
-                .disabled(savingGeneral || syncingModels || savingProvider)
             }
-            .padding(.horizontal, 18)
-            .frame(height: 52)
+            .padding(12)
+            .frame(width: 164)
+            .frame(maxHeight: .infinity)
+            .background(Color.white)
 
             Divider()
 
-            TabView {
-                generalTab
-                    .tabItem { Label("通用", systemImage: "gearshape") }
-                providersTab
-                    .tabItem { Label("Provider", systemImage: "server.rack") }
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Group {
+                        if selectedPane == .general {
+                            Text("通用")
+                        } else if showingProviderForm {
+                            Text(isEditingProvider ? "编辑 Provider" : "添加 Provider")
+                        } else {
+                            Text("Provider")
+                        }
+                    }
+                    .font(.title3.weight(.semibold))
+
+                    if selectedPane == .general && savingGeneral {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+
+                    Spacer()
+
+                    if selectedPane == .providers {
+                        Button {
+                            if showingProviderForm {
+                                showingProviderForm = false
+                            } else {
+                                provider = ProviderConfiguration(
+                                    id: "custom-\(UUID().uuidString.lowercased())",
+                                    kind: .openAI,
+                                    name: "",
+                                    baseURL: "",
+                                    models: []
+                                )
+                                apiKey = ""
+                                selectedModelId = ""
+                                providerMessage = nil
+                                showingProviderForm = true
+                            }
+                        } label: {
+                            Label(
+                                showingProviderForm ? "返回列表" : "添加 Provider",
+                                systemImage: showingProviderForm ? "chevron.left" : "plus"
+                            )
+                        }
+                        .disabled(syncingModels || savingProvider)
+                    }
+                }
+                .padding(.horizontal, 24)
+                .frame(height: 64)
+
+                Divider()
+
+                if selectedPane == .general {
+                    generalTab
+                } else {
+                    providersTab
+                }
             }
-            .padding(16)
         }
-        .frame(width: 520, height: 600)
+        .frame(width: 700, height: 600)
         .background(Color.white)
         .preferredColorScheme(.light)
         .interactiveDismissDisabled(savingGeneral || syncingModels || savingProvider)
@@ -106,6 +192,10 @@ struct SettingsView: View {
                 ))
             }
 
+            Section("首页") {
+                Toggle("显示系统状态", isOn: $showSystemStatus)
+            }
+
             Section("软件更新") {
                 Button {
                     state.checkForUpdates()
@@ -138,35 +228,7 @@ struct SettingsView: View {
     }
 
     private var providersTab: some View {
-        VStack(spacing: 12) {
-            HStack {
-                Text("Provider")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    if showingProviderForm {
-                        showingProviderForm = false
-                    } else {
-                        provider = ProviderConfiguration(
-                            id: "custom-\(UUID().uuidString.lowercased())",
-                            kind: .openAI,
-                            name: "",
-                            baseURL: "",
-                            models: []
-                        )
-                        apiKey = ""
-                        selectedModelId = ""
-                        providerMessage = nil
-                        showingProviderForm = true
-                    }
-                } label: {
-                    Image(systemName: showingProviderForm ? "xmark" : "plus")
-                }
-                .buttonStyle(.plain)
-                .disabled(syncingModels || savingProvider)
-                .help(showingProviderForm ? "关闭" : "添加自定义 Provider")
-            }
-
+        Group {
             if showingProviderForm {
                 providerForm
             } else {
@@ -176,77 +238,141 @@ struct SettingsView: View {
     }
 
     private var providerList: some View {
-        VStack(spacing: 8) {
-            List(state.providerOptions) { item in
-                if let stored = state.settings.providers.first(where: { $0.id == item.id }) {
-                    customProviderRow(stored)
-                } else {
-                    builtInProviderRow(item)
+        VStack(spacing: 0) {
+            List {
+                Section("自定义 Provider") {
+                    if state.settings.providers.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "plus.circle.dashed")
+                            Text("尚未添加自定义 Provider")
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 6)
+                    } else {
+                        ForEach(state.settings.providers) { item in
+                            customProviderRow(item)
+                        }
+                    }
+                }
+
+                Section("内置 Provider") {
+                    ForEach(state.providerOptions.filter { item in
+                        !state.settings.providers.contains { $0.id == item.id }
+                    }) { item in
+                        builtInProviderRow(item)
+                    }
                 }
             }
             .listStyle(.inset)
             .scrollContentBackground(.hidden)
             .background(Color.white)
-            .overlay {
-                if state.providerOptions.isEmpty {
-                    ContentUnavailableView("没有可用 Provider", systemImage: "server.rack")
-                }
-            }
 
             if let providerMessage {
+                Divider()
                 Text(providerMessage)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(16)
             }
         }
     }
 
     private var providerForm: some View {
         Form {
-            Group {
-                Picker("类型", selection: $provider.kind) {
-                    ForEach(ProviderKind.allCases) { kind in
-                        Text(kind.title).tag(kind)
-                    }
-                }
-                .pickerStyle(.segmented)
+            Section("推荐服务") {
+                Link(destination: URL(string: "https://codeingforce.com")!) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "network")
+                            .font(.title2)
+                            .foregroundStyle(.orange)
+                            .frame(width: 28)
 
-                TextField("名称", text: $provider.name)
-                TextField(
-                    provider.kind == .openAI
-                        ? "Base URL，例如 https://api.openai.com/v1"
-                        : "Base URL，例如 https://api.anthropic.com",
-                    text: $provider.baseURL
-                )
-                SecureField(
-                    isEditingProvider ? "API Key（留空则保留已保存的 Key）" : "API Key",
-                    text: $apiKey
-                )
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Coding Force 中转站")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                            Text("codeingforce.com")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        Image(systemName: "arrow.up.right.square")
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("访问 Coding Force 中转站")
+            }
+
+            Section {
+                LabeledContent("接口类型") {
+                    Picker("", selection: $provider.kind) {
+                        ForEach(ProviderKind.allCases) { kind in
+                            Text(kind.title).tag(kind)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(width: 280)
+                    .accessibilityLabel("接口类型")
+                }
+
+                LabeledContent("名称") {
+                    TextField("", text: $provider.name)
+                        .accessibilityLabel("名称")
+                        .frame(width: 280)
+                }
+
+                LabeledContent("Base URL") {
+                    TextField("", text: $provider.baseURL)
+                        .accessibilityLabel("Base URL")
+                        .frame(width: 280)
+                }
+
+                LabeledContent("API Key") {
+                    SecureField("", text: $apiKey)
+                        .accessibilityLabel("API Key")
+                        .frame(width: 280)
+                }
             }
             .disabled(syncingModels || savingProvider)
 
-            Button {
-                Task { await syncProviderModels() }
-            } label: {
-                if syncingModels {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Label("同步模型", systemImage: "arrow.triangle.2.circlepath")
-                }
-            }
-            .disabled(
-                syncingModels
-                    || savingProvider
-                    || (!isEditingProvider
-                        && apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            )
+            Section("模型") {
+                HStack {
+                    Text(provider.models.isEmpty ? "尚未同步模型" : "\(provider.models.count) 个可用模型")
+                        .foregroundStyle(.secondary)
 
-            if !provider.models.isEmpty {
-                Picker("使用模型", selection: $selectedModelId) {
-                    ForEach(provider.models, id: \.self) { modelId in
-                        Text(modelId).tag(modelId)
+                    Spacer()
+
+                    Button {
+                        Task { await syncProviderModels() }
+                    } label: {
+                        if syncingModels {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label("同步模型", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    }
+                    .disabled(
+                        syncingModels
+                            || savingProvider
+                            || (!isEditingProvider
+                                && apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    )
+                }
+
+                if !provider.models.isEmpty {
+                    Picker("使用模型", selection: $selectedModelId) {
+                        ForEach(provider.models, id: \.self) { modelId in
+                            Text(modelId).tag(modelId)
+                        }
                     }
                 }
             }
@@ -258,25 +384,30 @@ struct SettingsView: View {
                     .textSelection(.enabled)
             }
 
-            Button {
-                Task { await saveProvider() }
-            } label: {
-                if savingProvider {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Text("保存 Provider")
+            Section {
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await saveProvider() }
+                    } label: {
+                        if savingProvider {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("保存 Provider")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        provider.models.isEmpty
+                            || selectedModelId.isEmpty
+                            || (!isEditingProvider
+                                && apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            || syncingModels
+                            || savingProvider
+                    )
                 }
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(
-                provider.models.isEmpty
-                    || selectedModelId.isEmpty
-                    || (!isEditingProvider
-                        && apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    || syncingModels
-                    || savingProvider
-            )
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)

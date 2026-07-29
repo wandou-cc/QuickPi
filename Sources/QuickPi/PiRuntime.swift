@@ -1,7 +1,15 @@
 import Foundation
 
+enum PiSessionLaunch {
+    case mostRecent
+    case existing(path: String)
+    case new(id: String)
+}
+
 enum PiRuntimeEvent {
     case agentStarted
+    case userMessage(String)
+    case userMessagePersisted
     case textDelta(String)
     case thinkingDelta(String)
     case toolStarted(id: String, name: String, input: String)
@@ -15,7 +23,12 @@ enum PiRuntimeEvent {
     case authEvent(AuthEvent)
     case authCompleted(String)
     case logoutCompleted(String)
-    case extensionNotice(String)
+    case customMessage(PiCustomMessage)
+    case extensionNotification(ExtensionNotification)
+    case extensionStatus(key: String, text: String?)
+    case extensionWidget(key: String, lines: [String]?, placement: ExtensionWidget.Placement)
+    case extensionTitle(String)
+    case extensionEditorText(String)
     case extensionPrompt(ExtensionPrompt)
     case operationFailed(String)
     case runtimeExited(String)
@@ -36,6 +49,9 @@ final class PiRuntime {
         let provider: String?
         let modelId: String?
         let sessionPath: String?
+        let entryId: String?
+        let name: String?
+        let customInstructions: String?
 
         // Builds one command from the fields defined by Pi's RPC protocol.
         init(
@@ -45,7 +61,10 @@ final class PiRuntime {
             images: [ImagePayload]? = nil,
             provider: String? = nil,
             modelId: String? = nil,
-            sessionPath: String? = nil
+            sessionPath: String? = nil,
+            entryId: String? = nil,
+            name: String? = nil,
+            customInstructions: String? = nil
         ) {
             self.id = id
             self.type = type
@@ -54,6 +73,9 @@ final class PiRuntime {
             self.provider = provider
             self.modelId = modelId
             self.sessionPath = sessionPath
+            self.entryId = entryId
+            self.name = name
+            self.customInstructions = customInstructions
         }
     }
 
@@ -73,6 +95,7 @@ final class PiRuntime {
         let id: String?
         let success: Bool
         let error: String?
+        let data: JSONValue?
     }
 
     private struct MessageUpdateEnvelope: Decodable {
@@ -104,7 +127,6 @@ final class PiRuntime {
                 let cost: Cost
             }
 
-            let role: String
             let provider: String?
             let model: String?
             let usage: Usage?
@@ -113,6 +135,47 @@ final class PiRuntime {
         }
 
         let message: Message
+    }
+
+    private struct MessageRoleEnvelope: Decodable {
+        struct Message: Decodable {
+            let role: String
+        }
+
+        let message: Message
+    }
+
+    private struct MessageStartEnvelope: Decodable {
+        struct Message: Decodable {
+            let role: String
+            let content: CustomMessageContent
+        }
+
+        let message: Message
+    }
+
+    private enum CustomMessageContent: Decodable {
+        struct Block: Decodable {
+            let type: String
+            let text: String?
+            let mimeType: String?
+        }
+
+        case text(String)
+        case blocks([Block])
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if let text = try? container.decode(String.self) {
+                self = .text(text)
+            } else {
+                self = .blocks(try container.decode([Block].self))
+            }
+        }
+    }
+
+    private struct CustomMessageEndEnvelope: Decodable {
+        let message: PiCustomMessage
     }
 
     private struct ToolExecutionStartEnvelope: Decodable {
@@ -161,6 +224,13 @@ final class PiRuntime {
         let placeholder: String?
         let options: [String]?
         let prefill: String?
+        let text: String?
+        let notifyType: String?
+        let statusKey: String?
+        let statusText: String?
+        let widgetKey: String?
+        let widgetLines: [String]?
+        let widgetPlacement: String?
     }
 
     private struct ExtensionPayload: Decodable {
@@ -209,7 +279,7 @@ final class PiRuntime {
     private var standardErrorBuffer = Data()
     private var activeRunId: UUID?
     private var errorOutput: [String] = []
-    private var commandContinuations: [String: CheckedContinuation<Void, Error>] = [:]
+    private var commandContinuations: [String: (Result<JSONValue?, Error>) -> Void] = [:]
     private var snapshotContinuation: CheckedContinuation<RuntimeSnapshot, Error>?
     private var sessionSnapshotContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var deleteSessionsContinuation: CheckedContinuation<SessionSnapshot, Error>?
@@ -217,13 +287,13 @@ final class PiRuntime {
 
     var onEvent: ((PiRuntimeEvent) -> Void)?
 
-    // Keeps Pi state isolated in this application's support directory.
+    // Keeps Quick Pi's providers and sessions isolated while Pi loads its normal global resources.
     init(applicationSupportDirectory: URL) {
         self.applicationSupportDirectory = applicationSupportDirectory
     }
 
     // Starts the bundled official Pi process and verifies that its RPC loop answers.
-    func start(settings: AppSettings) async throws {
+    func start(settings: AppSettings, session: PiSessionLaunch = .mostRecent) async throws {
         guard process == nil else {
             throw QuickPiError.message("Pi 已经在运行")
         }
@@ -253,13 +323,17 @@ final class PiRuntime {
         let errorPipe = Pipe()
         nextProcess.executableURL = piURL
         nextProcess.currentDirectoryURL = currentDirectoryURL
-        nextProcess.arguments = arguments(settings: settings, extensionURL: extensionURL)
+        nextProcess.arguments = arguments(settings: settings, extensionURL: extensionURL, session: session)
         nextProcess.standardInput = inputPipe
         nextProcess.standardOutput = outputPipe
         nextProcess.standardError = errorPipe
         var environment = ProcessInfo.processInfo.environment
-        environment["PI_CODING_AGENT_DIR"] = applicationSupportDirectory
-            .appendingPathComponent("pi", isDirectory: true).path
+        let quickPiDirectory = applicationSupportDirectory.appendingPathComponent("pi", isDirectory: true)
+        environment["PI_CODING_AGENT_DIR"] = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".pi/agent", isDirectory: true).path
+        environment["PI_CODING_AGENT_SESSION_DIR"] = quickPiDirectory
+            .appendingPathComponent("sessions", isDirectory: true).path
+        environment["QUICK_PI_DATA_DIR"] = quickPiDirectory.path
         environment["PI_OFFLINE"] = "1"
         nextProcess.environment = environment
         nextProcess.terminationHandler = { [weak self] terminatedProcess in
@@ -426,14 +500,51 @@ final class PiRuntime {
         try await sendCommand(type: "abort")
     }
 
-    // Clears Pi's in-memory conversation while preserving the running process.
-    func newSession() async throws {
-        try await sendCommand(type: "new_session")
+    // Sets the display name stored on the active Pi session.
+    func setSessionName(_ name: String) async throws {
+        try await sendCommand(type: "set_session_name", name: name)
     }
 
-    // Loads one session selected from the current working-directory snapshot.
-    func switchSession(path: String) async throws {
-        try await sendCommand(type: "switch_session", sessionPath: path)
+    // Reads Pi's exact token, message, tool, cost, and context statistics.
+    func sessionStats() async throws -> PiSessionStats {
+        try await sendCommand(type: "get_session_stats", response: PiSessionStats.self)
+    }
+
+    // Runs Pi's manual context compaction with optional user instructions.
+    func compact(instructions: String?) async throws -> PiCompactionResult {
+        try await sendCommand(
+            type: "compact",
+            customInstructions: instructions,
+            response: PiCompactionResult.self
+        )
+    }
+
+    // Clones the current branch into a new Pi session.
+    func cloneSession() async throws -> PiCloneResult {
+        try await sendCommand(type: "clone", response: PiCloneResult.self)
+    }
+
+    // Returns the exact persisted user-message ids accepted by Pi for session forking.
+    func forkMessages() async throws -> [PiForkMessage] {
+        let result = try await sendCommand(
+            type: "get_fork_messages",
+            response: PiForkMessages.self
+        )
+        return result.messages
+    }
+
+    // Forks the active session from one persisted user-message entry.
+    func fork(entryId: String) async throws -> PiForkResult {
+        try await sendCommand(
+            type: "fork",
+            entryId: entryId,
+            response: PiForkResult.self
+        )
+    }
+
+    // Exports the active Pi session through the bundled HTML exporter.
+    func exportHTML() async throws -> PiExportResult {
+        try await sendCommand(type: "export_html", response: PiExportResult.self)
     }
 
     // Replaces the active session, removes every older Pi session, and returns the new state.
@@ -453,13 +564,24 @@ final class PiRuntime {
     }
 
     // Enables Pi's native tools and resource discovery in the selected working directory.
-    private func arguments(settings: AppSettings, extensionURL: URL) -> [String] {
+    private func arguments(
+        settings: AppSettings,
+        extensionURL: URL,
+        session: PiSessionLaunch
+    ) -> [String] {
         var values = [
             "--mode", "rpc",
-            "--continue",
             "--extension", extensionURL.path,
             "--offline",
         ]
+        switch session {
+        case .mostRecent:
+            values.append("--continue")
+        case .existing(let path):
+            values.append(contentsOf: ["--session", path])
+        case .new(let id):
+            values.append(contentsOf: ["--session-id", id])
+        }
         if settings.workspacePath != nil {
             values.append(contentsOf: [
                 "--approve",
@@ -483,11 +605,20 @@ final class PiRuntime {
         images: [ImagePayload]? = nil,
         provider: String? = nil,
         modelId: String? = nil,
-        sessionPath: String? = nil
+        sessionPath: String? = nil,
+        name: String? = nil,
+        customInstructions: String? = nil
     ) async throws {
         let id = UUID().uuidString
         try await withCheckedThrowingContinuation { continuation in
-            commandContinuations[id] = continuation
+            commandContinuations[id] = { result in
+                switch result {
+                case .success:
+                    continuation.resume()
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
             do {
                 try write(RPCCommand(
                     id: id,
@@ -496,7 +627,49 @@ final class PiRuntime {
                     images: images,
                     provider: provider,
                     modelId: modelId,
-                    sessionPath: sessionPath
+                    sessionPath: sessionPath,
+                    name: name,
+                    customInstructions: customInstructions
+                ))
+            } catch {
+                commandContinuations[id] = nil
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    // Sends a correlated command and decodes the documented response data object.
+    private func sendCommand<Response: Decodable>(
+        type: String,
+        entryId: String? = nil,
+        customInstructions: String? = nil,
+        response: Response.Type
+    ) async throws -> Response {
+        let id = UUID().uuidString
+        return try await withCheckedThrowingContinuation { continuation in
+            commandContinuations[id] = { result in
+                switch result {
+                case .success(let value):
+                    guard let value else {
+                        continuation.resume(throwing: QuickPiError.message("Pi RPC 响应缺少数据"))
+                        return
+                    }
+                    do {
+                        let data = try JSONEncoder().encode(value)
+                        continuation.resume(returning: try JSONDecoder().decode(Response.self, from: data))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+            do {
+                try write(RPCCommand(
+                    id: id,
+                    type: type,
+                    entryId: entryId,
+                    customInstructions: customInstructions
                 ))
             } catch {
                 commandContinuations[id] = nil
@@ -594,6 +767,8 @@ final class PiRuntime {
                 try consumeResponse(record)
             case "agent_start":
                 onEvent?(.agentStarted)
+            case "message_start":
+                try consumeMessageStart(record)
             case "agent_settled":
                 onEvent?(.settled)
             case "message_update":
@@ -633,14 +808,45 @@ final class PiRuntime {
             return
         }
         if envelope.success {
-            continuation.resume()
+            continuation(.success(envelope.data))
         } else {
             guard let error = envelope.error else {
-                continuation.resume(throwing: QuickPiError.message("Pi RPC 错误响应缺少说明"))
+                continuation(.failure(QuickPiError.message("Pi RPC 错误响应缺少说明")))
                 return
             }
-            continuation.resume(throwing: QuickPiError.message(error))
+            continuation(.failure(QuickPiError.message(error)))
         }
+    }
+
+    // Publishes user messages injected by extensions so background plugin turns have visible context.
+    private func consumeMessageStart(_ record: Data) throws {
+        let message = try JSONDecoder().decode(MessageStartEnvelope.self, from: record).message
+        guard message.role == "user" else {
+            return
+        }
+        let text: String
+        switch message.content {
+        case .text(let value):
+            text = value
+        case .blocks(let blocks):
+            text = try blocks.map { block in
+                switch block.type {
+                case "text":
+                    guard let value = block.text else {
+                        throw QuickPiError.message("Pi 用户文本消息缺少内容")
+                    }
+                    return value
+                case "image":
+                    guard let mimeType = block.mimeType else {
+                        throw QuickPiError.message("Pi 用户图片消息缺少类型")
+                    }
+                    return "[图片：\(mimeType)]"
+                default:
+                    throw QuickPiError.message("未知的 Pi 用户消息类型：\(block.type)")
+                }
+            }.joined(separator: "\n")
+        }
+        onEvent?(.userMessage(text))
     }
 
     // Publishes text, thinking, and terminal model errors from a streaming assistant event.
@@ -673,12 +879,22 @@ final class PiRuntime {
         }
     }
 
-    // Publishes model identity, usage, and stop reason for each completed assistant turn.
+    // Publishes the complete Pi custom-message contract or metadata from a completed assistant turn.
     private func consumeMessageEnd(_ record: Data) throws {
-        let message = try JSONDecoder().decode(MessageEndEnvelope.self, from: record).message
-        guard message.role == "assistant" else {
+        let role = try JSONDecoder().decode(MessageRoleEnvelope.self, from: record).message.role
+        if role == "user" {
+            onEvent?(.userMessagePersisted)
             return
         }
+        if role == "custom" {
+            let message = try JSONDecoder().decode(CustomMessageEndEnvelope.self, from: record).message
+            onEvent?(.customMessage(message))
+            return
+        }
+        guard role == "assistant" else {
+            return
+        }
+        let message = try JSONDecoder().decode(MessageEndEnvelope.self, from: record).message
         guard let provider = message.provider,
               let model = message.model,
               let usage = message.usage,
@@ -751,7 +967,7 @@ final class PiRuntime {
     }
 
     // Decodes Quick Pi control messages and public interaction requests from loaded extensions.
-    private func consumeExtensionRequest(_ record: Data) throws {
+    func consumeExtensionRequest(_ record: Data) throws {
         let envelope = try JSONDecoder().decode(ExtensionRequestEnvelope.self, from: record)
         if envelope.method == "notify" {
             guard let message = envelope.message else {
@@ -761,8 +977,44 @@ final class PiRuntime {
                 let payload = try decodeExtensionPayload(String(message.dropFirst("quickpi:".count)))
                 try consumeExtensionPayload(payload)
             } else {
-                onEvent?(.extensionNotice(message))
+                let rawKind = envelope.notifyType ?? ExtensionNotificationKind.info.rawValue
+                guard let kind = ExtensionNotificationKind(rawValue: rawKind) else {
+                    throw QuickPiError.message("未知的 Pi 扩展通知类型：\(rawKind)")
+                }
+                onEvent?(.extensionNotification(ExtensionNotification(message: message, kind: kind)))
             }
+            return
+        }
+        if envelope.method == "setStatus" {
+            guard let key = envelope.statusKey else {
+                throw QuickPiError.message("Pi 扩展状态缺少标识")
+            }
+            onEvent?(.extensionStatus(key: key, text: envelope.statusText))
+            return
+        }
+        if envelope.method == "setWidget" {
+            guard let key = envelope.widgetKey else {
+                throw QuickPiError.message("Pi 扩展 Widget 缺少标识")
+            }
+            let rawPlacement = envelope.widgetPlacement ?? ExtensionWidget.Placement.aboveEditor.rawValue
+            guard let placement = ExtensionWidget.Placement(rawValue: rawPlacement) else {
+                throw QuickPiError.message("未知的 Pi 扩展 Widget 位置：\(rawPlacement)")
+            }
+            onEvent?(.extensionWidget(key: key, lines: envelope.widgetLines, placement: placement))
+            return
+        }
+        if envelope.method == "setTitle" {
+            guard let title = envelope.title else {
+                throw QuickPiError.message("Pi 扩展窗口标题缺少内容")
+            }
+            onEvent?(.extensionTitle(title))
+            return
+        }
+        if envelope.method == "set_editor_text" {
+            guard let text = envelope.text else {
+                throw QuickPiError.message("Pi 扩展输入框消息缺少内容")
+            }
+            onEvent?(.extensionEditorText(text))
             return
         }
         if envelope.method == "input" || envelope.method == "select" {
@@ -796,7 +1048,7 @@ final class PiRuntime {
         }
 
         guard ["input", "select", "confirm", "editor"].contains(envelope.method) else {
-            return
+            throw QuickPiError.message("未知的 Pi 扩展 UI 请求：\(envelope.method)")
         }
         guard let requestId = envelope.id, let title = envelope.title else {
             throw QuickPiError.message("Pi 扩展交互请求不完整")
@@ -932,7 +1184,7 @@ final class PiRuntime {
     // Resolves every outstanding continuation when its process can no longer answer.
     private func failPendingCommands(with error: Error) {
         for continuation in commandContinuations.values {
-            continuation.resume(throwing: error)
+            continuation(.failure(error))
         }
         commandContinuations.removeAll()
         if let continuation = snapshotContinuation {

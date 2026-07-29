@@ -80,6 +80,37 @@ final class ConfigurationStoreTests: XCTestCase {
         XCTAssertNil(try store.load().workspacePath)
     }
 
+    // Verifies that an explicit no-workspace selection is presented as the main space.
+    @MainActor
+    func testScopeTitleUsesMainSpaceWithoutWorkspace() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+
+        XCTAssertEqual(state.scopeTitle, "主空间")
+    }
+
+    // Verifies that a selected project is presented by its directory name.
+    @MainActor
+    func testScopeTitleUsesSelectedDirectoryName() throws {
+        let directory = try temporaryDirectory()
+        let workspace = directory.appendingPathComponent("client-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        let store = ConfigurationStore(applicationSupportDirectory: directory)
+        var settings = AppSettings.defaults
+        settings.workspacePath = workspace.path
+        _ = try store.save(settings)
+        let state = try AppState(
+            applicationSupportDirectory: directory,
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+
+        XCTAssertEqual(state.scopeTitle, "client-project")
+    }
+
     // Verifies that a missing project directory never becomes the active persisted workspace.
     @MainActor
     func testInvalidWorkspaceSelectionIsRejected() throws {
@@ -96,14 +127,14 @@ final class ConfigurationStoreTests: XCTestCase {
         XCTAssertEqual(state.runtimeError, "所选工作区不是有效目录")
     }
 
-    // Verifies that custom API keys remain private without overwriting a built-in OAuth credential.
-    func testAPIKeyWritePreservesBuiltInCredential() throws {
+    // Verifies that saving one custom API key preserves another custom Provider credential.
+    func testAPIKeyWritePreservesOtherCustomCredential() throws {
         let directory = try temporaryDirectory()
         let piDirectory = directory.appendingPathComponent("pi", isDirectory: true)
         try FileManager.default.createDirectory(at: piDirectory, withIntermediateDirectories: true)
         let authURL = piDirectory.appendingPathComponent("auth.json")
         let original: [String: Any] = [
-            "built-in": ["type": "oauth", "access": "token"],
+            "provider-2": ["type": "api_key", "key": "other-key"],
         ]
         try JSONSerialization.data(withJSONObject: original).write(to: authURL)
 
@@ -114,9 +145,9 @@ final class ConfigurationStoreTests: XCTestCase {
         let credentials = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: Data(contentsOf: authURL)) as? [String: Any]
         )
-        let builtIn = try XCTUnwrap(credentials["built-in"] as? [String: String])
+        let other = try XCTUnwrap(credentials["provider-2"] as? [String: String])
         let custom = try XCTUnwrap(credentials["provider-1"] as? [String: String])
-        XCTAssertEqual(builtIn, ["type": "oauth", "access": "token"])
+        XCTAssertEqual(other, ["type": "api_key", "key": "other-key"])
         XCTAssertEqual(custom, ["type": "api_key", "key": "test-key"])
         let attributes = try FileManager.default.attributesOfItem(atPath: authURL.path)
         XCTAssertEqual(attributes[.posixPermissions] as? Int, 0o600)

@@ -102,13 +102,83 @@ struct RuntimeSnapshot: Codable, Equatable {
 
 struct SlashCommand: Codable, Equatable {
     enum Source: String, Codable {
+        case app
         case `extension`
         case prompt
         case skill
+
+        var title: String {
+            switch self {
+            case .app:
+                "应用"
+            case .extension:
+                "插件"
+            case .prompt:
+                "提示"
+            case .skill:
+                "Skill"
+            }
+        }
     }
 
     let name: String
+    let description: String?
     let source: Source
+}
+
+struct PiSessionStats: Decodable, Equatable {
+    struct Tokens: Decodable, Equatable {
+        let input: Int
+        let output: Int
+        let cacheRead: Int
+        let cacheWrite: Int
+        let total: Int
+    }
+
+    struct ContextUsage: Decodable, Equatable {
+        let tokens: Int?
+        let contextWindow: Int
+        let percent: Double?
+    }
+
+    let sessionFile: String
+    let sessionId: String
+    let userMessages: Int
+    let assistantMessages: Int
+    let toolCalls: Int
+    let toolResults: Int
+    let totalMessages: Int
+    let tokens: Tokens
+    let cost: Double
+    let contextUsage: ContextUsage?
+}
+
+struct PiCompactionResult: Decodable, Equatable {
+    let summary: String
+    let tokensBefore: Int
+    let estimatedTokensAfter: Int
+}
+
+struct PiCloneResult: Decodable, Equatable {
+    let cancelled: Bool
+}
+
+struct PiForkResult: Decodable, Equatable {
+    let text: String
+    let cancelled: Bool
+}
+
+struct PiForkMessages: Decodable, Equatable {
+    let messages: [PiForkMessage]
+}
+
+struct PiForkMessage: Decodable, Equatable {
+    let entryId: String
+    let text: String
+}
+
+struct PiExportResult: Decodable, Equatable {
+    let path: String
 }
 
 enum JSONValue: Codable, Equatable {
@@ -160,6 +230,84 @@ enum JSONValue: Codable, Equatable {
             try container.encodeNil()
         }
     }
+
+    // Formats an already valid JSON value without changing its structure or field names.
+    var formattedJSON: String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return String(decoding: try! encoder.encode(self), as: UTF8.self)
+    }
+}
+
+enum CustomMessageQRCode: Equatable {
+    case absent
+    case invalid
+    case url(URL)
+}
+
+struct PiCustomMessage: Codable, Equatable {
+    let customType: String
+    let content: JSONValue
+    let display: Bool
+    let details: JSONValue?
+    let timestamp: Double
+
+    private enum CodingKeys: String, CodingKey {
+        case customType
+        case content
+        case display
+        case details
+        case timestamp
+    }
+
+    // Creates the same custom-message shape used by Pi's public extension contract.
+    init(customType: String, content: JSONValue, display: Bool, details: JSONValue?, timestamp: Double) {
+        self.customType = customType
+        self.content = content
+        self.display = display
+        self.details = details
+        self.timestamp = timestamp
+    }
+
+    // Validates the portable details.qrUrl hint without coupling it to one plugin type.
+    var qrCode: CustomMessageQRCode {
+        guard case .object(let values) = details,
+              let qrValue = values["qrUrl"] else {
+            return .absent
+        }
+        guard case .string(let value) = qrValue,
+              let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              url.host != nil else {
+            return .invalid
+        }
+        return .url(url)
+    }
+
+    // Preserves an explicit JSON null in details instead of merging it with an omitted field.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        customType = try container.decode(String.self, forKey: .customType)
+        content = try container.decode(JSONValue.self, forKey: .content)
+        display = try container.decode(Bool.self, forKey: .display)
+        details = container.contains(.details)
+            ? try container.decode(JSONValue.self, forKey: .details)
+            : nil
+        timestamp = try container.decode(Double.self, forKey: .timestamp)
+    }
+
+    // Writes details only when Pi supplied it, while retaining an explicit JSON null value.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(customType, forKey: .customType)
+        try container.encode(content, forKey: .content)
+        try container.encode(display, forKey: .display)
+        if let details {
+            try container.encode(details, forKey: .details)
+        }
+        try container.encode(timestamp, forKey: .timestamp)
+    }
 }
 
 struct ConversationSession: Codable, Equatable, Identifiable {
@@ -203,8 +351,10 @@ struct SavedSessionMessage: Codable, Equatable {
         case user
         case assistant
         case toolResult
+        case custom
     }
 
+    let entryId: String
     let role: Role
     let timestamp: Double
     let text: String?
@@ -217,6 +367,7 @@ struct SavedSessionMessage: Codable, Equatable {
     let toolCallId: String?
     let toolName: String?
     let isError: Bool?
+    let customMessage: PiCustomMessage?
 }
 
 struct SavedAssistantContent: Codable, Equatable {
@@ -281,6 +432,9 @@ struct ToolActivity: Equatable {
 
 enum AnswerSectionContent: Equatable {
     case markdown(String)
+    case extensionMessage(String)
+    case customMessage(PiCustomMessage)
+    case extensionNotification(ExtensionNotification)
     case thinking(String)
     case tool(ToolActivity)
 }
@@ -313,10 +467,11 @@ struct AnswerUsage: Equatable {
 
 struct AnswerSession: Identifiable, Equatable {
     let id: UUID = UUID()
-    let question: SubmittedQuestion
+    let question: SubmittedQuestion?
     let startedAt: Date
     var sections: [AnswerSection]
     var status: AnswerStatus
+    var forkEntryId: String? = nil
     var provider: String? = nil
     var model: String? = nil
     var usage = AnswerUsage()
@@ -326,10 +481,26 @@ struct AnswerSession: Identifiable, Equatable {
 
     var answerText: String {
         sections.compactMap { section in
-            if case .markdown(let text) = section.content {
+            switch section.content {
+            case .markdown(let text), .extensionMessage(let text):
                 return text
+            case .customMessage(let message):
+                var text = "[\(message.customType)]\n"
+                switch message.content {
+                case .string(let content):
+                    text += content
+                default:
+                    text += message.content.formattedJSON
+                }
+                if let details = message.details {
+                    text += "\n\ndetails:\n\(details.formattedJSON)"
+                }
+                return text
+            case .extensionNotification(let notification):
+                return notification.message
+            case .thinking, .tool:
+                return nil
             }
-            return nil
         }.joined(separator: "\n\n")
     }
 }
@@ -386,6 +557,37 @@ struct AuthSession: Equatable {
     var event: AuthEvent?
     var prompt: AuthPrompt?
     var error: String?
+}
+
+enum ExtensionNotificationKind: String, Equatable {
+    case info
+    case warning
+    case error
+}
+
+struct ExtensionNotification: Equatable {
+    let message: String
+    let kind: ExtensionNotificationKind
+}
+
+struct ExtensionStatus: Identifiable, Equatable {
+    let key: String
+    var text: String
+
+    var id: String { key }
+}
+
+struct ExtensionWidget: Identifiable, Equatable {
+    enum Placement: String, Equatable {
+        case aboveEditor
+        case belowEditor
+    }
+
+    let key: String
+    var lines: [String]
+    var placement: Placement
+
+    var id: String { key }
 }
 
 struct ExtensionPrompt: Equatable {
