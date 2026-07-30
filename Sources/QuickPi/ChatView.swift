@@ -7,12 +7,27 @@ import MarkdownUI
 import SwiftUI
 import UniformTypeIdentifiers
 
-private let chatMessageFontSize: CGFloat = 13
+private let chatMessageFontSize: CGFloat = 16
 private let qrCodeContext = CIContext()
 
 private struct SlashCommandScrollRequest: Equatable {
     let id = UUID()
     let commandName: String
+}
+
+private struct ResultBottomPreferenceKey: PreferenceKey {
+    static let defaultValue = CGFloat.infinity
+
+    // Keeps the single bottom position emitted by the result content.
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+// Retains scroll position without invalidating the view for every scroll-wheel event.
+private final class ResultScrollTracker {
+    var isAtBottom = true
+    var followsPendingAnswerChange = false
 }
 
 extension Notification.Name {
@@ -21,6 +36,7 @@ extension Notification.Name {
 
 struct ChatView: View {
     @ObservedObject var state: AppState
+    let togglePanelZoom: () -> Void
     @AppStorage("showSystemStatus") private var showSystemStatus = true
     @FocusState private var promptFocused: Bool
     @State private var confirmsDeletingSessions = false
@@ -28,6 +44,7 @@ struct ChatView: View {
     @State private var selectedSlashCommandIndex = 0
     @State private var slashCommandScrollRequest: SlashCommandScrollRequest?
     @State private var modelMenuPresented = false
+    @State private var resultScrollTracker = ResultScrollTracker()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -148,7 +165,7 @@ struct ChatView: View {
                     )
                 )
                     .textFieldStyle(.plain)
-                    .font(.system(size: 16))
+                    .font(.system(size: chatMessageFontSize))
                     .frame(minWidth: 120)
                     .focused($promptFocused)
                     .onSubmit {
@@ -311,7 +328,7 @@ struct ChatView: View {
                             HStack(spacing: 12) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("/\(command.name)")
-                                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
                                         .foregroundStyle(.primary)
                                         .lineLimit(1)
                                     if let description = command.description, !description.isEmpty {
@@ -388,7 +405,7 @@ struct ChatView: View {
                             HStack(spacing: 8) {
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(model.name)
-                                        .font(.system(size: 13, weight: .medium))
+                                        .font(.system(size: 14, weight: .medium))
                                         .foregroundStyle(.primary)
                                         .lineLimit(1)
                                     Text(model.providerName)
@@ -575,6 +592,9 @@ struct ChatView: View {
             }
 
             Spacer(minLength: 0)
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2, perform: togglePanelZoom)
 
             Button {
                 Task { await state.createSession() }
@@ -594,106 +614,146 @@ struct ChatView: View {
     private var resultPanel: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        ForEach(state.conversationAnswers) { answer in
-                            let tools = answer.sections.compactMap { section in
-                                if case .tool(let tool) = section.content {
-                                    return tool
-                                }
-                                return nil
-                            }
+                GeometryReader { viewport in
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            VStack(alignment: .leading, spacing: 14) {
+                                ForEach(state.conversationAnswers) { answer in
+                                    let tools = answer.sections.compactMap { section in
+                                        if case .tool(let tool) = section.content {
+                                            return tool
+                                        }
+                                        return nil
+                                    }
 
-                            if let question = answer.question {
-                                questionView(question)
-                            }
+                                    VStack(alignment: .leading, spacing: 14) {
+                                        if let question = answer.question {
+                                            questionView(question)
+                                        }
 
-                            ForEach(answer.sections) { section in
-                                AnswerSectionView(section: section, tools: tools)
-                            }
+                                        ForEach(answer.sections) { section in
+                                            AnswerSectionView(section: section, tools: tools)
+                                        }
 
-                            if answer.id == state.answer?.id && answer.sections.isEmpty && state.isAnswering {
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                    Text(answer.status == .waiting ? "正在连接模型" : "正在思考")
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-
-                            if let retry = answer.retryMessage {
-                                Label(retry, systemImage: "arrow.clockwise")
-                                    .font(.caption)
-                                    .foregroundStyle(.orange)
-                                    .textSelection(.enabled)
-                            }
-                            if let error = answer.error {
-                                Label(error, systemImage: "exclamationmark.circle")
-                                    .font(.caption)
-                                    .foregroundStyle(.red)
-                                    .textSelection(.enabled)
-                            } else if answer.status == .stopped {
-                                Label("已停止", systemImage: "stop.circle")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            answerMetadata(answer)
-
-                            if answer.forkEntryId != nil || !answer.answerText.isEmpty {
-                                HStack(spacing: 12) {
-                                    if let entryId = answer.forkEntryId {
-                                        Button {
-                                            Task {
-                                                await state.forkSession(from: entryId)
-                                                promptFocused = true
+                                        if answer.id == state.answer?.id && answer.sections.isEmpty && state.isAnswering {
+                                            HStack(spacing: 8) {
+                                                ProgressView()
+                                                    .controlSize(.small)
+                                                Text(answer.status == .waiting ? "正在连接模型" : "正在思考")
+                                                    .foregroundStyle(.secondary)
                                             }
-                                        } label: {
-                                            Image(systemName: "arrow.triangle.branch")
                                         }
-                                        .buttonStyle(.plain)
-                                        .frame(width: 24, height: 24)
-                                        .disabled(
-                                            !state.runtimeReady
-                                                || state.isBusy
-                                                || state.sessionChanging
-                                        )
-                                        .help("从此回复分叉")
-                                    }
 
-                                    if !answer.answerText.isEmpty {
-                                        Button {
-                                            copy(answer.answerText)
-                                        } label: {
-                                            Image(systemName: "doc.on.doc")
+                                        if let retry = answer.retryMessage {
+                                            Label(retry, systemImage: "arrow.clockwise")
+                                                .font(.caption)
+                                                .foregroundStyle(.orange)
+                                                .textSelection(.enabled)
                                         }
-                                        .buttonStyle(.plain)
-                                        .frame(width: 24, height: 24)
-                                        .help("复制此回复")
+                                        if let error = answer.error {
+                                            Label(error, systemImage: "exclamationmark.circle")
+                                                .font(.caption)
+                                                .foregroundStyle(.red)
+                                                .textSelection(.enabled)
+                                        } else if answer.status == .stopped {
+                                            Label("已停止", systemImage: "stop.circle")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+
+                                        answerMetadata(answer)
+
+                                        if answer.cloneEntryId != nil || !answer.answerText.isEmpty {
+                                            HStack(spacing: 12) {
+                                                if let entryId = answer.cloneEntryId {
+                                                    Button {
+                                                        Task {
+                                                            await state.cloneSession(from: entryId)
+                                                            promptFocused = true
+                                                        }
+                                                    } label: {
+                                                        Image(systemName: "arrow.triangle.branch")
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                    .frame(width: 24, height: 24)
+                                                    .disabled(
+                                                        !state.runtimeReady
+                                                            || state.isBusy
+                                                            || state.sessionChanging
+                                                    )
+                                                    .help("从此回复克隆为新会话")
+                                                }
+
+                                                if !answer.answerText.isEmpty {
+                                                    Button {
+                                                        copy(answer.answerText)
+                                                    } label: {
+                                                        Image(systemName: "doc.on.doc")
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                    .frame(width: 24, height: 24)
+                                                    .help("复制此回复")
+                                                }
+                                            }
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .id(answer.id)
+                                    .onAppear {
+                                        guard answer.id == state.conversationAnswers.last?.id else {
+                                            return
+                                        }
+                                        resultScrollTracker.isAtBottom = true
+                                        resultScrollTracker.followsPendingAnswerChange = false
+                                        proxy.scrollTo("result-bottom", anchor: .bottom)
                                     }
                                 }
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+
+                                if let runtimeError = state.runtimeError {
+                                    Label(runtimeError, systemImage: "exclamationmark.triangle")
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                        .textSelection(.enabled)
+                                }
                             }
-                        }
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 16)
+                            .frame(maxWidth: .infinity, alignment: .leading)
 
-                        if let runtimeError = state.runtimeError {
-                            Label(runtimeError, systemImage: "exclamationmark.triangle")
-                                .font(.caption)
-                                .foregroundStyle(.red)
-                                .textSelection(.enabled)
+                            Color.clear
+                                .frame(height: 1)
+                                .id("result-bottom")
+                                .background {
+                                    GeometryReader { bottom in
+                                        Color.clear.preference(
+                                            key: ResultBottomPreferenceKey.self,
+                                            value: bottom.frame(in: .named("result-scroll")).maxY
+                                        )
+                                    }
+                                }
                         }
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id("answer-bottom")
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 16)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .onChange(of: state.conversationAnswers) { _, _ in
-                    proxy.scrollTo("answer-bottom", anchor: .bottom)
+                    .coordinateSpace(name: "result-scroll")
+                    .onPreferenceChange(ResultBottomPreferenceKey.self) { bottom in
+                        resultScrollTracker.isAtBottom = bottom <= viewport.size.height + 1
+                    }
+                    .onReceive(state.objectWillChange) { _ in
+                        // Capture the position before published content moves the bottom marker.
+                        resultScrollTracker.followsPendingAnswerChange = resultScrollTracker.isAtBottom
+                    }
+                    .onChange(of: state.answer) { _, _ in
+                        let shouldFollow = resultScrollTracker.followsPendingAnswerChange
+                        resultScrollTracker.followsPendingAnswerChange = false
+                        guard shouldFollow else {
+                            return
+                        }
+                        Task { @MainActor in
+                            // Scroll after Markdown has adopted the newly published content size.
+                            await Task.yield()
+                            proxy.scrollTo("result-bottom", anchor: .bottom)
+                        }
+                    }
                 }
             }
 

@@ -318,6 +318,48 @@ export default async function quickPiExtension(pi) {
     },
   });
 
+  pi.registerCommand("quick-clone-turn", {
+    description: "Clone one completed turn into a new Quick Pi session",
+    handler: async (args, ctx) => {
+      const entryId = args.trim();
+      const branch = ctx.sessionManager.getBranch();
+      const turnStartIndex = branch.findIndex((entry) => (
+        entry.id === entryId
+          && entry.type === "message"
+          && entry.message.role === "user"
+      ));
+      if (turnStartIndex < 0) {
+        throw new Error("克隆节点不属于当前会话分支");
+      }
+
+      let targetEntry = branch[turnStartIndex];
+      let hasAssistantMessage = false;
+      for (let index = turnStartIndex + 1; index < branch.length; index += 1) {
+        const entry = branch[index];
+        if (entry.type === "message" && entry.message.role === "user") {
+          break;
+        }
+        targetEntry = entry;
+        if (entry.type === "message" && entry.message.role === "assistant") {
+          hasAssistantMessage = true;
+        }
+      }
+      if (!hasAssistantMessage) {
+        throw new Error("当前回复尚未持久化，不能克隆");
+      }
+
+      const result = await ctx.fork(targetEntry.id, {
+        position: "at",
+        withSession: async (nextCtx) => {
+          await sendSessionSnapshot(nextCtx, "sessionCloned");
+        },
+      });
+      if (result.cancelled) {
+        throw new Error("插件取消了会话克隆");
+      }
+    },
+  });
+
   pi.registerCommand("quick-delete-all-sessions", {
     description: "Delete every saved Quick Pi session",
     handler: async (_args, ctx) => {

@@ -293,10 +293,10 @@ final class AppState: ObservableObject {
         self.presentSettings = presentSettings
     }
 
-    // Generates Pi configuration, starts the process, and restores the persisted model.
-    func start() async {
+    // Generates Pi configuration and opens the exact session requested by its owning window.
+    func start(session: PiSessionLaunch = .mostRecent) async {
         runtimeGeneration += 1
-        await launchRuntime(generation: runtimeGeneration)
+        await launchRuntime(generation: runtimeGeneration, session: session)
     }
 
     // Persists the selected model first, then applies that exact disk selection to Pi.
@@ -853,36 +853,30 @@ final class AppState: ObservableObject {
         notifyPanel()
     }
 
-    // Creates a new Pi session before one persisted prompt and restores that prompt for editing.
-    func forkSession(from entryId: String) async {
+    // Clones one completed turn into a new session and switches the current window to it.
+    func cloneSession(from entryId: String) async {
         guard runtimeReady, !isBusy, !sessionChanging else {
             return
         }
-        guard let sessionID = activeSessionID, let runtime = runtimes[sessionID] else {
+        guard let sessionID = activeSessionID,
+              let sourceSession = activeSession,
+              let runtime = runtimes[sessionID] else {
             return
         }
         sessionChanging = true
         setRuntimeError(nil, sessionID: sessionID)
         notifyPanel()
         do {
-            let result = try await runtime.fork(entryId: entryId)
-            if result.cancelled {
-                sessionChanging = false
-                setRuntimeError("会话分叉已取消", sessionID: sessionID)
-                notifyPanel()
-                return
-            }
-            let snapshot = try await runtime.sessionSnapshot()
+            let snapshot = try await runtime.cloneTurn(entryId: entryId)
             try validateSessionSnapshot(snapshot)
-            guard snapshot.activeSessionId != sessionID else {
-                throw QuickPiError.message("Pi 没有创建分叉会话")
+            guard snapshot.activeSessionId != sessionID,
+                  snapshot.activeSessionPath != sourceSession.path,
+                  snapshot.sessions.contains(where: { $0.id == sessionID && $0.path == sourceSession.path }) else {
+                throw QuickPiError.message("Pi 没有创建独立的克隆会话")
             }
             try applySessionSnapshot(snapshot)
             rebindRuntime(runtime, from: sessionID, to: snapshot.activeSessionId)
-            readySessionIDs.insert(snapshot.activeSessionId)
-            updateSession(snapshot.activeSessionId) { $0.draft = result.text }
         } catch {
-            removeRuntime(runtime, stopping: true)
             setRuntimeError(error.localizedDescription, sessionID: sessionID)
         }
         sessionChanging = false
@@ -1220,7 +1214,7 @@ final class AppState: ObservableObject {
     }
 
     // Runs the deterministic lifecycle only for the latest persisted configuration generation.
-    private func launchRuntime(generation: Int) async {
+    private func launchRuntime(generation: Int, session: PiSessionLaunch) async {
         guard generation == runtimeGeneration else {
             return
         }
@@ -1240,7 +1234,7 @@ final class AppState: ObservableObject {
         let runtime = makeRuntime()
         do {
             try store.writeModels(for: settings)
-            let modelError = try await startRuntime(runtime, session: .mostRecent)
+            let modelError = try await startRuntime(runtime, session: session)
             guard generation == runtimeGeneration else {
                 removeRuntime(runtime, stopping: true)
                 return
@@ -1251,6 +1245,18 @@ final class AppState: ObservableObject {
                 return
             }
             try validateSessionSnapshot(sessionSnapshot)
+            switch session {
+            case .mostRecent:
+                break
+            case .existing(let path):
+                guard sessionSnapshot.activeSessionPath == path else {
+                    throw QuickPiError.message("Pi 没有打开指定会话")
+                }
+            case .new(let id):
+                guard sessionSnapshot.activeSessionId == id else {
+                    throw QuickPiError.message("Pi 没有创建指定会话")
+                }
+            }
             try applySessionSnapshot(sessionSnapshot)
             bindRuntime(runtime, to: sessionSnapshot.activeSessionId)
             if runtimes[sessionSnapshot.activeSessionId] === runtime {
@@ -1296,7 +1302,7 @@ final class AppState: ObservableObject {
         notifyPanel()
         let generation = runtimeGeneration
         Task {
-            await launchRuntime(generation: generation)
+            await launchRuntime(generation: generation, session: .mostRecent)
             guard generation == runtimeGeneration, runtimeReady, let message else {
                 return
             }
@@ -1411,7 +1417,7 @@ final class AppState: ObservableObject {
                     startedAt: Date(timeIntervalSince1970: message.timestamp / 1_000),
                     sections: [],
                     status: .waiting,
-                    forkEntryId: message.entryId
+                    cloneEntryId: message.entryId
                 )
             case .assistant:
                 guard var answer = current,
@@ -1816,13 +1822,13 @@ final class AppState: ObservableObject {
                         return
                     }
                     guard let entry = messages.last else {
-                        throw QuickPiError.message("Pi 没有返回当前消息的分叉点")
+                        throw QuickPiError.message("Pi 没有返回当前消息的克隆节点")
                     }
                     guard sessionExecutions[sessionID]?.answer != nil else {
                         throw QuickPiError.message("当前回复不存在")
                     }
                     updateSession(sessionID) { execution in
-                        execution.answer?.forkEntryId = entry.entryId
+                        execution.answer?.cloneEntryId = entry.entryId
                     }
                 } catch {
                     guard generation == sessionExecutions[sessionID]?.answerGeneration else {

@@ -151,7 +151,7 @@ struct SettingsView: View {
                 }
             }
         }
-        .frame(width: 700, height: 600)
+        .frame(width: 780, height: 660)
         .background(Color.white)
         .preferredColorScheme(.light)
         .interactiveDismissDisabled(savingGeneral || syncingModels || savingProvider)

@@ -163,11 +163,6 @@ struct PiCloneResult: Decodable, Equatable {
     let cancelled: Bool
 }
 
-struct PiForkResult: Decodable, Equatable {
-    let text: String
-    let cancelled: Bool
-}
-
 struct PiForkMessages: Decodable, Equatable {
     let messages: [PiForkMessage]
 }
@@ -471,7 +466,7 @@ struct AnswerSession: Identifiable, Equatable {
     let startedAt: Date
     var sections: [AnswerSection]
     var status: AnswerStatus
-    var forkEntryId: String? = nil
+    var cloneEntryId: String? = nil
     var provider: String? = nil
     var model: String? = nil
     var usage = AnswerUsage()

@@ -1,54 +1,84 @@
-# Quick Pi
+<p align="center">
+  <img src="resources/icon.png" width="112" alt="Quick Pi 图标">
+</p>
 
-Quick Pi 是一款 macOS 菜单栏 AI 助手。它将 [Pi](https://github.com/earendil-works/pi)
-运行时打包在应用内，可以通过全局快捷键随时打开一个轻量问答窗口。
+<h1 align="center">Quick Pi</h1>
 
-## 主要功能
+<p align="center">
+  随时唤起、能理解项目并执行任务的原生 macOS AI 助手
+</p>
 
-- 使用全局快捷键或菜单栏图标快速打开问答窗口。
-- 支持流式 Markdown 回答，并展示思考过程、工具执行状态、Token 用量与费用。
-- 支持 Pi 内置 Provider 的 API Key 或 OAuth 登录。
-- 支持添加 OpenAI Responses 和 Anthropic Messages 兼容的自定义 Provider。
-- 支持图片、PDF、DOCX、常见文本及代码文件附件。
-- 可选择并记住一个项目工作区，让 Pi 以项目根目录运行并读取项目说明。
-- 支持按运行目录隔离的持久化多轮会话，可命名、克隆、分叉、压缩或导出。
-- 输入 `/` 可搜索应用、扩展、技能和提示模板命令，并查看命令说明与来源。
-- 支持 Pi RPC 扩展 UI 的通知、状态、文本 Widget、窗口标题、编辑器文本与交互对话框。
-- 开放 Pi 内置工具和扩展注册的工具，包括终端与文件系统工具。
-- 回答区域可折叠，并可查看本机 CPU、内存和系统运行状态。
-- 支持登录后自动启动和 Sparkle 应用内更新。
+<p align="center">
+  <a href="https://github.com/wandou-cc/QuickPi/releases">下载安装</a>
+  ·
+  <a href="#核心功能">核心功能</a>
+  ·
+  <a href="#快速开始">快速开始</a>
+  ·
+  <a href="#开发">开发</a>
+</p>
 
-## 系统要求
+Quick Pi 是一款常驻菜单栏的原生 macOS AI 助手。发布版内置
+[Pi](https://github.com/earendil-works/pi) Runtime，无需单独安装命令行环境；按下全局快捷键即可开始问答，也可以选择一个项目目录，让 Pi 读取代码、编辑文件、调用工具并持续处理任务。
 
-- macOS 14 或更高版本
-- Apple Silicon 或 Intel Mac
-- 从源码构建时需要安装 Xcode
+## 核心优势
 
-## 安装
+| 优势 | 实际价值 |
+| --- | --- |
+| 原生且随手可用 | 常驻菜单栏，通过全局快捷键快速呼出；支持所有桌面与全屏空间，并可选择失焦后自动隐藏。 |
+| 不只是聊天 | 选择工作区后，Pi 会以项目根目录运行，可使用终端、文件系统及扩展提供的工具完成实际任务。 |
+| Provider 不绑定 | 既支持 Pi 内置 Provider 的 API Key/OAuth 登录，也支持 OpenAI Responses 和 Anthropic Messages 兼容服务。 |
+| 会话持续且可并行 | 会话自动保存并按工作区隔离；切换到其他会话后，正在执行的任务可以继续运行。 |
+| 执行过程透明 | 实时展示 Markdown 回答、思考过程、工具输入输出、重试、错误、模型、Token 与费用。 |
+| 沿用 Pi 生态 | 可直接加载 Pi 的扩展、Skill、提示模板、项目上下文文件及已安装 package。 |
+| 数据位置明确 | 应用设置、自定义 Provider 和会话保存在本机固定目录，凭证文件限制为当前用户访问。 |
 
-从项目的 [GitHub Releases](https://github.com/wandou-cc/QuickPi/releases) 下载与 Mac
-架构匹配的 `Quick-Pi-<版本号>-<架构>.zip`，解压后打开 `Quick Pi.app`。
+## 核心功能
 
-## 使用
+### 快速问答
 
-1. 打开 Quick Pi，进入“设置 > Provider”。
-2. 登录 Pi 提供的内置 Provider，或添加自定义 Provider 并同步模型列表。
-3. 需要处理项目时，从问答窗口选择工作区。
-4. 从问答窗口选择模型，然后输入问题并按 Return 发送。
-5. 默认快捷键是 `Command + Shift + Space`，可在“设置 > 通用”中修改。
+- 点击菜单栏图标或使用全局快捷键打开悬浮问答窗口。
+- 默认快捷键为 `Command + Shift + Space`，也可改为其他预设组合。
+- 支持流式 Markdown、代码块复制、停止生成，以及回答区域展开或收起。
+- 每个问题和回答都可单独复制；任意已完成回答都可克隆为新会话并在当前窗口继续。
+- 可设置登录后自动启动、首页系统状态显示，以及主窗口失焦后是否自动隐藏。
 
-工作区决定 Pi 的项目根目录和相对路径，并在下次启动时恢复。它不是文件访问沙箱；Pi
-及其扩展以当前用户权限运行，可访问当前用户有权访问的文件并执行命令。
+### 模型与 Provider
 
-会话由 Pi 按运行目录保存。未选择工作区时只显示用户主目录下的普通会话；选择工作区后
-只显示该项目的会话，两者不会混在同一个列表中。新问题会继续当前会话并保留前文；可从
-问答窗口顶部新建或切换会话。“删除全部会话”会同时删除普通会话及所有工作区会话。
+- 使用 Pi 内置 Provider，并按 Provider 能力选择 API Key 或 OAuth 登录。
+- 添加、编辑或删除 OpenAI Responses / Anthropic Messages 兼容的自定义 Provider。
+- 从 Provider 的 `/models` 接口同步模型列表，并记住当前模型。
+- 在主窗口快速切换已配置模型；图片只会提交给支持图片输入的模型。
 
-每轮回答都可单独复制。对于已经写入会话的提问，还可以从该轮分叉出新会话，原提问会
-放回输入框供修改后重新发送。折叠回答区域不会停止正在生成的内容。
+### 工作区与 Agent 工具
 
-在输入框键入 `/` 会打开命令列表，可继续输入名称筛选，并用方向键和 Return 选择。Quick Pi
-提供以下不经过模型执行的应用命令，这些命令不接受附件：
+- 选择并记住一个项目工作区，Pi 会以该目录作为真实运行目录。
+- 开放 Pi 内置的终端、文件系统等工具，以及扩展注册的工具。
+- 自动加载项目中的 Pi 配置、扩展、Skill、提示模板和上下文说明。
+- 未选择工作区时，以用户主目录运行，并使用通用问答模式。
+
+工作区用于确定 Pi 的项目根目录和相对路径，但它不是文件访问沙箱。Pi 及其扩展以当前用户权限运行，能够访问当前用户有权访问的其他文件和命令。加载不可信项目的 `.pi` 内容前，请先检查其来源。
+
+### 多会话与上下文管理
+
+- 按运行目录保存多轮会话，主空间与各工作区的会话互不混合。
+- 支持新建、切换、命名和删除会话，并在重新启动后恢复对话、工具记录及状态。
+- 一个会话执行时可以切换到另一个会话继续工作；列表会显示运行状态和未读完成状态。
+- 支持克隆整个当前分支，也可保留到某一轮回答并在当前窗口的新会话中继续。
+- 可查看消息数、工具调用、Token、费用和上下文占用，也可压缩上下文或导出 HTML。
+
+“删除全部会话”会删除主空间及所有工作区中的 Quick Pi 会话，并在当前范围新建一个空会话。此操作不可撤销。
+
+### 附件
+
+- 支持图片、PDF、DOCX、常见文本格式及代码文件。
+- 每次最多添加 5 个附件，每个文件不超过 10 MB，单个文本内容不超过 200,000 字符。
+- 图片会在本地转换为 JPEG，并将最长边限制为 2,048 像素。
+- PDF、DOCX 与文本文件会先在本地提取文字，再随问题发送给所选模型。
+
+### 命令、扩展与 Skill
+
+在输入框键入 `/` 即可搜索应用命令、扩展命令、Skill 和提示模板；支持继续输入筛选，并使用方向键与 Return 选择。Quick Pi 自带以下不经过模型执行的应用命令，这些命令不接受附件：
 
 | 命令 | 作用 |
 | --- | --- |
@@ -61,34 +91,55 @@ Quick Pi 是一款 macOS 菜单栏 AI 助手。它将 [Pi](https://github.com/ea
 | `/clone` | 将当前会话分支克隆为新会话 |
 | `/export` | 将当前会话导出为 HTML，并显示文件路径 |
 
-Quick Pi 使用 Pi 原生的资源发现规则。用户级扩展、技能、提示模板以及通过 `pi install`
-安装的 npm/git/local package 均读取自 `~/.pi/agent/`；工作区级资源读取项目中的
-`.pi/settings.json`、`.pi/extensions/`、`.pi/skills/` 和 `.pi/prompts/`。选择工作区时，
-Quick Pi 会让 Pi 信任并直接加载该项目的 `.pi` 内容。输入 `/reload` 可调用 Pi 重新加载
-这些资源，随后可直接输入列表中注册的 `/命令`。
+Quick Pi 使用 Pi 原生的资源发现规则：
 
-Quick Pi 是基于 Pi RPC 模式的原生客户端，接入 RPC 协议支持的 `notify`、`setStatus`、
-`setWidget`、`setTitle`、编辑器文本和四类交互请求。Pi 文档中明确限定为 TUI 的
-`ctx.ui.custom()`、组件工厂和自定义终端渲染器不能在 RPC 客户端中执行；扩展应通过
-`ctx.mode` 区分 TUI 专属界面，并为 RPC 模式提供标准文本或交互请求。
-Quick Pi 还会识别自定义消息的 `details.qrUrl` 字段；任意扩展都可以提供 HTTP(S)
-地址，由原生客户端在本地生成二维码，不会请求远程图片。
+- 用户级扩展、Skill、提示模板和通过 `pi install` 安装的 package 位于 `~/.pi/agent/`。
+- 工作区级资源位于项目的 `.pi/settings.json`、`.pi/extensions/`、`.pi/skills/` 和 `.pi/prompts/`。
+- 输入 `/reload` 可重新加载这些资源，随后即可使用其中注册的命令。
 
-每次提问最多添加 5 个附件，每个文件不得超过 10 MB；文本内容不得超过 200,000
-字符。图片会在本地转换并缩放，PDF、DOCX 与文本文件会在本地提取文字后发送给模型。
+作为 Pi RPC 原生客户端，Quick Pi 支持扩展发送通知、状态、编辑器上下 Widget、窗口标题和编辑器文本，也支持 `input`、`select`、`confirm`、`editor` 四类交互请求。扩展还可通过自定义消息的 `details.qrUrl` 提供 HTTP(S) 地址，由客户端在本地生成二维码。
 
-## 本地数据
+Pi 中仅面向 TUI 的 `ctx.ui.custom()`、组件工厂和自定义终端渲染器无法在 RPC 客户端中运行。扩展应通过 `ctx.mode` 区分运行环境，并为 RPC 模式提供标准文本或交互请求。
 
-Quick Pi 自身的应用设置、自定义 Provider 配置与凭证、独立会话保存在：
+### 系统与应用集成
+
+- 首页可用一行摘要查看 CPU、内存和磁盘占用，点击后查看容量与系统运行时间。
+- 系统状态可在设置中关闭，关闭后不会继续采集。
+- 支持 Sparkle 应用内检查和安装更新。
+- 支持 Apple Silicon 与 Intel Mac 的独立原生安装包。
+
+## 系统要求
+
+- macOS 14 或更高版本
+- Apple Silicon 或 Intel Mac
+- 从源码构建时需要完整安装 Xcode
+
+## 快速开始
+
+1. 从 [GitHub Releases](https://github.com/wandou-cc/QuickPi/releases) 下载与 Mac 架构匹配的 `Quick-Pi-<版本号>-<架构>.zip`。
+2. 解压并打开 `Quick Pi.app`。
+3. 进入“设置 > Provider”，登录一个 Pi 内置 Provider，或添加自定义 Provider 并同步模型。
+4. 回到主窗口选择模型；需要处理项目时，再选择对应工作区。
+5. 输入问题并按 Return 发送。默认全局快捷键为 `Command + Shift + Space`。
+
+## 本地数据与权限
+
+Quick Pi 自身的数据保存在：
 
 ```text
 ~/Library/Application Support/Quick Pi/
 ```
 
-应用设置位于 `settings.json`，自定义 Provider 的模型配置与凭证分别位于 `pi/models.json`
-与 `pi/auth.json`，会话位于 `pi/sessions/`。Pi 内置 Provider 的登录凭证、全局设置和已安装
-package 仍使用 `~/.pi/agent/`，因此终端 Pi 与 Quick Pi 会加载同一套全局能力。凭证文件
-仅允许当前用户访问，请勿提交或分享。
+| 路径 | 内容 |
+| --- | --- |
+| `settings.json` | 快捷键、登录启动、工作区、当前模型和自定义 Provider 配置 |
+| `pi/models.json` | 自定义 Provider 的 Pi 模型配置 |
+| `pi/auth.json` | 自定义 Provider 凭证 |
+| `pi/sessions/` | 主空间及所有工作区的 Quick Pi 会话 |
+
+Pi 内置 Provider 的凭证、全局设置和已安装 package 仍位于 `~/.pi/agent/`，因此终端 Pi 与 Quick Pi 会共用这些全局能力。应用会将自身设置、模型配置与凭证文件权限设为仅当前用户可读写；这些文件仍包含敏感信息，请勿提交或分享。
+
+问题、附件处理结果和工具输出会按所选模型与 Provider 的协议发送。使用第三方或自定义 Provider 前，应确认其数据处理政策。
 
 ## 开发
 
@@ -99,36 +150,28 @@ swift build
 swift test
 ```
 
-`swift build` 生成的可执行文件不包含 Pi Runtime 和应用资源。需要生成可直接运行的
-macOS 应用时，执行：
+`swift build` 生成的可执行文件不包含 Pi Runtime、Sparkle Framework 和完整应用资源。生成可直接运行的 macOS 应用需要执行：
 
 ```bash
 scripts/package-mac.sh
 ```
 
-脚本会下载并校验对应架构的 Pi Runtime，将 HTML 导出器和应用资源一并打包，构建
-Release 版本，并输出到 `release/native-<架构>/`。构建脚本固定使用
-`/Applications/Xcode.app` 中的 Swift 工具链。
-
-## 许可证
-
-Quick Pi 使用 [MIT License](LICENSE) 开源。项目所使用的第三方组件及其许可证见
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+打包脚本固定使用 `/Applications/Xcode.app` 的 Swift 工具链，下载并校验当前架构的 Pi Runtime，打包 HTML 导出器、应用资源、第三方许可证和 Sparkle，最终输出到 `release/native-<架构>/`。
 
 ## 发布 macOS 更新
 
-应用使用 GitHub Releases 和 Sparkle 2 检查、验证并安装更新。Apple Silicon 与 Intel 安装包包含不同的 Pi Runtime，因此每种架构使用独立的 appcast。
-
-首次发布前，本机钥匙串中必须存在更新签名私钥。项目当前使用的钥匙串账户是 `dev.pi.quick`，公开密钥已经写入 `resources/Info.plist`。私钥不能提交到 Git；请通过 `.cache/sparkle-2.9.4/tools/bin/generate_keys --account dev.pi.quick -x <仓库外的安全路径>` 单独备份。
-
-每次发布按以下步骤操作：
+Quick Pi 使用 GitHub Releases 和 Sparkle 2 分发更新。Apple Silicon 与 Intel 安装包包含不同架构的 Pi Runtime，因此各自使用独立 appcast。
 
 1. 在 `resources/Info.plist` 中更新 `CFBundleShortVersionString`，并递增 `CFBundleVersion`。
 2. 在对应架构的 Mac 上执行 `scripts/package-mac.sh`。
-3. 执行 `scripts/create-update.sh`，为该架构生成签名后的 appcast。
-4. 在 `wandou-cc/QuickPi` 创建标签为 `v<版本号>` 的非预发布 GitHub Release。
-5. 上传该架构生成的两个文件：`Quick-Pi-<版本号>-<架构>.zip` 和 `appcast-<架构>.xml`。
+3. 执行 `scripts/create-update.sh`，生成该架构签名后的 appcast。
+4. 在 `wandou-cc/QuickPi` 创建标签为 `v<版本号>` 的正式 GitHub Release。
+5. 上传 `Quick-Pi-<版本号>-<架构>.zip` 和 `appcast-<架构>.xml`。
 
-首次执行 `scripts/create-update.sh` 时，macOS 会请求读取钥匙串中的更新私钥；选择“始终允许”，后续发布即可直接签名。
+首次发布前，钥匙串中必须存在 Sparkle 更新签名私钥。当前账户名为 `dev.pi.quick`，公开密钥已写入 `resources/Info.plist`；私钥不得提交到 Git。可使用 `.cache/sparkle-2.9.4/tools/bin/generate_keys --account dev.pi.quick -x <仓库外的安全路径>` 单独备份。首次运行更新脚本时，macOS 会请求读取私钥，选择“始终允许”后即可自动签名。
 
-若同时发布 Apple Silicon 和 Intel 版本，两个架构的四个文件必须放在同一个 Release。GitHub 的 `latest` Release 必须保持为正式版本，应用中的固定更新地址才能解析到最新 appcast。
+同时发布两种架构时，需要将两个 ZIP 和两个 appcast 放入同一个正式 Release，并确保 GitHub 的 `latest` 始终指向正式版本。
+
+## 许可证
+
+Quick Pi 使用 [MIT License](LICENSE) 开源。第三方组件及其许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

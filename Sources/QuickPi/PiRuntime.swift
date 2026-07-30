@@ -49,7 +49,6 @@ final class PiRuntime {
         let provider: String?
         let modelId: String?
         let sessionPath: String?
-        let entryId: String?
         let name: String?
         let customInstructions: String?
 
@@ -62,7 +61,6 @@ final class PiRuntime {
             provider: String? = nil,
             modelId: String? = nil,
             sessionPath: String? = nil,
-            entryId: String? = nil,
             name: String? = nil,
             customInstructions: String? = nil
         ) {
@@ -73,7 +71,6 @@ final class PiRuntime {
             self.provider = provider
             self.modelId = modelId
             self.sessionPath = sessionPath
-            self.entryId = entryId
             self.name = name
             self.customInstructions = customInstructions
         }
@@ -282,6 +279,7 @@ final class PiRuntime {
     private var commandContinuations: [String: (Result<JSONValue?, Error>) -> Void] = [:]
     private var snapshotContinuation: CheckedContinuation<RuntimeSnapshot, Error>?
     private var sessionSnapshotContinuation: CheckedContinuation<SessionSnapshot, Error>?
+    private var cloneTurnContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var deleteSessionsContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var logoutContinuation: CheckedContinuation<String, Error>?
 
@@ -524,22 +522,29 @@ final class PiRuntime {
         try await sendCommand(type: "clone", response: PiCloneResult.self)
     }
 
-    // Returns the exact persisted user-message ids accepted by Pi for session forking.
+    // Clones one completed user turn at its final branch entry and returns the new session.
+    func cloneTurn(entryId: String) async throws -> SessionSnapshot {
+        guard cloneTurnContinuation == nil else {
+            throw QuickPiError.message("另一个会话克隆尚未完成")
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            cloneTurnContinuation = continuation
+            do {
+                try sendWithoutResponse(type: "prompt", message: "/quick-clone-turn \(entryId)")
+            } catch {
+                cloneTurnContinuation = nil
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    // Returns persisted user-message ids used as stable turn anchors by Quick Pi.
     func forkMessages() async throws -> [PiForkMessage] {
         let result = try await sendCommand(
             type: "get_fork_messages",
             response: PiForkMessages.self
         )
         return result.messages
-    }
-
-    // Forks the active session from one persisted user-message entry.
-    func fork(entryId: String) async throws -> PiForkResult {
-        try await sendCommand(
-            type: "fork",
-            entryId: entryId,
-            response: PiForkResult.self
-        )
     }
 
     // Exports the active Pi session through the bundled HTML exporter.
@@ -641,7 +646,6 @@ final class PiRuntime {
     // Sends a correlated command and decodes the documented response data object.
     private func sendCommand<Response: Decodable>(
         type: String,
-        entryId: String? = nil,
         customInstructions: String? = nil,
         response: Response.Type
     ) async throws -> Response {
@@ -668,7 +672,6 @@ final class PiRuntime {
                 try write(RPCCommand(
                     id: id,
                     type: type,
-                    entryId: entryId,
                     customInstructions: customInstructions
                 ))
             } catch {
@@ -1101,6 +1104,12 @@ final class PiRuntime {
             }
             sessionSnapshotContinuation = nil
             continuation.resume(returning: snapshot)
+        case "sessionCloned":
+            guard let snapshot = payload.sessionSnapshot, let continuation = cloneTurnContinuation else {
+                throw QuickPiError.message("Pi 会话克隆响应无效")
+            }
+            cloneTurnContinuation = nil
+            continuation.resume(returning: snapshot)
         case "sessionsDeleted":
             guard let snapshot = payload.sessionSnapshot, let continuation = deleteSessionsContinuation else {
                 throw QuickPiError.message("Pi 会话删除响应无效")
@@ -1170,6 +1179,10 @@ final class PiRuntime {
             sessionSnapshotContinuation = nil
             continuation.resume(throwing: error)
         }
+        if let continuation = cloneTurnContinuation {
+            cloneTurnContinuation = nil
+            continuation.resume(throwing: error)
+        }
         if let continuation = deleteSessionsContinuation {
             deleteSessionsContinuation = nil
             continuation.resume(throwing: error)
@@ -1193,6 +1206,10 @@ final class PiRuntime {
         }
         if let continuation = sessionSnapshotContinuation {
             sessionSnapshotContinuation = nil
+            continuation.resume(throwing: error)
+        }
+        if let continuation = cloneTurnContinuation {
+            cloneTurnContinuation = nil
             continuation.resume(throwing: error)
         }
         if let continuation = deleteSessionsContinuation {

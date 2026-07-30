@@ -3,7 +3,7 @@ import Carbon
 import Sparkle
 import SwiftUI
 
-private let panelMinimumWidth: CGFloat = 520
+private let panelMinimumWidth: CGFloat = 600
 
 private let hotKeyHandler: EventHandlerUPP = { _, _, userData in
     guard let userData else {
@@ -114,7 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusMenu: NSMenu?
     private var shortcut: GlobalShortcut?
     private var state: AppState?
-    private var resultContentHeight: CGFloat = 441
+    private var resultContentHeight: CGFloat = 520
 
     // Creates the menu-bar app, native panel, global shortcut, and managed Pi runtime.
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -175,10 +175,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         state?.stop()
     }
 
-    // Hides the panel instead of terminating its accessory application.
+    // Hides app windows instead of destroying their persistent view state.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
         return false
+    }
+
+    // Uses the current screen's visible area for the panel's standard zoom frame.
+    func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame newFrame: NSRect) -> NSRect {
+        guard window === panel, let screen = window.screen else {
+            return newFrame
+        }
+        return screen.visibleFrame.insetBy(dx: 24, dy: 24)
     }
 
     // Preserves only user-driven result height changes while streamed events continue updating the panel.
@@ -215,10 +223,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.mainMenu = mainMenu
     }
 
-    // Hosts the compact SwiftUI launcher in a borderless floating AppKit panel.
+    // Hosts the compact SwiftUI launcher in a borderless AppKit panel.
     private func createPanel(state: AppState) {
         let panel = QuickPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 102),
+            contentRect: NSRect(x: 0, y: 0, width: 840, height: 102),
             styleMask: [.borderless, .resizable],
             backing: .buffered,
             defer: false
@@ -228,20 +236,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
-        panel.level = .floating
         panel.hidesOnDeactivate = UserDefaults.standard.bool(forKey: "hidePanelWhenInactive")
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
         panel.contentMinSize = NSSize(width: panelMinimumWidth, height: 102)
         panel.delegate = self
-        panel.contentView = NSHostingView(rootView: ChatView(state: state))
+        panel.contentView = NSHostingView(rootView: ChatView(
+            state: state,
+            togglePanelZoom: { [weak panel] in
+                panel?.zoom(nil)
+            }
+        )
+        .dynamicTypeSize(.medium))
         self.panel = panel
     }
 
     // Hosts settings in a titled standalone window so it remains draggable and non-modal.
     private func createSettingsWindow(state: AppState) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 660),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -250,12 +263,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         window.level = .normal
         window.tabbingMode = .disallowed
+        window.delegate = self
         window.contentView = NSHostingView(rootView: SettingsView(
             state: state,
             setPanelHidesOnDeactivate: { [unowned self] hidesOnDeactivate in
                 self.panel?.hidesOnDeactivate = hidesOnDeactivate
             }
-        ))
+        )
+        .dynamicTypeSize(.medium))
         window.center()
         settingsWindow = window
     }
@@ -321,7 +336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // Switches between the hidden and focused launcher states.
     private func togglePanel() {
-        if panel?.isVisible == true {
+        if panel?.isKeyWindow == true {
             panel?.orderOut(nil)
         } else {
             showPanel()
@@ -336,7 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NotificationCenter.default.post(name: .quickPiFocusInput, object: nil)
     }
 
-    // Activates and focuses the independent settings window without changing the launcher.
+    // Opens the independent settings window above the main panel.
     private func showSettings() {
         guard let settingsWindow else {
             preconditionFailure("设置窗口必须在打开前创建")
@@ -351,6 +366,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         panel.title = state.extensionTitle ?? "Quick Pi"
+        guard !panel.isZoomed else {
+            return
+        }
         let inputHeight = state.inputBarHeight
         let targetHeight: CGFloat
         if state.slashCommandMenuHeight > 0 {

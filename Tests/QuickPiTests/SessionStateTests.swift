@@ -51,18 +51,13 @@ final class SessionStateTests: XCTestCase {
         XCTAssertNil(snapshot.commands[1].description)
     }
 
-    func testForkRPCDataDecodesPersistedEntryIDs() throws {
+    func testCloneTurnAnchorsDecodePersistedEntryIDs() throws {
         let messages = try JSONDecoder().decode(
             PiForkMessages.self,
             from: Data(#"{"messages":[{"entryId":"entry-1","text":"原始问题"}]}"#.utf8)
         )
-        let result = try JSONDecoder().decode(
-            PiForkResult.self,
-            from: Data(#"{"text":"原始问题","cancelled":false}"#.utf8)
-        )
 
         XCTAssertEqual(messages.messages, [PiForkMessage(entryId: "entry-1", text: "原始问题")])
-        XCTAssertEqual(result, PiForkResult(text: "原始问题", cancelled: false))
     }
 
     func testAnswerTextIncludesExtensionMessages() {
@@ -219,7 +214,7 @@ final class SessionStateTests: XCTestCase {
         XCTAssertEqual(state.conversationAnswers.count, 2)
         let answer = try XCTUnwrap(state.conversationAnswers.first)
         XCTAssertEqual(answer.question?.text, "检查项目")
-        XCTAssertEqual(answer.forkEntryId, "user-1")
+        XCTAssertEqual(answer.cloneEntryId, "user-1")
         XCTAssertEqual(answer.status, .completed)
         XCTAssertEqual(answer.answerText, "开始检查。\n\n检查完成。")
         XCTAssertEqual(answer.usage.totalTokens, 45)
@@ -229,13 +224,77 @@ final class SessionStateTests: XCTestCase {
         XCTAssertEqual(tool.output, "file contents")
         XCTAssertEqual(tool.status, .completed)
         XCTAssertEqual(state.conversationAnswers[1].question?.text, "继续处理")
-        XCTAssertEqual(state.conversationAnswers[1].forkEntryId, "user-2")
+        XCTAssertEqual(state.conversationAnswers[1].cloneEntryId, "user-2")
         XCTAssertEqual(state.conversationAnswers[1].answerText, "第二轮完成。")
 
         state.toggleResultPanel()
         XCTAssertFalse(state.showsResultPanel)
         state.toggleResultPanel()
         XCTAssertTrue(state.showsResultPanel)
+    }
+
+    // Switches the current window to the cloned session while keeping the source session record.
+    @MainActor
+    func testClonedTurnBecomesActiveSessionWithEmptyDraft() throws {
+        let directory = try temporaryDirectory()
+        let state = try AppState(
+            applicationSupportDirectory: directory,
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        let cwd = FileManager.default.homeDirectoryForCurrentUser
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        let sourceSession = conversationSession(id: "source-session", cwd: cwd, firstMessage: "第一轮")
+        let clonedSession = conversationSession(id: "cloned-session", cwd: cwd, firstMessage: "第一轮")
+        let firstTurn = [
+            message(entryId: "user-1", role: .user, timestamp: 1_000, text: "第一轮"),
+            message(
+                entryId: "assistant-1",
+                role: .assistant,
+                timestamp: 2_000,
+                content: [content(type: .text, text: "第一轮回答")],
+                provider: "provider",
+                model: "model",
+                usage: PiUsage(input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01),
+                stopReason: "stop"
+            ),
+        ]
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: sourceSession.path,
+            activeSessionId: sourceSession.id,
+            sessions: [sourceSession],
+            messages: firstTurn + [
+                message(entryId: "user-2", role: .user, timestamp: 3_000, text: "第二轮"),
+                message(
+                    entryId: "assistant-2",
+                    role: .assistant,
+                    timestamp: 4_000,
+                    content: [content(type: .text, text: "第二轮回答")],
+                    provider: "provider",
+                    model: "model",
+                    usage: PiUsage(input: 12, output: 6, cacheRead: 0, cacheWrite: 0, cost: 0.02),
+                    stopReason: "stop"
+                ),
+            ]
+        ))
+        state.draft = "原会话草稿"
+
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: clonedSession.path,
+            activeSessionId: clonedSession.id,
+            sessions: [clonedSession, sourceSession],
+            messages: firstTurn
+        ))
+
+        XCTAssertEqual(state.activeSessionID, clonedSession.id)
+        XCTAssertEqual(Set(state.sessions.map(\.id)), Set([sourceSession.id, clonedSession.id]))
+        XCTAssertEqual(state.conversationAnswers.map { $0.question?.text }, ["第一轮"])
+        XCTAssertEqual(state.conversationAnswers.first?.answerText, "第一轮回答")
+        XCTAssertTrue(state.draft.isEmpty)
     }
 
     @MainActor
