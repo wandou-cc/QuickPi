@@ -229,6 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.isOpaque = false
         panel.hasShadow = true
         panel.level = .floating
+        panel.hidesOnDeactivate = UserDefaults.standard.bool(forKey: "hidePanelWhenInactive")
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
         panel.contentMinSize = NSSize(width: panelMinimumWidth, height: 102)
@@ -247,10 +248,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
         window.title = "设置"
         window.isReleasedWhenClosed = false
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.level = .normal
         window.tabbingMode = .disallowed
-        window.contentView = NSHostingView(rootView: SettingsView(state: state))
+        window.contentView = NSHostingView(rootView: SettingsView(
+            state: state,
+            setPanelHidesOnDeactivate: { [unowned self] hidesOnDeactivate in
+                self.panel?.hidesOnDeactivate = hidesOnDeactivate
+            }
+        ))
         window.center()
         settingsWindow = window
     }
@@ -316,7 +321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // Switches between the hidden and focused launcher states.
     private func togglePanel() {
-        if panel?.isKeyWindow == true {
+        if panel?.isVisible == true {
             panel?.orderOut(nil)
         } else {
             showPanel()

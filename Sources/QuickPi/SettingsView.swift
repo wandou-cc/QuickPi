@@ -8,6 +8,7 @@ private enum SettingsPane {
 struct SettingsView: View {
     @ObservedObject var state: AppState
     @AppStorage("showSystemStatus") private var showSystemStatus = true
+    @AppStorage("hidePanelWhenInactive") private var hidePanelWhenInactive = false
     @State private var selectedPane: SettingsPane = .general
     @State private var shortcut: String
     @State private var launchAtLogin: Bool
@@ -26,10 +27,12 @@ struct SettingsView: View {
     @State private var syncingModels = false
     @State private var savingProvider = false
     @State private var providerMessage: String?
+    private let setPanelHidesOnDeactivate: (Bool) -> Void
 
-    // Seeds editable controls from the persisted desktop settings.
-    init(state: AppState) {
+    // Seeds editable controls and binds the live AppKit panel behavior.
+    init(state: AppState, setPanelHidesOnDeactivate: @escaping (Bool) -> Void) {
         self.state = state
+        self.setPanelHidesOnDeactivate = setPanelHidesOnDeactivate
         _shortcut = State(initialValue: state.settings.shortcut)
         _launchAtLogin = State(initialValue: state.settings.launchAtLogin)
     }
@@ -190,6 +193,10 @@ struct SettingsView: View {
                         )
                     }
                 ))
+                Toggle("失焦时隐藏主弹窗", isOn: $hidePanelWhenInactive)
+                    .onChange(of: hidePanelWhenInactive) { _, hidesOnDeactivate in
+                        setPanelHidesOnDeactivate(hidesOnDeactivate)
+                    }
             }
 
             Section("首页") {
