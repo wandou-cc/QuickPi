@@ -20,6 +20,7 @@ models.json
 *.cer
 *.der
 *.mobileprovision
+.pi
 
 # Xcode user data
 DerivedData/
