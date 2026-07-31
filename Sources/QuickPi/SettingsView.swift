@@ -20,7 +20,8 @@ struct SettingsView: View {
         kind: .openAI,
         name: "",
         baseURL: "",
-        models: []
+        models: [],
+        modelThinkingLevels: [:]
     )
     @State private var apiKey = ""
     @State private var selectedModelId = ""
@@ -123,7 +124,8 @@ struct SettingsView: View {
                                     kind: .openAI,
                                     name: "",
                                     baseURL: "",
-                                    models: []
+                                    models: [],
+                                    modelThinkingLevels: [:]
                                 )
                                 apiKey = ""
                                 selectedModelId = ""
@@ -381,6 +383,40 @@ struct SettingsView: View {
                             Text(modelId).tag(modelId)
                         }
                     }
+
+                    Toggle("支持推理", isOn: Binding(
+                        get: { provider.modelThinkingLevels?[selectedModelId] != nil },
+                        set: { supportsReasoning in
+                            guard !selectedModelId.isEmpty else {
+                                return
+                            }
+                            var configurations = provider.modelThinkingLevels ?? [:]
+                            if supportsReasoning {
+                                configurations[selectedModelId] = [
+                                    .off, .minimal, .low, .medium, .high,
+                                ]
+                            } else {
+                                configurations.removeValue(forKey: selectedModelId)
+                            }
+                            provider.modelThinkingLevels = configurations
+                        }
+                    ))
+                    .disabled(syncingModels || savingProvider)
+
+                    if let levels = provider.modelThinkingLevels?[selectedModelId] {
+                        LabeledContent("可用强度") {
+                            Menu {
+                                ForEach(ThinkingLevel.allCases, id: \.self) { level in
+                                    Toggle(level.title, isOn: thinkingLevelBinding(level))
+                                }
+                            } label: {
+                                Text(levels.map(\.title).joined(separator: "、"))
+                                    .lineLimit(1)
+                            }
+                            .frame(width: 280, alignment: .trailing)
+                        }
+                        .disabled(syncingModels || savingProvider)
+                    }
                 }
             }
 
@@ -467,9 +503,15 @@ struct SettingsView: View {
                 providerId: provider.id
             )
             provider.models = models
+            if let modelThinkingLevels = provider.modelThinkingLevels {
+                provider.modelThinkingLevels = modelThinkingLevels.filter {
+                    models.contains($0.key)
+                }
+            }
             selectedModelId = models[0]
         } catch {
             provider.models = []
+            provider.modelThinkingLevels = [:]
             selectedModelId = ""
             providerMessage = error.localizedDescription
         }
@@ -495,7 +537,8 @@ struct SettingsView: View {
                 kind: .openAI,
                 name: "",
                 baseURL: "",
-                models: []
+                models: [],
+                modelThinkingLevels: [:]
             )
             apiKey = ""
             selectedModelId = ""
@@ -507,8 +550,38 @@ struct SettingsView: View {
     // Invalidates a model catalog as soon as any connection field changes.
     private func resetSyncedModels() {
         provider.models = []
+        provider.modelThinkingLevels = [:]
         selectedModelId = ""
         providerMessage = nil
+    }
+
+    // Updates one exact Pi level while keeping the Provider capability list ordered and valid.
+    private func thinkingLevelBinding(_ level: ThinkingLevel) -> Binding<Bool> {
+        Binding(
+            get: {
+                provider.modelThinkingLevels?[selectedModelId]?.contains(level) == true
+            },
+            set: { enabled in
+                guard !selectedModelId.isEmpty,
+                      var configurations = provider.modelThinkingLevels,
+                      let configuredLevels = configurations[selectedModelId] else {
+                    return
+                }
+                var selectedLevels = Set(configuredLevels)
+                if enabled {
+                    selectedLevels.insert(level)
+                } else {
+                    selectedLevels.remove(level)
+                }
+                let orderedLevels = ThinkingLevel.allCases.filter(selectedLevels.contains)
+                if orderedLevels.contains(where: { $0 != .off }) {
+                    configurations[selectedModelId] = orderedLevels
+                } else {
+                    configurations.removeValue(forKey: selectedModelId)
+                }
+                provider.modelThinkingLevels = configurations
+            }
+        )
     }
 
     // Shows one disk-backed custom Provider and deletes it from all app-owned files.

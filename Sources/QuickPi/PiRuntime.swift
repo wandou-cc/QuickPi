@@ -48,6 +48,7 @@ final class PiRuntime {
         let images: [ImagePayload]?
         let provider: String?
         let modelId: String?
+        let level: ThinkingLevel?
         let sessionPath: String?
         let name: String?
         let customInstructions: String?
@@ -60,6 +61,7 @@ final class PiRuntime {
             images: [ImagePayload]? = nil,
             provider: String? = nil,
             modelId: String? = nil,
+            level: ThinkingLevel? = nil,
             sessionPath: String? = nil,
             name: String? = nil,
             customInstructions: String? = nil
@@ -70,6 +72,7 @@ final class PiRuntime {
             self.images = images
             self.provider = provider
             self.modelId = modelId
+            self.level = level
             self.sessionPath = sessionPath
             self.name = name
             self.customInstructions = customInstructions
@@ -84,6 +87,11 @@ final class PiRuntime {
         let cancelled: Bool?
     }
 
+    private struct CommitMessageRequest: Encodable {
+        let requestId: String
+        let context: String
+    }
+
     private struct EnvelopeType: Decodable {
         let type: String
     }
@@ -93,6 +101,14 @@ final class PiRuntime {
         let success: Bool
         let error: String?
         let data: JSONValue?
+    }
+
+    private struct RuntimeStateResponse: Decodable {
+        let thinkingLevel: ThinkingLevel
+    }
+
+    private struct ThinkingLevelsResponse: Decodable {
+        let levels: [ThinkingLevel]
     }
 
     private struct MessageUpdateEnvelope: Decodable {
@@ -265,6 +281,9 @@ final class PiRuntime {
         let event: WireAuthEvent?
         let prompt: WirePrompt?
         let providerId: String?
+        let requestId: String?
+        let message: String?
+        let error: String?
     }
 
     private let applicationSupportDirectory: URL
@@ -277,9 +296,11 @@ final class PiRuntime {
     private var activeRunId: UUID?
     private var errorOutput: [String] = []
     private var commandContinuations: [String: (Result<JSONValue?, Error>) -> Void] = [:]
+    private var commitMessageContinuations: [String: (Result<String, Error>) -> Void] = [:]
     private var snapshotContinuation: CheckedContinuation<RuntimeSnapshot, Error>?
     private var sessionSnapshotContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var cloneTurnContinuation: CheckedContinuation<SessionSnapshot, Error>?
+    private var deleteSessionContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var deleteSessionsContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var logoutContinuation: CheckedContinuation<String, Error>?
 
@@ -291,27 +312,31 @@ final class PiRuntime {
     }
 
     // Starts the bundled official Pi process and verifies that its RPC loop answers.
-    func start(settings: AppSettings, session: PiSessionLaunch = .mostRecent) async throws {
+    func start(
+        settings: AppSettings,
+        workingDirectoryURL: URL,
+        session: PiSessionLaunch = .mostRecent
+    ) async throws {
         guard process == nil else {
             throw QuickPiError.message("Pi 已经在运行")
         }
         guard let piURL = Bundle.main.url(forResource: "pi", withExtension: nil, subdirectory: "pi-runtime"),
-              let extensionURL = Bundle.main.url(forResource: "quick-pi-extension", withExtension: "js") else {
+              let extensionURL = Bundle.main.url(forResource: "quick-pi-extension", withExtension: "js"),
+              let planModeURL = Bundle.main.url(
+                forResource: "index",
+                withExtension: "ts",
+                subdirectory: "plan-mode"
+              ) else {
             throw QuickPiError.message("应用内的 Pi 运行文件不完整")
         }
 
-        let currentDirectoryURL: URL
-        if let workspaceURL = settings.workspaceURL {
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(
-                atPath: workspaceURL.path,
-                isDirectory: &isDirectory
-            ), isDirectory.boolValue else {
-                throw QuickPiError.message("工作区不存在或已不再是目录：\(workspaceURL.path)")
-            }
-            currentDirectoryURL = workspaceURL
-        } else {
-            currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        let currentDirectoryURL = workingDirectoryURL.standardizedFileURL.resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(
+            atPath: currentDirectoryURL.path,
+            isDirectory: &isDirectory
+        ), isDirectory.boolValue else {
+            throw QuickPiError.message("会话运行目录不存在：\(currentDirectoryURL.path)")
         }
 
         let runId = UUID()
@@ -321,7 +346,12 @@ final class PiRuntime {
         let errorPipe = Pipe()
         nextProcess.executableURL = piURL
         nextProcess.currentDirectoryURL = currentDirectoryURL
-        nextProcess.arguments = arguments(settings: settings, extensionURL: extensionURL, session: session)
+        nextProcess.arguments = arguments(
+            settings: settings,
+            extensionURL: extensionURL,
+            planModeURL: planModeURL,
+            session: session
+        )
         nextProcess.standardInput = inputPipe
         nextProcess.standardOutput = outputPipe
         nextProcess.standardError = errorPipe
@@ -425,13 +455,33 @@ final class PiRuntime {
         }
     }
 
-    // Selects the exact Provider and model persisted by the native app.
-    func selectModel(_ selection: ModelSelection) async throws {
+    // Selects the exact Provider and model, then reads Pi's effective reasoning capability.
+    func selectModel(_ selection: ModelSelection) async throws -> PiThinkingState {
         try await sendCommand(
             type: "set_model",
             provider: selection.providerId,
             modelId: selection.modelId
         )
+        return try await thinkingState()
+    }
+
+    // Applies one level accepted by the current model and returns Pi's effective state.
+    func selectThinkingLevel(_ level: ThinkingLevel) async throws -> PiThinkingState {
+        try await sendCommand(type: "set_thinking_level", level: level)
+        return try await thinkingState()
+    }
+
+    // Reads the current level and the model-specific list from Pi's documented RPC commands.
+    private func thinkingState() async throws -> PiThinkingState {
+        let state = try await sendCommand(type: "get_state", response: RuntimeStateResponse.self)
+        let available = try await sendCommand(
+            type: "get_available_thinking_levels",
+            response: ThinkingLevelsResponse.self
+        )
+        guard available.levels.contains(state.thinkingLevel) else {
+            throw QuickPiError.message("Pi 返回的当前推理强度不在可用列表中")
+        }
+        return PiThinkingState(level: state.thinkingLevel, availableLevels: available.levels)
     }
 
     // Starts one built-in Provider authentication flow through Pi's extension UI protocol.
@@ -491,6 +541,30 @@ final class PiRuntime {
             message: message,
             images: images
         )
+    }
+
+    // Uses the active Pi model for one isolated completion that does not enter the conversation history.
+    func generateCommitMessage(context: String) async throws -> String {
+        let requestId = UUID().uuidString
+        let requestData = try JSONEncoder().encode(CommitMessageRequest(
+            requestId: requestId,
+            context: context
+        ))
+        let encodedRequest = requestData.base64EncodedString()
+        return try await withCheckedThrowingContinuation { continuation in
+            commitMessageContinuations[requestId] = { result in
+                continuation.resume(with: result)
+            }
+            do {
+                try sendWithoutResponse(
+                    type: "prompt",
+                    message: "/quick-generate-commit-message \(encodedRequest)"
+                )
+            } catch {
+                commitMessageContinuations[requestId] = nil
+                continuation.resume(throwing: error)
+            }
+        }
     }
 
     // Aborts the current model turn through the documented RPC command.
@@ -568,15 +642,33 @@ final class PiRuntime {
         }
     }
 
+    // Deletes one inactive Pi session and returns the refreshed project session list.
+    func deleteSession(id: String) async throws -> SessionSnapshot {
+        guard deleteSessionContinuation == nil else {
+            throw QuickPiError.message("另一个会话正在删除")
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            deleteSessionContinuation = continuation
+            do {
+                try sendWithoutResponse(type: "prompt", message: "/quick-delete-session \(id)")
+            } catch {
+                deleteSessionContinuation = nil
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
     // Enables Pi's native tools and resource discovery in the selected working directory.
     private func arguments(
         settings: AppSettings,
         extensionURL: URL,
+        planModeURL: URL,
         session: PiSessionLaunch
     ) -> [String] {
         var values = [
             "--mode", "rpc",
             "--extension", extensionURL.path,
+            "--extension", planModeURL.path,
             "--offline",
         ]
         switch session {
@@ -610,6 +702,7 @@ final class PiRuntime {
         images: [ImagePayload]? = nil,
         provider: String? = nil,
         modelId: String? = nil,
+        level: ThinkingLevel? = nil,
         sessionPath: String? = nil,
         name: String? = nil,
         customInstructions: String? = nil
@@ -632,6 +725,7 @@ final class PiRuntime {
                     images: images,
                     provider: provider,
                     modelId: modelId,
+                    level: level,
                     sessionPath: sessionPath,
                     name: name,
                     customInstructions: customInstructions
@@ -969,6 +1063,15 @@ final class PiRuntime {
         }.joined(separator: "\n")
     }
 
+    // Removes terminal SGR styling because native SwiftUI renders extension status text itself.
+    private func plainExtensionText(_ text: String) -> String {
+        text.replacingOccurrences(
+            of: "\u{001B}\\[[0-9;]*m",
+            with: "",
+            options: .regularExpression
+        )
+    }
+
     // Decodes Quick Pi control messages and public interaction requests from loaded extensions.
     func consumeExtensionRequest(_ record: Data) throws {
         let envelope = try JSONDecoder().decode(ExtensionRequestEnvelope.self, from: record)
@@ -992,7 +1095,7 @@ final class PiRuntime {
             guard let key = envelope.statusKey else {
                 throw QuickPiError.message("Pi 扩展状态缺少标识")
             }
-            onEvent?(.extensionStatus(key: key, text: envelope.statusText))
+            onEvent?(.extensionStatus(key: key, text: envelope.statusText.map(plainExtensionText)))
             return
         }
         if envelope.method == "setWidget" {
@@ -1003,7 +1106,11 @@ final class PiRuntime {
             guard let placement = ExtensionWidget.Placement(rawValue: rawPlacement) else {
                 throw QuickPiError.message("未知的 Pi 扩展 Widget 位置：\(rawPlacement)")
             }
-            onEvent?(.extensionWidget(key: key, lines: envelope.widgetLines, placement: placement))
+            onEvent?(.extensionWidget(
+                key: key,
+                lines: envelope.widgetLines?.map(plainExtensionText),
+                placement: placement
+            ))
             return
         }
         if envelope.method == "setTitle" {
@@ -1110,6 +1217,12 @@ final class PiRuntime {
             }
             cloneTurnContinuation = nil
             continuation.resume(returning: snapshot)
+        case "sessionDeleted":
+            guard let snapshot = payload.sessionSnapshot, let continuation = deleteSessionContinuation else {
+                throw QuickPiError.message("Pi 单会话删除响应无效")
+            }
+            deleteSessionContinuation = nil
+            continuation.resume(returning: snapshot)
         case "sessionsDeleted":
             guard let snapshot = payload.sessionSnapshot, let continuation = deleteSessionsContinuation else {
                 throw QuickPiError.message("Pi 会话删除响应无效")
@@ -1133,6 +1246,25 @@ final class PiRuntime {
             logoutContinuation = nil
             continuation.resume(returning: providerId)
             onEvent?(.logoutCompleted(providerId))
+        case "commitMessage":
+            guard let requestId = payload.requestId,
+                  let message = payload.message,
+                  let continuation = commitMessageContinuations.removeValue(forKey: requestId) else {
+                throw QuickPiError.message("Pi 提交信息响应无效")
+            }
+            let value = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else {
+                continuation(.failure(QuickPiError.message("当前模型生成了空提交信息")))
+                return
+            }
+            continuation(.success(value))
+        case "commitMessageError":
+            guard let requestId = payload.requestId,
+                  let message = payload.error,
+                  let continuation = commitMessageContinuations.removeValue(forKey: requestId) else {
+                throw QuickPiError.message("Pi 提交信息错误响应无效")
+            }
+            continuation(.failure(QuickPiError.message(message)))
         default:
             throw QuickPiError.message("未知的 Pi 扩展事件：\(payload.kind)")
         }
@@ -1171,6 +1303,10 @@ final class PiRuntime {
 
     // Resolves extension waiters and publishes the same explicit failure to the UI.
     private func failExtensionOperation(with error: Error) {
+        for continuation in commitMessageContinuations.values {
+            continuation(.failure(error))
+        }
+        commitMessageContinuations.removeAll()
         if let continuation = snapshotContinuation {
             snapshotContinuation = nil
             continuation.resume(throwing: error)
@@ -1181,6 +1317,10 @@ final class PiRuntime {
         }
         if let continuation = cloneTurnContinuation {
             cloneTurnContinuation = nil
+            continuation.resume(throwing: error)
+        }
+        if let continuation = deleteSessionContinuation {
+            deleteSessionContinuation = nil
             continuation.resume(throwing: error)
         }
         if let continuation = deleteSessionsContinuation {
@@ -1200,6 +1340,10 @@ final class PiRuntime {
             continuation(.failure(error))
         }
         commandContinuations.removeAll()
+        for continuation in commitMessageContinuations.values {
+            continuation(.failure(error))
+        }
+        commitMessageContinuations.removeAll()
         if let continuation = snapshotContinuation {
             snapshotContinuation = nil
             continuation.resume(throwing: error)
@@ -1210,6 +1354,10 @@ final class PiRuntime {
         }
         if let continuation = cloneTurnContinuation {
             cloneTurnContinuation = nil
+            continuation.resume(throwing: error)
+        }
+        if let continuation = deleteSessionContinuation {
+            deleteSessionContinuation = nil
             continuation.resume(throwing: error)
         }
         if let continuation = deleteSessionsContinuation {

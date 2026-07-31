@@ -83,6 +83,7 @@ env \
 rm -rf "$STAGING_APP_PATH" "$ASSET_CATALOG_PATH" "$ASSET_OUTPUT_PATH" "$ASSET_INFO_PATH"
 mkdir -p \
   "$CONTENTS_PATH/MacOS" \
+  "$CONTENTS_PATH/Resources/plan-mode" \
   "$CONTENTS_PATH/Resources/pi-runtime/theme" \
   "$FRAMEWORKS_PATH" \
   "$LICENSES_PATH" \
@@ -94,6 +95,13 @@ cp "$PROJECT_ROOT/resources/Info.plist" "$CONTENTS_PATH/Info.plist"
   "Set :SUFeedURL https://github.com/wandou-cc/QuickPi/releases/latest/download/appcast-$MACHINE_ARCH.xml" \
   "$CONTENTS_PATH/Info.plist"
 cp "$PROJECT_ROOT/resources/quick-pi-extension.js" "$CONTENTS_PATH/Resources/quick-pi-extension.js"
+if [ ! -f "$RUNTIME_DIRECTORY/examples/extensions/plan-mode/index.ts" ] || \
+   [ ! -f "$RUNTIME_DIRECTORY/examples/extensions/plan-mode/utils.ts" ]; then
+  echo "Official Pi archive does not contain the plan-mode extension" >&2
+  exit 1
+fi
+cp "$RUNTIME_DIRECTORY/examples/extensions/plan-mode/index.ts" "$CONTENTS_PATH/Resources/plan-mode/index.ts"
+cp "$RUNTIME_DIRECTORY/examples/extensions/plan-mode/utils.ts" "$CONTENTS_PATH/Resources/plan-mode/utils.ts"
 cp "$RUNTIME_DIRECTORY/pi" "$CONTENTS_PATH/Resources/pi-runtime/pi"
 cp "$RUNTIME_DIRECTORY/package.json" "$CONTENTS_PATH/Resources/pi-runtime/package.json"
 cp "$RUNTIME_DIRECTORY/photon_rs_bg.wasm" "$CONTENTS_PATH/Resources/pi-runtime/photon_rs_bg.wasm"

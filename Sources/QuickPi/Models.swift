@@ -30,12 +30,42 @@ struct ModelSelection: Codable, Equatable {
     let modelId: String
 }
 
+enum ThinkingLevel: String, Codable, CaseIterable, Equatable {
+    case off
+    case minimal
+    case low
+    case medium
+    case high
+    case xhigh
+    case max
+
+    var title: String {
+        switch self {
+        case .off:
+            "关闭"
+        case .minimal:
+            "最低"
+        case .low:
+            "低"
+        case .medium:
+            "中"
+        case .high:
+            "高"
+        case .xhigh:
+            "极高"
+        case .max:
+            "最高"
+        }
+    }
+}
+
 struct ProviderConfiguration: Codable, Equatable, Identifiable {
     let id: String
     var kind: ProviderKind
     var name: String
     var baseURL: String
     var models: [String]
+    var modelThinkingLevels: [String: [ThinkingLevel]]? = nil
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -43,6 +73,7 @@ struct ProviderConfiguration: Codable, Equatable, Identifiable {
         case name
         case baseURL = "baseUrl"
         case models
+        case modelThinkingLevels
     }
 }
 
@@ -70,6 +101,17 @@ struct AppSettings: Codable, Equatable {
     )
 }
 
+struct ManagedWorktree: Codable, Equatable, Identifiable, Sendable {
+    let id: String
+    let repositoryPath: String
+    let localWorkspacePath: String
+    let worktreePath: String
+    let workspacePath: String
+    let baseCommit: String
+    let createdAt: Double
+    var branch: String?
+}
+
 struct ProviderStatus: Codable, Identifiable, Equatable {
     let id: String
     let name: String
@@ -84,6 +126,7 @@ struct ModelOption: Codable, Identifiable, Equatable {
     let providerId: String
     let providerName: String
     let supportsImages: Bool
+    let supportsReasoning: Bool
 
     var selection: ModelSelection {
         ModelSelection(providerId: providerId, modelId: id)
@@ -98,6 +141,11 @@ struct RuntimeSnapshot: Codable, Equatable {
     let providers: [ProviderStatus]
     let models: [ModelOption]
     let commands: [SlashCommand]
+}
+
+struct PiThinkingState: Equatable {
+    let level: ThinkingLevel
+    let availableLevels: [ThinkingLevel]
 }
 
 struct SlashCommand: Codable, Equatable {
@@ -428,6 +476,7 @@ struct ToolActivity: Equatable {
 enum AnswerSectionContent: Equatable {
     case markdown(String)
     case extensionMessage(String)
+    case fileLink(URL)
     case customMessage(PiCustomMessage)
     case extensionNotification(ExtensionNotification)
     case thinking(String)
@@ -479,6 +528,8 @@ struct AnswerSession: Identifiable, Equatable {
             switch section.content {
             case .markdown(let text), .extensionMessage(let text):
                 return text
+            case .fileLink(let url):
+                return url.path
             case .customMessage(let message):
                 var text = "[\(message.customType)]\n"
                 switch message.content {
@@ -566,6 +617,9 @@ struct ExtensionNotification: Equatable {
 }
 
 struct ExtensionStatus: Identifiable, Equatable {
+    // Matches the status key emitted by Pi's bundled plan-mode extension.
+    static let planModeKey = "plan-mode"
+
     let key: String
     var text: String
 
@@ -573,6 +627,9 @@ struct ExtensionStatus: Identifiable, Equatable {
 }
 
 struct ExtensionWidget: Identifiable, Equatable {
+    // Matches the checklist key emitted by Pi's bundled plan-mode extension.
+    static let planModeKey = "plan-todos"
+
     enum Placement: String, Equatable {
         case aboveEditor
         case belowEditor

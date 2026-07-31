@@ -23,20 +23,48 @@ final class ConfigurationStore {
 
         let id: String
         let name: String
-        let reasoning = false
+        let reasoning: Bool
+        let thinkingLevelMap: [String: String?]?
         let input = ["text", "image"]
         let contextWindow = 128_000
         let maxTokens = 16_384
         let cost = Cost()
+
+        // Converts the explicitly configured model capability into Pi's exact level map.
+        init(id: String, name: String, thinkingLevels: [ThinkingLevel]?) {
+            self.id = id
+            self.name = name
+            guard let thinkingLevels else {
+                reasoning = false
+                thinkingLevelMap = nil
+                return
+            }
+            let supported = Set(thinkingLevels)
+            reasoning = true
+            let entries: [(String, String?)] = ThinkingLevel.allCases.compactMap { level in
+                if !supported.contains(level) {
+                    return (level.rawValue, nil)
+                }
+                switch level {
+                case .xhigh, .max:
+                    return (level.rawValue, level.rawValue)
+                case .off, .minimal, .low, .medium, .high:
+                    return nil
+                }
+            }
+            thinkingLevelMap = Dictionary(uniqueKeysWithValues: entries)
+        }
     }
 
     private let settingsURL: URL
     private let piDirectory: URL
+    private let worktreesURL: URL
 
     // Defines the app-owned settings, custom Provider catalog, and custom credentials.
     init(applicationSupportDirectory: URL) {
         settingsURL = applicationSupportDirectory.appendingPathComponent("settings.json")
         piDirectory = applicationSupportDirectory.appendingPathComponent("pi", isDirectory: true)
+        worktreesURL = applicationSupportDirectory.appendingPathComponent("worktrees.json")
     }
 
     // Reads the exact current settings schema; only a genuinely missing file means first launch.
@@ -56,6 +84,35 @@ final class ConfigurationStore {
         return try load()
     }
 
+    // Reads the exact persisted association between Pi sessions and app-managed Git worktrees.
+    func loadManagedWorktrees() throws -> [ManagedWorktree] {
+        guard FileManager.default.fileExists(atPath: worktreesURL.path) else {
+            return []
+        }
+        let worktrees = try JSONDecoder().decode(
+            [ManagedWorktree].self,
+            from: Data(contentsOf: worktreesURL)
+        )
+        guard Set(worktrees.map(\.id)).count == worktrees.count,
+              Set(worktrees.map(\.worktreePath)).count == worktrees.count,
+              Set(worktrees.map(\.workspacePath)).count == worktrees.count else {
+            throw QuickPiError.message("Worktree 关联记录包含重复项")
+        }
+        return worktrees
+    }
+
+    // Atomically persists managed worktree ownership after Git and session state agree.
+    func saveManagedWorktrees(_ worktrees: [ManagedWorktree]) throws {
+        guard Set(worktrees.map(\.id)).count == worktrees.count,
+              Set(worktrees.map(\.worktreePath)).count == worktrees.count,
+              Set(worktrees.map(\.workspacePath)).count == worktrees.count else {
+            throw QuickPiError.message("Worktree 关联记录包含重复项")
+        }
+        try createDirectories()
+        try Self.encoder.encode(worktrees).write(to: worktreesURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: worktreesURL.path)
+    }
+
     // Generates Pi's models.json solely from the settings document used by the UI.
     func writeModels(for settings: AppSettings) throws {
         try createDirectories()
@@ -64,6 +121,17 @@ final class ConfigurationStore {
             guard providers[provider.id] == nil else {
                 throw QuickPiError.message("Provider ID 重复：\(provider.id)")
             }
+            if let modelThinkingLevels = provider.modelThinkingLevels {
+                let modelIds = Set(provider.models)
+                guard Set(modelThinkingLevels.keys).isSubset(of: modelIds),
+                      modelThinkingLevels.values.allSatisfy({ levels in
+                          !levels.isEmpty
+                              && Set(levels).count == levels.count
+                              && levels.contains(where: { $0 != .off })
+                      }) else {
+                    throw QuickPiError.message("Provider 的模型推理能力配置无效：\(provider.name)")
+                }
+            }
             providers[provider.id] = PiProvider(
                 name: provider.name,
                 baseUrl: provider.baseURL,
@@ -71,7 +139,13 @@ final class ConfigurationStore {
                 headers: provider.kind == .openAI
                     ? ["User-Agent": "codex_cli_rs/0.145.0"]
                     : nil,
-                models: provider.models.map { PiModel(id: $0, name: $0) }
+                models: provider.models.map {
+                    PiModel(
+                        id: $0,
+                        name: $0,
+                        thinkingLevels: provider.modelThinkingLevels?[$0]
+                    )
+                }
             )
         }
         let data = try Self.encoder.encode(ModelsDocument(providers: providers))

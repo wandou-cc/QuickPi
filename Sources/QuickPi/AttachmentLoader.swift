@@ -22,10 +22,16 @@ enum AttachmentLoader {
 
         let fileExtension = url.pathExtension.lowercased()
         if UTType(filenameExtension: fileExtension)?.conforms(to: .image) == true {
+            guard let source = NSImage(contentsOf: url), source.size.width > 0, source.size.height > 0 else {
+                throw QuickPiError.message("无法读取图片：\(url.lastPathComponent)")
+            }
             return PendingAttachment(
                 id: UUID(),
                 name: url.lastPathComponent,
-                content: .image(data: try normalizedJPEG(url: url), mimeType: "image/jpeg")
+                content: .image(
+                    data: try normalizedJPEG(source: source, name: url.lastPathComponent),
+                    mimeType: "image/jpeg"
+                )
             )
         }
 
@@ -52,11 +58,23 @@ enum AttachmentLoader {
         return PendingAttachment(id: UUID(), name: url.lastPathComponent, content: .text(text))
     }
 
-    // Converts a selected image to a bounded JPEG accepted by image-capable Provider APIs.
-    private static func normalizedJPEG(url: URL) throws -> Data {
-        guard let source = NSImage(contentsOf: url), source.size.width > 0, source.size.height > 0 else {
-            throw QuickPiError.message("无法读取图片：\(url.lastPathComponent)")
+    // Loads clipboard image data into the same attachment format used by selected files.
+    static func loadImage(data: Data, name: String) throws -> PendingAttachment {
+        guard data.count <= 10 * 1_024 * 1_024 else {
+            throw QuickPiError.message("附件 \(name) 超过 10 MB")
         }
+        guard let source = NSImage(data: data), source.size.width > 0, source.size.height > 0 else {
+            throw QuickPiError.message("无法读取图片：\(name)")
+        }
+        return PendingAttachment(
+            id: UUID(),
+            name: name,
+            content: .image(data: try normalizedJPEG(source: source, name: name), mimeType: "image/jpeg")
+        )
+    }
+
+    // Converts a decoded image to a bounded JPEG accepted by image-capable Provider APIs.
+    private static func normalizedJPEG(source: NSImage, name: String) throws -> Data {
         let scale = min(1, 2_048 / max(source.size.width, source.size.height))
         let size = NSSize(
             width: max(1, floor(source.size.width * scale)),
@@ -76,7 +94,7 @@ enum AttachmentLoader {
         guard let tiff = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiff),
               let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.86]) else {
-            throw QuickPiError.message("无法转换图片：\(url.lastPathComponent)")
+            throw QuickPiError.message("无法转换图片：\(name)")
         }
         return jpeg
     }

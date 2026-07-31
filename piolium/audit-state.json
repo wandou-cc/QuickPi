@@ -1,0 +1,43 @@
+{
+	"audits": [
+		{
+			"audit_id": "2026-07-29T06:54:52.209Z",
+			"mode": "knowledge-base",
+			"started_at": "2026-07-29T06:54:52.209Z",
+			"completed_at": "2026-07-29T07:05:48.934Z",
+			"status": "failed",
+			"phases": {
+				"KB0": {
+					"status": "skipped",
+					"error": "No external knowledge-base input provided.",
+					"started_at": "2026-07-29T06:54:52.227Z",
+					"completed_at": "2026-07-29T07:03:13.776Z"
+				},
+				"K1": {
+					"status": "failed",
+					"attempt": 6,
+					"max_attempts": 6,
+					"started_at": "2026-07-29T06:54:52.228Z",
+					"heartbeat_at": "2026-07-29T07:05:48.909Z",
+					"last_event_at": "2026-07-29T07:05:48.909Z",
+					"run_id": "k1-2026-07-29T06-54-52-209Z-a6-946e6b6f",
+					"error": "Failed after 5 retries: No API key for provider: kimi-coding",
+					"artifacts": [
+						"/Users/cc/Documents/ai快捷问答/piolium/tmp/piolium/runs/k1-2026-07-29T06-54-52-209Z-a6-946e6b6f/transcript.jsonl"
+					],
+					"last_error": "No API key for provider: kimi-coding",
+					"completed_at": "2026-07-29T07:05:48.933Z"
+				},
+				"K2": {
+					"status": "pending"
+				}
+			},
+			"agent_sdk": "pi",
+			"commit": "9d17c2c559bd0d7d2635ea9480c5b0e716ad0477",
+			"branch": "main",
+			"repository": "wandou-cc/QuickPi",
+			"history_available": true,
+			"source_snapshot_clean": false
+		}
+	]
+}

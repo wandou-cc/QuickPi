@@ -1,8 +1,10 @@
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { complete } from "@earendil-works/pi-ai/compat";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 const prefix = "quickpi:";
+const commitMessageSystemPrompt = `你负责为当前 Git 项目生成提交信息。先检查用户提供的“Git 校验与提交约定”和最近提交历史；如果项目存在 commit.template、commit-msg、commitlint、Conventional Commits 或其他提交校验，生成结果必须符合这些规则和项目既有风格。然后根据当前 Git 状态和待提交 Diff，生成准确、简洁的提交信息。只输出可以直接用于 git commit 的最终提交信息，不要解释，不要使用 Markdown，不要添加引号。`;
 
 // Reads Pi's credential document; absence is the documented first-launch state.
 async function readCredentials(path) {
@@ -30,6 +32,58 @@ async function writeCredentials(directory, credentials) {
 // Sends one structured native-app event through Pi's public extension UI channel.
 function notify(ctx, payload) {
   ctx.ui.notify(`${prefix}${JSON.stringify(payload)}`, "info");
+}
+
+function decodeCommitMessageRequest(value) {
+  const encoded = value.trim();
+  if (!encoded) {
+    throw new Error("缺少提交信息生成请求");
+  }
+  const request = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  if (typeof request?.requestId !== "string" || !request.requestId) {
+    throw new Error("提交信息生成请求缺少 requestId");
+  }
+  if (typeof request.context !== "string" || !request.context || request.context.length > 200_000) {
+    throw new Error("提交信息生成上下文无效");
+  }
+  return request;
+}
+
+async function generateCommitMessage(ctx, context) {
+  if (!ctx.model) {
+    throw new Error("当前没有已选择的模型");
+  }
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+  if (!auth.ok || !auth.apiKey) {
+    throw new Error(auth.ok ? `Provider ${ctx.model.provider} 没有可用凭证` : auth.error);
+  }
+  const response = await complete(
+    ctx.model,
+    {
+      systemPrompt: commitMessageSystemPrompt,
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: context }],
+        timestamp: Date.now(),
+      }],
+    },
+    { apiKey: auth.apiKey, headers: auth.headers, env: auth.env },
+  );
+  if (response.stopReason !== "stop") {
+    throw new Error(
+      response.errorMessage
+        || `当前模型没有完整生成提交信息（${response.stopReason}）`,
+    );
+  }
+  const message = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+  if (!message) {
+    throw new Error("当前模型生成了空提交信息");
+  }
+  return message;
 }
 
 function normalizeUserText(text) {
@@ -138,7 +192,7 @@ async function sessionSnapshot(ctx) {
     throw new Error("当前会话没有持久化文件");
   }
   const activeSessionId = ctx.sessionManager.getSessionId();
-  const savedSessions = await SessionManager.list(ctx.cwd, ctx.sessionManager.getSessionDir());
+  const savedSessions = await SessionManager.listAll(ctx.sessionManager.getSessionDir());
   const savedActiveSession = savedSessions.find((session) => session.id === activeSessionId);
   if (savedActiveSession && savedActiveSession.path !== activeSessionPath) {
     throw new Error("当前会话路径与磁盘记录不一致");
@@ -264,6 +318,7 @@ function sendSnapshot(pi, ctx) {
         providerId: model.provider,
         providerName,
         supportsImages: model.input.includes("image"),
+        supportsReasoning: model.reasoning,
       };
     })
     .sort((left, right) => {
@@ -318,6 +373,23 @@ export default async function quickPiExtension(pi) {
     },
   });
 
+  pi.registerCommand("quick-generate-commit-message", {
+    description: "Generate one Git commit message with the active model",
+    handler: async (args, ctx) => {
+      const request = decodeCommitMessageRequest(args);
+      try {
+        const message = await generateCommitMessage(ctx, request.context);
+        notify(ctx, { kind: "commitMessage", requestId: request.requestId, message });
+      } catch (error) {
+        notify(ctx, {
+          kind: "commitMessageError",
+          requestId: request.requestId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+  });
+
   pi.registerCommand("quick-clone-turn", {
     description: "Clone one completed turn into a new Quick Pi session",
     handler: async (args, ctx) => {
@@ -357,6 +429,26 @@ export default async function quickPiExtension(pi) {
       if (result.cancelled) {
         throw new Error("插件取消了会话克隆");
       }
+    },
+  });
+
+  pi.registerCommand("quick-delete-session", {
+    description: "Delete one inactive Quick Pi session",
+    handler: async (args, ctx) => {
+      const sessionId = args.trim();
+      if (!sessionId) {
+        throw new Error("缺少要删除的会话 ID");
+      }
+      if (sessionId === ctx.sessionManager.getSessionId()) {
+        throw new Error("不能删除当前活动会话");
+      }
+      const sessions = await SessionManager.listAll(ctx.sessionManager.getSessionDir());
+      const target = sessions.find((session) => session.id === sessionId);
+      if (!target) {
+        throw new Error("要删除的会话不存在");
+      }
+      await unlink(target.path);
+      await sendSessionSnapshot(ctx, "sessionDeleted");
     },
   });
 

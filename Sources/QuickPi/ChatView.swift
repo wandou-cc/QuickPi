@@ -4,6 +4,7 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import Darwin
 import MarkdownUI
+import SystemConfiguration
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -37,10 +38,13 @@ extension Notification.Name {
 struct ChatView: View {
     @ObservedObject var state: AppState
     let togglePanelZoom: () -> Void
+    let presentGitActions: () -> Void
     @AppStorage("showSystemStatus") private var showSystemStatus = true
     @FocusState private var promptFocused: Bool
     @State private var confirmsDeletingSessions = false
+    @State private var sessionPendingDeletion: ConversationSession?
     @State private var sessionsPresented = false
+    @State private var planPresented = false
     @State private var selectedSlashCommandIndex = 0
     @State private var slashCommandScrollRequest: SlashCommandScrollRequest?
     @State private var modelMenuPresented = false
@@ -53,16 +57,16 @@ struct ChatView: View {
                 slashCommandMenu
             } else if state.showsResultPanel {
                 Divider()
-                    .padding(.horizontal, 14)
+                    .opacity(0.65)
                 resultPanel
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.white)
-        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(.primary.opacity(0.1))
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.primary.opacity(0.12))
         }
         .sheet(isPresented: Binding(
             get: { state.extensionPrompt != nil },
@@ -82,9 +86,38 @@ struct ChatView: View {
                 Task { await state.deleteAllSessions() }
             }
         } message: {
-            Text("这会删除主空间以及所有工作区中的全部会话，且无法撤销。")
+            Text("仅当所有托管 Worktree 都没有未提交改动时，才会清理 Worktree 并删除全部会话。操作无法撤销。")
+        }
+        .alert("删除会话？", isPresented: Binding(
+            get: { sessionPendingDeletion != nil },
+            set: { presented in
+                if !presented {
+                    sessionPendingDeletion = nil
+                }
+            }
+        )) {
+            Button("取消", role: .cancel) {
+                sessionPendingDeletion = nil
+            }
+            Button("删除", role: .destructive) {
+                guard let session = sessionPendingDeletion else {
+                    return
+                }
+                sessionPendingDeletion = nil
+                Task { await state.deleteSession(id: session.id) }
+            }
+        } message: {
+            if let session = sessionPendingDeletion,
+               state.isManagedWorktreeSession(id: session.id) {
+                Text("会删除此会话。如果它是所属 Worktree 的最后一个会话，也会清理该 Worktree；存在未提交改动时删除会被取消。")
+            } else {
+                Text("会话记录删除后无法恢复。")
+            }
         }
         .preferredColorScheme(.light)
+        .task(id: "\(state.activeSessionID ?? "")\0\(state.scopePath)") {
+            await state.refreshGitStatus()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .quickPiFocusInput)) { _ in
             promptFocused = true
         }
@@ -105,7 +138,9 @@ struct ChatView: View {
         VStack(spacing: 0) {
             contextBar
 
-            ForEach(state.extensionWidgets.filter { $0.placement == .aboveEditor }) { widget in
+            ForEach(state.extensionWidgets.filter {
+                $0.key != ExtensionWidget.planModeKey && $0.placement == .aboveEditor
+            }) { widget in
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(widget.lines.enumerated()), id: \.offset) { _, line in
                         Text(line)
@@ -146,7 +181,7 @@ struct ChatView: View {
                             .frame(height: 26)
                             .background(
                                 .primary.opacity(0.055),
-                                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                             )
                         }
                     }
@@ -157,6 +192,16 @@ struct ChatView: View {
             }
 
             HStack(spacing: 8) {
+                Button {
+                    chooseAttachments()
+                } label: {
+                    Image(systemName: "paperclip")
+                }
+                .buttonStyle(.plain)
+                .frame(width: 30, height: 30)
+                .foregroundStyle(.secondary)
+                .help("添加附件")
+
                 TextField(
                     "问点什么",
                     text: Binding(
@@ -168,6 +213,9 @@ struct ChatView: View {
                     .font(.system(size: chatMessageFontSize))
                     .frame(minWidth: 120)
                     .focused($promptFocused)
+                    .onPasteCommand(of: [.image]) { providers in
+                        Task { await state.addPastedImages(providers: providers) }
+                    }
                     .onSubmit {
                         let suggestions = state.slashCommandSuggestions
                         if suggestions.isEmpty {
@@ -203,15 +251,8 @@ struct ChatView: View {
                         return .handled
                     }
 
-                Button {
-                    chooseAttachments()
-                } label: {
-                    Image(systemName: "paperclip")
-                }
-                .buttonStyle(.plain)
-                .frame(width: 30, height: 30)
-                .foregroundStyle(.secondary)
-                .help("添加附件")
+                Divider()
+                    .frame(height: 18)
 
                 Button {
                     modelMenuPresented.toggle()
@@ -221,26 +262,35 @@ struct ChatView: View {
                             ProgressView()
                                 .controlSize(.mini)
                         }
-                        Text(state.selectedModel?.name ?? "选择模型")
+                        Text(state.selectedModel.map { model in
+                            state.supportsThinking
+                                ? "\(model.name) · \(state.thinkingLevel.title)"
+                                : model.name
+                        } ?? "选择模型")
                             .lineLimit(1)
                             .truncationMode(.middle)
-                            .frame(maxWidth: 108)
+                            .frame(maxWidth: 140)
                         Image(systemName: "chevron.down")
                             .font(.system(size: 9, weight: .semibold))
                     }
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 6)
                     .frame(height: 30)
-                    .background(
-                        .primary.opacity(0.055),
-                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    )
                 }
                 .buttonStyle(.plain)
-                .disabled(!state.runtimeReady || state.hasRunningSessions || state.sessionChanging)
+                .disabled(
+                    !state.runtimeReady
+                        || state.hasRunningSessions
+                        || state.sessionChanging
+                        || state.gitOperationRunning
+                )
                 .help(
-                    state.selectedModel.map { "\($0.providerName) · \($0.name)" }
+                    state.selectedModel.map {
+                        state.supportsThinking
+                            ? "\($0.providerName) · \($0.name) · 推理强度：\(state.thinkingLevel.title)"
+                            : "\($0.providerName) · \($0.name)"
+                    }
                         ?? "选择模型"
                 )
                 .popover(
@@ -264,11 +314,13 @@ struct ChatView: View {
                 }
                 .buttonStyle(.plain)
                 .frame(width: 30, height: 30)
+                .foregroundStyle(Color.accentColor)
                 .disabled(
                     state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         || !state.runtimeReady
                         || state.isBusy
                         || state.sessionChanging
+                        || state.gitOperationRunning
                 )
                 .help("发送")
 
@@ -294,10 +346,25 @@ struct ChatView: View {
                 .foregroundStyle(.secondary)
                 .help("设置")
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, 8)
+            .frame(height: 44)
+            .background(
+                Color(nsColor: .textBackgroundColor),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(
+                        promptFocused ? Color.accentColor.opacity(0.5) : Color.primary.opacity(0.12),
+                        lineWidth: promptFocused ? 1.5 : 1
+                    )
+            }
+            .padding(.horizontal, 14)
             .frame(height: 64)
 
-            ForEach(state.extensionWidgets.filter { $0.placement == .belowEditor }) { widget in
+            ForEach(state.extensionWidgets.filter {
+                $0.key != ExtensionWidget.planModeKey && $0.placement == .belowEditor
+            }) { widget in
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(widget.lines.enumerated()), id: \.offset) { _, line in
                         Text(line)
@@ -389,50 +456,84 @@ struct ChatView: View {
     }
 
     private var modelMenu: some View {
-        ScrollView(.vertical) {
-            if state.modelOptions.isEmpty {
-                Text("未配置模型")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 48)
-            } else {
-                LazyVStack(spacing: 0) {
-                    ForEach(state.modelOptions, id: \.selectionKey) { model in
-                        Button {
-                            modelMenuPresented = false
-                            Task { await state.selectModel(selectionKey: model.selectionKey) }
-                        } label: {
-                            HStack(spacing: 8) {
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(model.name)
-                                        .font(.system(size: 14, weight: .medium))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
-                                    Text(model.providerName)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
+        VStack(spacing: 0) {
+            ScrollView(.vertical) {
+                if state.modelOptions.isEmpty {
+                    Text("未配置模型")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 48)
+                } else {
+                    LazyVStack(spacing: 0) {
+                        ForEach(state.modelOptions, id: \.selectionKey) { model in
+                            Button {
+                                modelMenuPresented = false
+                                Task { await state.selectModel(selectionKey: model.selectionKey) }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(model.name)
+                                            .font(.system(size: 14, weight: .medium))
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(1)
+                                        Text(model.providerName)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer(minLength: 8)
+                                    if model.supportsReasoning {
+                                        Image(systemName: "brain")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .help("支持推理强度")
+                                    }
+                                    if state.settings.selectedModel == model.selection {
+                                        Image(systemName: "checkmark")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(Color.accentColor)
+                                    }
                                 }
-                                Spacer(minLength: 8)
-                                if state.settings.selectedModel == model.selection {
-                                    Image(systemName: "checkmark")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(Color.accentColor)
-                                }
+                                .padding(.horizontal, 10)
+                                .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+                                .contentShape(Rectangle())
                             }
-                            .padding(.horizontal, 10)
-                            .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
                 }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
+            }
+            .scrollIndicators(.visible)
+            .frame(height: modelMenuHeight)
+
+            if state.supportsThinking {
+                Divider()
+                HStack(spacing: 10) {
+                    Label("推理强度", systemImage: "brain")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("推理强度", selection: Binding(
+                        get: { state.thinkingLevel },
+                        set: { level in
+                            Task { await state.selectThinkingLevel(level) }
+                        }
+                    )) {
+                        ForEach(state.availableThinkingLevels, id: \.self) { level in
+                            Text(level.title).tag(level)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 104)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 44)
             }
         }
-        .scrollIndicators(.visible)
-        .frame(width: 280, height: modelMenuHeight)
+        .frame(width: 280)
     }
 
     // Inserts a Pi command and leaves the cursor ready for any command arguments.
@@ -461,9 +562,24 @@ struct ChatView: View {
                         Label("返回主空间", systemImage: "house")
                     }
                 }
+                if let worktree = state.activeManagedWorktree {
+                    Divider()
+                    Label(
+                        worktree.branch ?? "detached HEAD",
+                        systemImage: "arrow.triangle.branch"
+                    )
+                    if worktree.branch == nil {
+                        Button {
+                            state.draft = "/branch "
+                            promptFocused = true
+                        } label: {
+                            Label("创建分支…", systemImage: "plus")
+                        }
+                    }
+                }
             } label: {
                 HStack(spacing: 5) {
-                    Image(systemName: "folder")
+                    Image(systemName: state.activeManagedWorktree == nil ? "folder" : "arrow.triangle.branch")
                     Text(state.scopeTitle)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -474,16 +590,13 @@ struct ChatView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 9)
                 .frame(width: 116, height: 28, alignment: .leading)
-                .background(
-                    .primary.opacity(0.055),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                )
+                .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .frame(width: 116)
-            .disabled(state.hasRunningSessions || state.sessionChanging)
-            .help(state.settings.workspacePath ?? "主空间")
+            .disabled(state.hasRunningSessions || state.sessionChanging || state.gitOperationRunning)
+            .help(state.scopePath)
 
             Button {
                 sessionsPresented.toggle()
@@ -505,12 +618,13 @@ struct ChatView: View {
                 .frame(width: 116, height: 28, alignment: .leading)
                 .background(
                     .primary.opacity(0.055),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
                 )
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .frame(width: 116)
-            .disabled(state.sessions.isEmpty || state.sessionChanging)
+            .disabled(state.sessions.isEmpty || state.sessionChanging || state.gitOperationRunning)
             .help("查看会话记录")
             .popover(isPresented: $sessionsPresented, arrowEdge: .top) {
                 VStack(spacing: 0) {
@@ -523,39 +637,70 @@ struct ChatView: View {
                         ScrollView(.vertical) {
                             LazyVStack(spacing: 0) {
                                 ForEach(state.sessions) { session in
-                                    Button {
-                                        sessionsPresented = false
-                                        Task { await state.switchSession(id: session.id) }
-                                    } label: {
-                                        HStack(spacing: 8) {
-                                            Group {
-                                                if state.isSessionRunning(id: session.id) {
-                                                    ProgressView()
-                                                        .controlSize(.mini)
-                                                } else if state.hasUnreadCompletion(id: session.id) {
-                                                    Circle()
-                                                        .fill(Color.blue)
-                                                        .frame(width: 8, height: 8)
-                                                } else {
-                                                    Image(systemName: "checkmark")
-                                                        .opacity(session.id == state.activeSessionID ? 1 : 0)
+                                    HStack(spacing: 4) {
+                                        Button {
+                                            sessionsPresented = false
+                                            Task { await state.switchSession(id: session.id) }
+                                        } label: {
+                                            HStack(spacing: 8) {
+                                                Group {
+                                                    if state.isSessionRunning(id: session.id) {
+                                                        ProgressView()
+                                                            .controlSize(.mini)
+                                                    } else if state.hasUnreadCompletion(id: session.id) {
+                                                        Circle()
+                                                            .fill(Color.blue)
+                                                            .frame(width: 8, height: 8)
+                                                    } else {
+                                                        Image(systemName: "checkmark")
+                                                            .opacity(session.id == state.activeSessionID ? 1 : 0)
+                                                    }
                                                 }
+                                                .frame(width: 12, height: 12)
+
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(state.title(for: session))
+                                                        .lineLimit(1)
+                                                    if let worktree = state.worktreeLabel(for: session) {
+                                                        Label(worktree, systemImage: "arrow.triangle.branch")
+                                                            .font(.caption2)
+                                                            .foregroundStyle(.secondary)
+                                                            .lineLimit(1)
+                                                    }
+                                                }
+                                                Spacer(minLength: 8)
                                             }
-                                            .frame(width: 12, height: 12)
-                                            Text(state.title(for: session))
-                                                .lineLimit(1)
-                                            Spacer(minLength: 8)
+                                            .contentShape(Rectangle())
+                                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                                         }
-                                        .contentShape(Rectangle())
-                                        .padding(.horizontal, 10)
-                                        .frame(height: 32)
+                                        .buttonStyle(.plain)
+
+                                        Button {
+                                            sessionsPresented = false
+                                            sessionPendingDeletion = session
+                                        } label: {
+                                            Image(systemName: "trash")
+                                        }
+                                        .buttonStyle(.plain)
+                                        .frame(width: 26, height: 26)
+                                        .foregroundStyle(.secondary)
+                                        .disabled(
+                                            session.id == state.activeSessionID
+                                                || state.hasRunningSessions
+                                                || state.sessionChanging
+                                                || state.gitOperationRunning
+                                        )
+                                        .help(session.id == state.activeSessionID ? "请先切换到其他会话" : "删除会话")
                                     }
-                                    .buttonStyle(.plain)
+                                    .padding(.leading, 10)
+                                    .padding(.trailing, 6)
+                                    .frame(height: 44)
+                                    .help(session.cwd)
                                 }
                             }
                         }
                         .scrollIndicators(.visible)
-                        .frame(height: min(CGFloat(state.sessions.count) * 32, 256))
+                        .frame(height: min(CGFloat(state.sessions.count) * 44, 308))
                     }
 
                     Divider()
@@ -572,13 +717,83 @@ struct ChatView: View {
                     .foregroundStyle(.red)
                     .padding(.horizontal, 10)
                     .frame(height: 36)
-                    .disabled(state.hasRunningSessions)
+                    .disabled(state.hasRunningSessions || state.gitOperationRunning)
                 }
                 .frame(width: 260)
             }
 
-            if !state.extensionStatuses.isEmpty {
-                let statusText = state.extensionStatuses.map(\.text).joined(separator: " · ")
+            if let planStatus = state.extensionStatuses.first(where: {
+                $0.key == ExtensionStatus.planModeKey
+            }) {
+                Button {
+                    planPresented.toggle()
+                } label: {
+                    HStack(spacing: 5) {
+                        Text(planStatus.text)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 9)
+                    .frame(width: 104, height: 28, alignment: .leading)
+                    .background(
+                        .primary.opacity(0.055),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(width: 104)
+                .help("查看 Plan 进度")
+                .popover(isPresented: $planPresented, arrowEdge: .top) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        HStack(spacing: 8) {
+                            Label("Plan 进度", systemImage: "list.bullet.clipboard")
+                            Spacer()
+                            Text(planStatus.text)
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption.weight(.medium))
+                        .padding(.horizontal, 12)
+                        .frame(height: 40)
+
+                        Divider()
+
+                        if let planWidget = state.extensionWidgets.first(where: {
+                            $0.key == ExtensionWidget.planModeKey
+                        }) {
+                            ScrollView(.vertical) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    ForEach(Array(planWidget.lines.enumerated()), id: \.offset) { _, line in
+                                        Text(line)
+                                            .font(.system(size: 13))
+                                            .lineLimit(2)
+                                            .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+                                    }
+                                }
+                                .padding(12)
+                            }
+                            .scrollIndicators(.visible)
+                            .frame(height: min(CGFloat(planWidget.lines.count) * 36 + 24, 360))
+                        } else {
+                            Text("尚无执行进度")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, minHeight: 52)
+                        }
+                    }
+                    .frame(width: 360)
+                }
+            }
+
+            let extensionStatuses = state.extensionStatuses.filter {
+                $0.key != ExtensionStatus.planModeKey
+            }
+            if !extensionStatuses.isEmpty {
+                let statusText = extensionStatuses.map(\.text).joined(separator: " · ")
                 Label(statusText, systemImage: "puzzlepiece.extension")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -591,21 +806,60 @@ struct ChatView: View {
                 SystemStatusView()
             }
 
+            Button {
+                presentGitActions()
+            } label: {
+                HStack(spacing: 5) {
+                    if state.gitOperationRunning || state.activeGitStatusLoading {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.triangle.branch")
+                    }
+                    Text(
+                        state.activeGitStatus.map { $0.branch ?? "detached HEAD" }
+                            ?? (state.activeGitStatusError == nil ? "Git" : "非 Git")
+                    )
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .font(.caption.weight(.medium))
+                .padding(.horizontal, 8)
+                .frame(width: 104, height: 28, alignment: .leading)
+                .background(
+                    .primary.opacity(0.055),
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(width: 104)
+            .foregroundStyle(.secondary)
+            .disabled(state.activeSessionID == nil || state.runtimeStarting || state.sessionChanging)
+            .help(state.activeGitStatusError ?? "Git 操作")
+
             Spacer(minLength: 0)
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
                 .onTapGesture(count: 2, perform: togglePanelZoom)
 
             Button {
-                Task { await state.createSession() }
+                Task { await state.createSession(usesIndependentWorktree: false) }
             } label: {
                 Image(systemName: "square.and.pencil")
             }
             .buttonStyle(.plain)
             .frame(width: 30, height: 28)
             .foregroundStyle(.secondary)
-            .disabled(state.activeSessionID == nil || state.runtimeStarting || state.sessionChanging)
-            .help("新建会话")
+            .disabled(
+                state.activeSessionID == nil
+                    || state.runtimeStarting
+                    || state.sessionChanging
+                    || state.gitOperationRunning
+            )
+            .help("在当前目录新建会话")
         }
         .padding(.horizontal, 18)
         .frame(height: 38)
@@ -617,8 +871,11 @@ struct ChatView: View {
                 GeometryReader { viewport in
                     ScrollView {
                         VStack(spacing: 0) {
-                            VStack(alignment: .leading, spacing: 14) {
-                                ForEach(state.conversationAnswers) { answer in
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(
+                                    Array(state.conversationAnswers.enumerated()),
+                                    id: \.element.id
+                                ) { index, answer in
                                     let tools = answer.sections.compactMap { section in
                                         if case .tool(let tool) = section.content {
                                             return tool
@@ -626,79 +883,117 @@ struct ChatView: View {
                                         return nil
                                     }
 
-                                    VStack(alignment: .leading, spacing: 14) {
+                                    VStack(alignment: .leading, spacing: 16) {
                                         if let question = answer.question {
                                             questionView(question)
                                         }
 
-                                        ForEach(answer.sections) { section in
-                                            AnswerSectionView(section: section, tools: tools)
-                                        }
+                                        VStack(alignment: .leading, spacing: 12) {
+                                            ForEach(answer.sections) { section in
+                                                AnswerSectionView(
+                                                    section: section,
+                                                    tools: tools,
+                                                    baseURL: state.activeWorkingDirectoryURL,
+                                                    openFile: state.openLocalFile
+                                                )
+                                            }
 
-                                        if answer.id == state.answer?.id && answer.sections.isEmpty && state.isAnswering {
-                                            HStack(spacing: 8) {
-                                                ProgressView()
-                                                    .controlSize(.small)
-                                                Text(answer.status == .waiting ? "正在连接模型" : "正在思考")
+                                            if answer.id == state.answer?.id
+                                                && answer.sections.isEmpty
+                                                && state.isAnswering {
+                                                HStack(spacing: 8) {
+                                                    ProgressView()
+                                                        .controlSize(.small)
+                                                    Text(
+                                                        answer.status == .waiting
+                                                            ? "正在连接模型"
+                                                            : "正在思考"
+                                                    )
+                                                    .foregroundStyle(.secondary)
+                                                }
+                                            }
+
+                                            if let retry = answer.retryMessage {
+                                                Label(retry, systemImage: "arrow.clockwise")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.orange)
+                                                    .textSelection(.enabled)
+                                            }
+                                            if let error = answer.error {
+                                                Label(error, systemImage: "exclamationmark.circle")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.red)
+                                                    .textSelection(.enabled)
+                                            } else if answer.status == .stopped {
+                                                Label("已停止", systemImage: "stop.circle")
+                                                    .font(.caption)
                                                     .foregroundStyle(.secondary)
                                             }
-                                        }
 
-                                        if let retry = answer.retryMessage {
-                                            Label(retry, systemImage: "arrow.clockwise")
-                                                .font(.caption)
-                                                .foregroundStyle(.orange)
-                                                .textSelection(.enabled)
-                                        }
-                                        if let error = answer.error {
-                                            Label(error, systemImage: "exclamationmark.circle")
-                                                .font(.caption)
-                                                .foregroundStyle(.red)
-                                                .textSelection(.enabled)
-                                        } else if answer.status == .stopped {
-                                            Label("已停止", systemImage: "stop.circle")
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
+                                            if answer.model != nil
+                                                || answer.usage.totalTokens > 0
+                                                || answer.stopReason == "length"
+                                                || answer.cloneEntryId != nil
+                                                || !answer.answerText.isEmpty {
+                                                VStack(alignment: .leading, spacing: 4) {
+                                                    answerMetadata(answer)
 
-                                        answerMetadata(answer)
+                                                    if answer.cloneEntryId != nil || !answer.answerText.isEmpty {
+                                                        HStack(spacing: 10) {
+                                                            if let entryId = answer.cloneEntryId {
+                                                                Button {
+                                                                    Task {
+                                                                        await state.cloneSession(from: entryId)
+                                                                        promptFocused = true
+                                                                    }
+                                                                } label: {
+                                                                    Image(systemName: "arrow.triangle.branch")
+                                                                        .font(.system(size: 12, weight: .medium))
+                                                                }
+                                                                .buttonStyle(.plain)
+                                                                .frame(width: 24, height: 24)
+                                                                .disabled(
+                                                                    !state.runtimeReady
+                                                                        || state.isBusy
+                                                                        || state.sessionChanging
+                                                                )
+                                                                .help("从此回复克隆为新会话")
+                                                            }
 
-                                        if answer.cloneEntryId != nil || !answer.answerText.isEmpty {
-                                            HStack(spacing: 12) {
-                                                if let entryId = answer.cloneEntryId {
-                                                    Button {
-                                                        Task {
-                                                            await state.cloneSession(from: entryId)
-                                                            promptFocused = true
+                                                            if !answer.answerText.isEmpty {
+                                                                Button {
+                                                                    copy(answer.answerText)
+                                                                } label: {
+                                                                    Image(systemName: "doc.on.doc")
+                                                                        .font(.system(size: 12, weight: .medium))
+                                                                }
+                                                                .buttonStyle(.plain)
+                                                                .frame(width: 24, height: 24)
+                                                                .help("复制此回复")
+                                                            }
+
+                                                            Spacer(minLength: 8)
                                                         }
-                                                    } label: {
-                                                        Image(systemName: "arrow.triangle.branch")
+                                                        .foregroundStyle(.secondary)
                                                     }
-                                                    .buttonStyle(.plain)
-                                                    .frame(width: 24, height: 24)
-                                                    .disabled(
-                                                        !state.runtimeReady
-                                                            || state.isBusy
-                                                            || state.sessionChanging
-                                                    )
-                                                    .help("从此回复克隆为新会话")
                                                 }
-
-                                                if !answer.answerText.isEmpty {
-                                                    Button {
-                                                        copy(answer.answerText)
-                                                    } label: {
-                                                        Image(systemName: "doc.on.doc")
-                                                    }
-                                                    .buttonStyle(.plain)
-                                                    .frame(width: 24, height: 24)
-                                                    .help("复制此回复")
-                                                }
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .padding(.top, 2)
                                             }
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                                        if index < state.conversationAnswers.count - 1 {
+                                            Divider()
+                                                .opacity(0.7)
+                                                .padding(.top, 2)
                                         }
                                     }
+                                    .padding(.top, 18)
+                                    .padding(
+                                        .bottom,
+                                        index == state.conversationAnswers.count - 1 ? 18 : 0
+                                    )
                                     .id(answer.id)
                                     .onAppear {
                                         guard answer.id == state.conversationAnswers.last?.id else {
@@ -717,8 +1012,7 @@ struct ChatView: View {
                                         .textSelection(.enabled)
                                 }
                             }
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 16)
+                            .padding(.horizontal, 24)
                             .frame(maxWidth: .infinity, alignment: .leading)
 
                             Color.clear
@@ -758,6 +1052,7 @@ struct ChatView: View {
             }
 
             Divider()
+                .opacity(0.65)
 
             HStack(spacing: 14) {
                 if state.isAnswering {
@@ -767,6 +1062,9 @@ struct ChatView: View {
                         Image(systemName: "stop.fill")
                     }
                     .buttonStyle(.plain)
+                    .frame(width: 28, height: 28)
+                    .foregroundStyle(.red)
+                    .background(.red.opacity(0.08), in: Circle())
                     .help("停止回答")
                 }
 
@@ -778,54 +1076,57 @@ struct ChatView: View {
                     Image(systemName: "chevron.up")
                 }
                 .buttonStyle(.plain)
+                .frame(width: 28, height: 28)
+                .foregroundStyle(.secondary)
                 .help("收起结果")
             }
             .font(.caption)
-            .padding(.horizontal, 18)
-            .frame(height: 40)
+            .padding(.horizontal, 16)
+            .frame(height: 38)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.primary.opacity(0.018))
     }
 
-    // Renders the submitted question and its attachment names without repeating extracted content.
+    // Renders the submitted question and attachment names without session-directory metadata.
     private func questionView(_ question: SubmittedQuestion) -> some View {
-        HStack {
-            Spacer(minLength: 72)
-            HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top) {
+            Spacer(minLength: 120)
+
+            VStack(alignment: .trailing, spacing: 6) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(question.text)
                         .font(.system(size: chatMessageFontSize))
-                    if let workspacePath = question.workspacePath {
-                        Label(
-                            URL(fileURLWithPath: workspacePath, isDirectory: true).lastPathComponent,
-                            systemImage: "folder"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .help(workspacePath)
-                    }
+                        .lineSpacing(3)
+                        .textSelection(.enabled)
                     if !question.attachmentNames.isEmpty {
                         Label(question.attachmentNames.joined(separator: " · "), systemImage: "paperclip")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
+                .padding(.horizontal, 13)
+                .padding(.vertical, 10)
+                .background(
+                    Color.accentColor.opacity(0.09),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.accentColor.opacity(0.12))
+                }
+
                 Button {
                     copy(question.text)
                 } label: {
                     Image(systemName: "doc.on.doc")
+                        .font(.system(size: 12, weight: .medium))
                 }
                 .buttonStyle(.plain)
                 .frame(width: 24, height: 24)
                 .foregroundStyle(.secondary)
                 .help("复制问题")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(
-                .primary.opacity(0.055),
-                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-            )
         }
     }
 
@@ -861,6 +1162,7 @@ struct ChatView: View {
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowedContentTypes = [.image, .pdf, .plainText, .data]
+        panel.directoryURL = state.activeWorkingDirectoryURL
         guard panel.runModal() == .OK else {
             return
         }
@@ -888,14 +1190,594 @@ struct ChatView: View {
     }
 }
 
+private enum GitAction: String, CaseIterable, Identifiable {
+    case commit
+    case push
+    case createBranch
+    case switchBranch
+    case diff
+    case log
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .commit: "提交"
+        case .push: "推送"
+        case .createBranch: "新建分支"
+        case .switchBranch: "切换分支"
+        case .diff: "Diff"
+        case .log: "Log"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .commit: "checkmark.circle"
+        case .push: "icloud.and.arrow.up"
+        case .createBranch: "plus"
+        case .switchBranch: "arrow.left.arrow.right"
+        case .diff: "doc.text.magnifyingglass"
+        case .log: "clock.arrow.circlepath"
+        }
+    }
+}
+
+struct GitActionsView: View {
+    @ObservedObject var state: AppState
+    @State private var selectedAction = GitAction.commit
+    @State private var commitMessage = ""
+    @State private var includesUnstaged = true
+    @State private var newBranchName = ""
+    @State private var localBranches: [GitLocalBranch] = []
+    @State private var diffSnapshot: GitDiffSnapshot?
+    @State private var logEntries: [GitLogEntry] = []
+    @State private var contentLoading = false
+    @State private var contentGeneration = 0
+    @State private var feedback: String?
+    @State private var feedbackIsError = false
+
+    private var operationDisabled: Bool {
+        state.activeGitStatus == nil
+            || state.gitOperationRunning
+            || state.hasRunningSessions
+            || state.sessionChanging
+    }
+
+    private var canCommit: Bool {
+        guard let status = state.activeGitStatus else {
+            return false
+        }
+        let hasCommittableChanges = includesUnstaged
+            ? status.hasChanges
+            : status.hasStagedChanges
+        return hasCommittableChanges && !operationDisabled
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            gitHeader
+            Divider()
+
+            HStack(spacing: 0) {
+                VStack(spacing: 4) {
+                    ForEach(GitAction.allCases) { action in
+                        Button {
+                            selectedAction = action
+                            feedback = nil
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: action.systemImage)
+                                    .frame(width: 16)
+                                Text(action.title)
+                                Spacer(minLength: 8)
+                            }
+                            .padding(.horizontal, 10)
+                            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .background(
+                                action == selectedAction
+                                    ? Color.accentColor.opacity(0.12)
+                                    : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(action == selectedAction ? Color.accentColor : Color.primary)
+                        .disabled(state.activeGitStatus == nil)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(8)
+                .frame(width: 148, height: 388, alignment: .top)
+                .background(.primary.opacity(0.025))
+
+                Divider()
+
+                selectedContent
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+            .frame(height: 388)
+
+            Divider()
+            Group {
+                if let feedback {
+                    Text(feedback)
+                        .foregroundStyle(feedbackIsError ? Color.red : Color.secondary)
+                        .help(feedback)
+                } else if let status = state.activeGitStatus {
+                    Text("\(status.changedFileCount) 个改动文件")
+                        .foregroundStyle(.secondary)
+                } else if state.activeGitStatusLoading {
+                    Text("正在读取 Git 状态")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(state.activeGitStatusError ?? "Git 状态不可用")
+                        .foregroundStyle(.red)
+                        .help(state.activeGitStatusError ?? "Git 状态不可用")
+                }
+            }
+            .font(.caption)
+            .lineLimit(2)
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+        }
+        .frame(minWidth: 640, maxWidth: .infinity)
+        .task(id: "\(state.activeSessionID ?? "")\0\(state.scopePath)") {
+            feedback = nil
+            selectedAction = .commit
+            await refreshStatus()
+        }
+        .task(id: "\(state.activeSessionID ?? "")\0\(state.scopePath)\0\(selectedAction.rawValue)") {
+            await loadContent(for: selectedAction)
+        }
+    }
+
+    private var gitHeader: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "arrow.triangle.branch")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(state.activeGitStatus.map { $0.branch ?? "detached HEAD" } ?? "Git")
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                if let upstream = state.activeGitStatus?.upstream {
+                    Text(upstream)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 12)
+            if let status = state.activeGitStatus, status.hasChanges {
+                Text("+\(status.additions)")
+                    .foregroundStyle(.green)
+                Text("-\(status.deletions)")
+                    .foregroundStyle(.red)
+            }
+            Button {
+                feedback = nil
+                Task {
+                    await refreshStatus()
+                    await loadContent(for: selectedAction)
+                }
+            } label: {
+                if state.activeGitStatusLoading {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                }
+            }
+            .buttonStyle(.plain)
+            .frame(width: 26, height: 26)
+            .disabled(state.activeGitStatusLoading || state.gitOperationRunning)
+            .help("刷新 Git 状态")
+        }
+        .font(.caption.monospacedDigit())
+        .padding(.horizontal, 12)
+        .frame(height: 50)
+    }
+
+    @ViewBuilder
+    private var selectedContent: some View {
+        switch selectedAction {
+        case .commit:
+            commitContent
+        case .push:
+            pushContent
+        case .createBranch:
+            createBranchContent
+        case .switchBranch:
+            switchBranchContent
+        case .diff:
+            diffContent
+        case .log:
+            logContent
+        }
+    }
+
+    private var commitContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("提交更改")
+                .font(.headline)
+            TextField("提交信息（留空时由当前模型生成）", text: $commitMessage, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(2...4)
+                .disabled(state.gitOperationRunning)
+            Toggle("包含未暂存的更改", isOn: $includesUnstaged)
+                .toggleStyle(.checkbox)
+                .disabled(state.gitOperationRunning)
+            HStack(spacing: 10) {
+                Button {
+                    Task { await commit(pushAfterCommit: false) }
+                } label: {
+                    Label("提交", systemImage: "checkmark.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(!canCommit)
+
+                Button {
+                    Task { await commit(pushAfterCommit: true) }
+                } label: {
+                    Label("提交并推送", systemImage: "arrow.up.circle")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canCommit || state.activeGitStatus?.canPush != true)
+            }
+            if let status = state.activeGitStatus {
+                Text(status.hasStagedChanges ? "暂存区有待提交更改" : "暂存区没有待提交更改")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+    }
+
+    private var pushContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("推送分支")
+                .font(.headline)
+            if let status = state.activeGitStatus {
+                LabeledContent("当前分支", value: status.branch ?? "detached HEAD")
+                LabeledContent("上游分支", value: status.upstream ?? "未设置")
+            }
+            Button {
+                Task { await push() }
+            } label: {
+                Label("推送", systemImage: "icloud.and.arrow.up")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(operationDisabled || state.activeGitStatus?.canPush != true)
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+    }
+
+    private var createBranchContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("新建分支")
+                .font(.headline)
+            TextField("分支名称", text: $newBranchName)
+                .textFieldStyle(.roundedBorder)
+                .disabled(state.gitOperationRunning)
+            Button {
+                Task { await createBranch() }
+            } label: {
+                Label("创建并切换", systemImage: "arrow.triangle.branch")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(
+                operationDisabled
+                    || newBranchName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            )
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+    }
+
+    private var switchBranchContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("切换本地分支")
+                .font(.headline)
+            if contentLoading {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if localBranches.isEmpty {
+                Text("没有本地分支")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 2) {
+                        ForEach(localBranches) { branch in
+                            Button {
+                                Task { await switchBranch(to: branch) }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: branch.isCurrent ? "checkmark" : "arrow.triangle.branch")
+                                        .frame(width: 16)
+                                    Text(branch.name)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer(minLength: 8)
+                                }
+                                .padding(.horizontal, 8)
+                                .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(branch.isCurrent || operationDisabled)
+                        }
+                    }
+                }
+                .scrollIndicators(.visible)
+            }
+        }
+        .padding(16)
+    }
+
+    private var diffContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("工作树 Diff")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    copyDiff()
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.plain)
+                .frame(width: 26, height: 26)
+                .disabled(diffSnapshot?.text.isEmpty != false)
+                .help("复制 Diff")
+            }
+            if contentLoading {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let diffSnapshot {
+                if diffSnapshot.text.isEmpty {
+                    Text("没有已跟踪文件差异")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: diffSnapshot.untrackedFiles.isEmpty ? 275 : 160)
+                } else {
+                    ScrollView([.horizontal, .vertical]) {
+                        Text(diffSnapshot.text)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: true, vertical: true)
+                            .padding(8)
+                    }
+                    .scrollIndicators(.visible)
+                    .frame(height: diffSnapshot.untrackedFiles.isEmpty ? 275 : 160)
+                    .background(.primary.opacity(0.035))
+                }
+                if diffSnapshot.isTruncated {
+                    Text("Diff 输出过大，仅显示前 200,000 个字符")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if !diffSnapshot.untrackedFiles.isEmpty {
+                    Text("未跟踪文件（\(diffSnapshot.untrackedFileCount)）")
+                        .font(.caption.weight(.semibold))
+                    ScrollView(.vertical) {
+                        LazyVStack(alignment: .leading, spacing: 3) {
+                            ForEach(diffSnapshot.untrackedFiles, id: \.self) { path in
+                                Text(path)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 55)
+                    if diffSnapshot.untrackedFileCount > diffSnapshot.untrackedFiles.count {
+                        Text("仅显示前 \(diffSnapshot.untrackedFiles.count) 个未跟踪文件")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(16)
+    }
+
+    private var logContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("最近提交")
+                .font(.headline)
+            if contentLoading {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if logEntries.isEmpty {
+                Text("还没有提交记录")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 0) {
+                        ForEach(logEntries) { entry in
+                            HStack(alignment: .top, spacing: 10) {
+                                Text(entry.shortCommitID)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(Color.accentColor)
+                                    .textSelection(.enabled)
+                                    .frame(width: 72, alignment: .leading)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(entry.subject)
+                                        .lineLimit(2)
+                                        .textSelection(.enabled)
+                                    Text(entry.author)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 8)
+                                Text(entry.date)
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 8)
+                            Divider()
+                        }
+                    }
+                }
+                .scrollIndicators(.visible)
+            }
+        }
+        .padding(16)
+    }
+
+    // Reloads repository status and exposes the exact Git error in the fixed footer.
+    private func refreshStatus() async {
+        await state.refreshGitStatus()
+        if let error = state.activeGitStatusError {
+            feedback = error
+            feedbackIsError = true
+        }
+    }
+
+    // Loads only the selected read-only Git view and ignores results from an obsolete selection.
+    private func loadContent(for action: GitAction) async {
+        guard action == .switchBranch || action == .diff || action == .log,
+              state.activeGitStatus != nil else {
+            contentLoading = false
+            return
+        }
+        contentGeneration &+= 1
+        let generation = contentGeneration
+        let workspacePath = state.activeWorkingDirectoryURL.path
+        contentLoading = true
+        do {
+            switch action {
+            case .switchBranch:
+                let branches = try await state.gitLocalBranches()
+                guard generation == contentGeneration,
+                      selectedAction == action,
+                      workspacePath == state.activeWorkingDirectoryURL.path else {
+                    return
+                }
+                localBranches = branches
+            case .diff:
+                let snapshot = try await state.gitDiff()
+                guard generation == contentGeneration,
+                      selectedAction == action,
+                      workspacePath == state.activeWorkingDirectoryURL.path else {
+                    return
+                }
+                diffSnapshot = snapshot
+            case .log:
+                let entries = try await state.gitLog()
+                guard generation == contentGeneration,
+                      selectedAction == action,
+                      workspacePath == state.activeWorkingDirectoryURL.path else {
+                    return
+                }
+                logEntries = entries
+            case .commit, .push, .createBranch:
+                return
+            }
+        } catch {
+            guard generation == contentGeneration,
+                  selectedAction == action,
+                  workspacePath == state.activeWorkingDirectoryURL.path else {
+                return
+            }
+            feedback = error.localizedDescription
+            feedbackIsError = true
+        }
+        guard generation == contentGeneration else {
+            return
+        }
+        contentLoading = false
+    }
+
+    // Executes commit or commit-and-push and preserves partial-success errors from AppState.
+    private func commit(pushAfterCommit: Bool) async {
+        do {
+            let message = try await state.commitGitChanges(
+                message: commitMessage,
+                includingUnstaged: includesUnstaged,
+                pushAfterCommit: pushAfterCommit
+            )
+            commitMessage = ""
+            feedback = message
+            feedbackIsError = false
+        } catch {
+            await state.refreshGitStatus()
+            feedback = error.localizedDescription
+            feedbackIsError = true
+        }
+    }
+
+    // Pushes the current branch and reports the exact remote or upstream failure.
+    private func push() async {
+        do {
+            feedback = try await state.pushGitBranch()
+            feedbackIsError = false
+        } catch {
+            await state.refreshGitStatus()
+            feedback = error.localizedDescription
+            feedbackIsError = true
+        }
+    }
+
+    // Creates a validated branch through AppState's Git write-operation lock.
+    private func createBranch() async {
+        do {
+            feedback = try await state.createGitBranch(named: newBranchName)
+            feedbackIsError = false
+            newBranchName = ""
+        } catch {
+            await state.refreshGitStatus()
+            feedback = error.localizedDescription
+            feedbackIsError = true
+        }
+    }
+
+    // Switches to one branch returned by Git and reloads the local branch list.
+    private func switchBranch(to branch: GitLocalBranch) async {
+        do {
+            feedback = try await state.switchGitBranch(named: branch.name)
+            feedbackIsError = false
+            await loadContent(for: .switchBranch)
+        } catch {
+            await state.refreshGitStatus()
+            feedback = error.localizedDescription
+            feedbackIsError = true
+        }
+    }
+
+    // Copies the currently displayed bounded Diff text to the macOS pasteboard.
+    private func copyDiff() {
+        guard let text = diffSnapshot?.text, !text.isEmpty else {
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+}
+
 private struct SystemStatusSnapshot {
     let cpuUsage: Double?
     let memoryUsage: Double
     let usedMemory: UInt64
     let totalMemory: UInt64
+    let appMemory: UInt64
+    let wiredMemory: UInt64
+    let compressedMemory: UInt64
+    let availableMemory: UInt64
+    let swapMemory: UInt64
     let storageUsage: Double
     let usedStorage: UInt64
     let totalStorage: UInt64
+    let networkInterface: String?
+    let networkAddress: String?
+    let downloadBytesPerSecond: Double?
+    let uploadBytesPerSecond: Double?
     let uptime: TimeInterval
 }
 
@@ -906,13 +1788,21 @@ private struct HostCPUTicks {
     let nice: UInt32
 }
 
+private struct NetworkSample {
+    let interfaceName: String
+    let receivedBytes: UInt64
+    let sentBytes: UInt64
+    let uptime: TimeInterval
+}
+
 @MainActor
 private final class SystemStatusMonitor: ObservableObject {
     @Published private(set) var snapshot: SystemStatusSnapshot?
     @Published private(set) var errorMessage: String?
     private var previousCPUTicks: HostCPUTicks?
+    private var previousNetworkSample: NetworkSample?
 
-    // Samples host-wide CPU, memory, and startup-volume usage for the status display.
+    // Samples host-wide CPU, memory, startup-volume, and primary-interface usage.
     func refresh() {
         var cpuInfo = host_cpu_load_info_data_t()
         var cpuInfoCount = mach_msg_type_number_t(
@@ -983,6 +1873,211 @@ private final class SystemStatusMonitor: ObservableObject {
             errorMessage = "内存统计数据超出物理内存"
             return
         }
+        let pageSize = UInt64(vm_kernel_page_size)
+        let appMemory = UInt64(memoryInfo.internal_page_count - memoryInfo.purgeable_count) * pageSize
+        let wiredMemory = UInt64(memoryInfo.wire_count) * pageSize
+        let compressedMemory = UInt64(memoryInfo.compressor_page_count) * pageSize
+        let availableMemory = totalMemory - memoryProduct.partialValue
+
+        var swapUsage = xsw_usage()
+        var swapUsageSize = MemoryLayout<xsw_usage>.stride
+        guard sysctlbyname("vm.swapusage", &swapUsage, &swapUsageSize, nil, 0) == 0 else {
+            snapshot = nil
+            errorMessage = "无法读取交换空间：\(String(cString: strerror(errno)))"
+            return
+        }
+
+        let ipv4Key = SCDynamicStoreKeyCreateNetworkGlobalEntity(
+            nil,
+            kSCDynamicStoreDomainState,
+            kSCEntNetIPv4
+        )
+        let ipv6Key = SCDynamicStoreKeyCreateNetworkGlobalEntity(
+            nil,
+            kSCDynamicStoreDomainState,
+            kSCEntNetIPv6
+        )
+        let primaryInterfaceKey = kSCDynamicStorePropNetPrimaryInterface as String
+        var networkInterface: String?
+        var networkAddressFamily: Int32?
+
+        let ipv4State = SCDynamicStoreCopyValue(nil, ipv4Key)
+        if let ipv4State {
+            guard let state = ipv4State as? [String: Any],
+                  let primaryInterface = state[primaryInterfaceKey] as? String else {
+                snapshot = nil
+                errorMessage = "IPv4 网络状态数据不一致"
+                return
+            }
+            networkInterface = primaryInterface
+            networkAddressFamily = AF_INET
+        } else {
+            let ipv4Error = SCError()
+            guard ipv4Error == kSCStatusNoKey else {
+                snapshot = nil
+                errorMessage = "无法读取 IPv4 网络状态：\(String(cString: SCErrorString(ipv4Error)))"
+                return
+            }
+
+            let ipv6State = SCDynamicStoreCopyValue(nil, ipv6Key)
+            if let ipv6State {
+                guard let state = ipv6State as? [String: Any],
+                      let primaryInterface = state[primaryInterfaceKey] as? String else {
+                    snapshot = nil
+                    errorMessage = "IPv6 网络状态数据不一致"
+                    return
+                }
+                networkInterface = primaryInterface
+                networkAddressFamily = AF_INET6
+            } else {
+                let ipv6Error = SCError()
+                guard ipv6Error == kSCStatusNoKey else {
+                    snapshot = nil
+                    errorMessage = "无法读取 IPv6 网络状态：\(String(cString: SCErrorString(ipv6Error)))"
+                    return
+                }
+            }
+        }
+
+        var networkAddress: String?
+        var downloadBytesPerSecond: Double?
+        var uploadBytesPerSecond: Double?
+        let currentUptime = ProcessInfo.processInfo.systemUptime
+
+        if let networkInterface, let networkAddressFamily {
+            var interfaceAddresses: UnsafeMutablePointer<ifaddrs>?
+            guard getifaddrs(&interfaceAddresses) == 0, let firstAddress = interfaceAddresses else {
+                snapshot = nil
+                errorMessage = "无法读取网络地址：\(String(cString: strerror(errno)))"
+                return
+            }
+            defer { freeifaddrs(firstAddress) }
+
+            var currentAddress: UnsafeMutablePointer<ifaddrs>? = firstAddress
+            while let addressEntry = currentAddress {
+                let address = addressEntry.pointee
+                currentAddress = address.ifa_next
+                guard String(cString: address.ifa_name) == networkInterface,
+                      let socketAddress = address.ifa_addr,
+                      socketAddress.pointee.sa_family == UInt8(networkAddressFamily) else {
+                    continue
+                }
+
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                let nameResult = getnameinfo(
+                    socketAddress,
+                    socklen_t(socketAddress.pointee.sa_len),
+                    &host,
+                    socklen_t(host.count),
+                    nil,
+                    0,
+                    NI_NUMERICHOST
+                )
+                guard nameResult == 0 else {
+                    snapshot = nil
+                    errorMessage = "无法解析网络地址：\(String(cString: gai_strerror(nameResult)))"
+                    return
+                }
+                networkAddress = String(cString: host)
+                break
+            }
+            guard networkAddress != nil else {
+                snapshot = nil
+                errorMessage = "主网络接口缺少本机地址"
+                return
+            }
+
+            let interfaceIndex = if_nametoindex(networkInterface)
+            guard interfaceIndex > 0 else {
+                snapshot = nil
+                errorMessage = "主网络接口不存在"
+                return
+            }
+
+            var routeMIB: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
+            var routeBufferSize = 0
+            guard sysctl(
+                &routeMIB,
+                u_int(routeMIB.count),
+                nil,
+                &routeBufferSize,
+                nil,
+                0
+            ) == 0 else {
+                snapshot = nil
+                errorMessage = "无法读取网络统计长度：\(String(cString: strerror(errno)))"
+                return
+            }
+
+            var routeBuffer = [UInt8](repeating: 0, count: routeBufferSize)
+            let routeResult = routeBuffer.withUnsafeMutableBytes { buffer in
+                sysctl(
+                    &routeMIB,
+                    u_int(routeMIB.count),
+                    buffer.baseAddress,
+                    &routeBufferSize,
+                    nil,
+                    0
+                )
+            }
+            guard routeResult == 0 else {
+                snapshot = nil
+                errorMessage = "无法读取网络统计：\(String(cString: strerror(errno)))"
+                return
+            }
+
+            var receivedBytes: UInt64?
+            var sentBytes: UInt64?
+            routeBuffer.withUnsafeBytes { buffer in
+                guard let baseAddress = buffer.baseAddress else {
+                    return
+                }
+                var offset = 0
+                while offset < routeBufferSize {
+                    let header = baseAddress.advanced(by: offset).loadUnaligned(as: if_msghdr.self)
+                    guard header.ifm_msglen > 0 else {
+                        return
+                    }
+                    if header.ifm_type == UInt8(RTM_IFINFO2) {
+                        let details = baseAddress.advanced(by: offset).loadUnaligned(as: if_msghdr2.self)
+                        if UInt32(details.ifm_index) == interfaceIndex {
+                            receivedBytes = details.ifm_data.ifi_ibytes
+                            sentBytes = details.ifm_data.ifi_obytes
+                            return
+                        }
+                    }
+                    offset += Int(header.ifm_msglen)
+                }
+            }
+            guard let receivedBytes, let sentBytes else {
+                snapshot = nil
+                errorMessage = "主网络接口缺少流量统计"
+                return
+            }
+
+            let currentNetworkSample = NetworkSample(
+                interfaceName: networkInterface,
+                receivedBytes: receivedBytes,
+                sentBytes: sentBytes,
+                uptime: currentUptime
+            )
+            if let previousNetworkSample,
+               previousNetworkSample.interfaceName == networkInterface,
+               receivedBytes >= previousNetworkSample.receivedBytes,
+               sentBytes >= previousNetworkSample.sentBytes {
+                let interval = currentUptime - previousNetworkSample.uptime
+                guard interval > 0 else {
+                    snapshot = nil
+                    errorMessage = "网络采样间隔无效"
+                    return
+                }
+                downloadBytesPerSecond = Double(receivedBytes - previousNetworkSample.receivedBytes) / interval
+                uploadBytesPerSecond = Double(sentBytes - previousNetworkSample.sentBytes) / interval
+            }
+            self.previousNetworkSample = currentNetworkSample
+        } else {
+            previousNetworkSample = nil
+        }
 
         let storageAttributes: [FileAttributeKey: Any]
         do {
@@ -1008,10 +2103,19 @@ private final class SystemStatusMonitor: ObservableObject {
             memoryUsage: Double(memoryProduct.partialValue) / Double(totalMemory),
             usedMemory: memoryProduct.partialValue,
             totalMemory: totalMemory,
+            appMemory: appMemory,
+            wiredMemory: wiredMemory,
+            compressedMemory: compressedMemory,
+            availableMemory: availableMemory,
+            swapMemory: swapUsage.xsu_used,
             storageUsage: Double(usedStorage) / Double(totalStorage),
             usedStorage: usedStorage,
             totalStorage: totalStorage,
-            uptime: ProcessInfo.processInfo.systemUptime
+            networkInterface: networkInterface,
+            networkAddress: networkAddress,
+            downloadBytesPerSecond: downloadBytesPerSecond,
+            uploadBytesPerSecond: uploadBytesPerSecond,
+            uptime: currentUptime
         )
         errorMessage = nil
     }
@@ -1061,8 +2165,9 @@ private struct SystemStatusView: View {
             .frame(width: 190, height: 28, alignment: .leading)
             .background(
                 .primary.opacity(0.055),
-                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
             )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .frame(width: 190)
@@ -1081,6 +2186,11 @@ private struct SystemStatusView: View {
                     let storageText = snapshot.storageUsage.formatted(
                         .percent.precision(.fractionLength(0))
                     )
+                    let appMemoryText = snapshot.appMemory.formatted(.byteCount(style: .memory))
+                    let wiredMemoryText = snapshot.wiredMemory.formatted(.byteCount(style: .memory))
+                    let compressedMemoryText = snapshot.compressedMemory.formatted(.byteCount(style: .memory))
+                    let availableMemoryText = snapshot.availableMemory.formatted(.byteCount(style: .memory))
+                    let swapMemoryText = snapshot.swapMemory.formatted(.byteCount(style: .memory))
 
                     LabeledContent("CPU") {
                         if let cpuUsage = snapshot.cpuUsage {
@@ -1096,12 +2206,45 @@ private struct SystemStatusView: View {
                                 + snapshot.totalMemory.formatted(.byteCount(style: .memory))
                         )
                     }
+                    LabeledContent("App 内存", value: appMemoryText)
+                    LabeledContent("联动内存", value: wiredMemoryText)
+                    LabeledContent("压缩内存", value: compressedMemoryText)
+                    LabeledContent("可用内存", value: availableMemoryText)
+                    LabeledContent("交换空间", value: swapMemoryText)
                     LabeledContent("磁盘") {
                         Text(
                             "\(storageText) · "
                                 + "\(snapshot.usedStorage.formatted(.byteCount(style: .file))) / "
                                 + snapshot.totalStorage.formatted(.byteCount(style: .file))
                         )
+                    }
+
+                    Divider()
+
+                    if let networkInterface = snapshot.networkInterface,
+                       let networkAddress = snapshot.networkAddress {
+                        LabeledContent("网络接口", value: networkInterface)
+                        LabeledContent("本机地址", value: networkAddress)
+                        LabeledContent("下行") {
+                            if let downloadBytesPerSecond = snapshot.downloadBytesPerSecond {
+                                Text(
+                                    "\(UInt64(downloadBytesPerSecond.rounded()).formatted(.byteCount(style: .file)))/秒"
+                                )
+                            } else {
+                                Text("采集中")
+                            }
+                        }
+                        LabeledContent("上行") {
+                            if let uploadBytesPerSecond = snapshot.uploadBytesPerSecond {
+                                Text(
+                                    "\(UInt64(uploadBytesPerSecond.rounded()).formatted(.byteCount(style: .file)))/秒"
+                                )
+                            } else {
+                                Text("采集中")
+                            }
+                        }
+                    } else {
+                        LabeledContent("网络", value: "未连接")
                     }
 
                     Divider()
@@ -1131,7 +2274,7 @@ private struct SystemStatusView: View {
             .font(.caption)
             .monospacedDigit()
             .padding(16)
-            .frame(width: 330)
+            .frame(width: 360)
         }
         .onAppear {
             monitor.refresh()
@@ -1235,13 +2378,26 @@ private struct ExtensionPromptView: View {
 private struct AnswerSectionView: View {
     let section: AnswerSection
     let tools: [ToolActivity]
+    let baseURL: URL
+    let openFile: (URL) -> Void
 
     var body: some View {
         switch section.content {
         case .markdown(let text):
-            AnswerMarkdownView(source: text)
+            AnswerMarkdownView(source: text, baseURL: baseURL)
         case .extensionMessage(let text):
-            AnswerMarkdownView(source: text)
+            AnswerMarkdownView(source: text, baseURL: baseURL)
+        case .fileLink(let url):
+            Button {
+                openFile(url)
+            } label: {
+                Label(url.lastPathComponent, systemImage: "doc")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.blue)
+            .help(url.path)
         case .customMessage(let message):
             VStack(alignment: .leading, spacing: 8) {
                 Text("[\(message.customType)]")
@@ -1249,11 +2405,12 @@ private struct AnswerSectionView: View {
                     .foregroundStyle(.secondary)
                 switch message.content {
                 case .string(let content):
-                    AnswerMarkdownView(source: content)
+                    AnswerMarkdownView(source: content, baseURL: baseURL)
                 default:
                     Text(message.content.formattedJSON)
                         .font(.system(size: 12, design: .monospaced))
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
                 }
                 switch message.qrCode {
                 case .absent:
@@ -1304,6 +2461,7 @@ private struct AnswerSectionView: View {
                             .font(.system(size: 12, design: .monospaced))
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.top, 6)
+                            .textSelection(.enabled)
                     } label: {
                         Text("插件详情")
                             .font(.caption.weight(.medium))
@@ -1323,11 +2481,11 @@ private struct AnswerSectionView: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: presentation.symbol)
                     .foregroundStyle(presentation.color)
-                AnswerMarkdownView(source: notification.message)
+                AnswerMarkdownView(source: notification.message, baseURL: baseURL)
             }
         case .thinking(let text):
             DisclosureGroup {
-                AnswerMarkdownView(source: text)
+                AnswerMarkdownView(source: text, baseURL: baseURL)
                     .padding(.top, 6)
             } label: {
                 Label("思考过程", systemImage: "brain")
@@ -1406,6 +2564,7 @@ private struct ToolActivityGroupView: View {
                     .font(.system(size: 12, design: .monospaced))
                     .padding(9)
                     .padding(.trailing, 30)
+                    .textSelection(.enabled)
             }
             Button {
                 NSPasteboard.general.clearContents()
@@ -1424,16 +2583,197 @@ private struct ToolActivityGroupView: View {
     }
 }
 
+private let answerMarkdownTheme = Theme()
+    .text {
+        ForegroundColor(Color.primary.opacity(0.92))
+        FontSize(chatMessageFontSize)
+    }
+    .code {
+        FontFamilyVariant(.monospaced)
+        FontSize(.em(0.88))
+        ForegroundColor(Color.primary.opacity(0.88))
+        BackgroundColor(Color.primary.opacity(0.055))
+    }
+    .strong {
+        FontWeight(.semibold)
+    }
+    .link {
+        ForegroundColor(.accentColor)
+    }
+    .heading1 { configuration in
+        configuration.label
+            .relativeLineSpacing(.em(0.14))
+            .markdownMargin(top: 18, bottom: 8)
+            .markdownTextStyle {
+                FontWeight(.semibold)
+                FontSize(.em(1.35))
+            }
+    }
+    .heading2 { configuration in
+        configuration.label
+            .relativeLineSpacing(.em(0.14))
+            .markdownMargin(top: 16, bottom: 8)
+            .markdownTextStyle {
+                FontWeight(.semibold)
+                FontSize(.em(1.2))
+            }
+    }
+    .heading3 { configuration in
+        configuration.label
+            .relativeLineSpacing(.em(0.14))
+            .markdownMargin(top: 14, bottom: 6)
+            .markdownTextStyle {
+                FontWeight(.semibold)
+                FontSize(.em(1.08))
+            }
+    }
+    .heading4 { configuration in
+        configuration.label
+            .markdownMargin(top: 12, bottom: 6)
+            .markdownTextStyle {
+                FontWeight(.semibold)
+                FontSize(.em(1))
+            }
+    }
+    .heading5 { configuration in
+        configuration.label
+            .markdownMargin(top: 12, bottom: 6)
+            .markdownTextStyle {
+                FontWeight(.semibold)
+                FontSize(.em(0.95))
+                ForegroundColor(.secondary)
+            }
+    }
+    .heading6 { configuration in
+        configuration.label
+            .markdownMargin(top: 12, bottom: 6)
+            .markdownTextStyle {
+                FontWeight(.semibold)
+                FontSize(.em(0.9))
+                ForegroundColor(.secondary)
+            }
+    }
+    .paragraph { configuration in
+        configuration.label
+            .fixedSize(horizontal: false, vertical: true)
+            .relativeLineSpacing(.em(0.22))
+            .markdownMargin(top: 0, bottom: 10)
+    }
+    .list { configuration in
+        configuration.label
+            .markdownMargin(top: 0, bottom: 10)
+    }
+    .listItem { configuration in
+        configuration.label
+            .relativeLineSpacing(.em(0.18))
+            .markdownMargin(top: .em(0.3))
+    }
+    .taskListMarker { configuration in
+        Image(systemName: configuration.isCompleted ? "checkmark.square.fill" : "square")
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(configuration.isCompleted ? Color.accentColor : Color.secondary)
+            .imageScale(.small)
+            .relativeFrame(minWidth: .em(1.5), alignment: .trailing)
+    }
+    .blockquote { configuration in
+        configuration.label
+            .markdownTextStyle {
+                ForegroundColor(.secondary)
+                BackgroundColor(nil)
+            }
+            .relativePadding(.vertical, length: .em(0.55))
+            .relativePadding(.horizontal, length: .em(0.9))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))
+            .overlay(alignment: .leading) {
+                Rectangle()
+                    .fill(Color.accentColor.opacity(0.65))
+                    .frame(width: 3)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .markdownMargin(top: 0, bottom: 10)
+    }
+    .codeBlock { configuration in
+        VStack(alignment: .leading, spacing: 0) {
+            if let language = configuration.language {
+                Text(language)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+            }
+            ScrollView(.horizontal) {
+                configuration.label
+                    .fixedSize(horizontal: false, vertical: true)
+                    .relativeLineSpacing(.em(0.24))
+                    .markdownTextStyle {
+                        FontFamilyVariant(.monospaced)
+                        FontSize(.em(0.86))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 6))
+        .overlay {
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.primary.opacity(0.08))
+        }
+        .markdownMargin(top: 0, bottom: 10)
+    }
+    .table { configuration in
+        ScrollView(.horizontal) {
+            configuration.label
+                .fixedSize(horizontal: false, vertical: true)
+                .markdownTableBorderStyle(.init(color: Color.primary.opacity(0.1)))
+                .markdownTableBackgroundStyle(
+                    .alternatingRows(
+                        Color.primary.opacity(0.025),
+                        Color.clear,
+                        header: Color.primary.opacity(0.055)
+                    )
+                )
+        }
+        .markdownMargin(top: 0, bottom: 10)
+    }
+    .tableCell { configuration in
+        configuration.label
+            .markdownTextStyle {
+                if configuration.row == 0 {
+                    FontWeight(.semibold)
+                }
+                BackgroundColor(nil)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .relativeLineSpacing(.em(0.18))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+    }
+    .thematicBreak {
+        Divider()
+            .overlay(Color.primary.opacity(0.12))
+            .markdownMargin(top: 14, bottom: 14)
+    }
+
 private struct AnswerMarkdownView: View {
     let source: String
+    let baseURL: URL
 
     var body: some View {
         // Asset-only providers prevent untrusted model output from issuing remote image requests.
-        Markdown(source)
-            .markdownTextStyle(\.text) { FontSize(chatMessageFontSize) }
-            .markdownTheme(.gitHub)
+        Markdown(source, baseURL: baseURL)
+            .markdownTheme(answerMarkdownTheme)
             .markdownImageProvider(AssetImageProvider())
             .markdownInlineImageProvider(AssetInlineImageProvider())
             .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
+            .environment(\.openURL, OpenURLAction { url in
+                guard url.isFileURL else {
+                    return .systemAction
+                }
+                return NSWorkspace.shared.open(url) ? .handled : .discarded
+            })
     }
 }

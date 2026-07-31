@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import UniformTypeIdentifiers
 import XCTest
 @testable import QuickPi
 
@@ -15,7 +17,7 @@ final class SessionStateTests: XCTestCase {
 
         XCTAssertEqual(
             state.slashCommandSuggestions.map(\.name),
-            ["new", "settings", "copy", "name", "session", "compact", "clone", "export"]
+            ["new", "worktree", "settings", "copy", "name", "session", "compact", "clone", "branch", "export"]
         )
         XCTAssertTrue(state.slashCommandSuggestions.allSatisfy { $0.source == .app })
         XCTAssertEqual(state.inputBarHeight, 102)
@@ -23,6 +25,51 @@ final class SessionStateTests: XCTestCase {
 
         state.draft = "/settings"
         XCTAssertTrue(state.draftMatchesSlashCommand)
+    }
+
+    // Verifies that an image paste enters the existing attachment pipeline and becomes normalized JPEG data.
+    @MainActor
+    func testPastedImageBecomesPendingAttachment() async throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 4,
+            pixelsHigh: 2,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        let provider = NSItemProvider()
+        provider.suggestedName = "clipboard.png"
+        provider.registerDataRepresentation(
+            forTypeIdentifier: UTType.png.identifier,
+            visibility: .all
+        ) { completion in
+            completion(png, nil)
+            return nil
+        }
+
+        await state.addPastedImages(providers: [provider])
+
+        let attachment = try XCTUnwrap(state.attachments.first)
+        XCTAssertEqual(state.attachments.count, 1)
+        XCTAssertEqual(attachment.name, "clipboard.png")
+        guard case let .image(data, mimeType) = attachment.content else {
+            return XCTFail("粘贴图片未生成图片附件")
+        }
+        XCTAssertEqual(mimeType, "image/jpeg")
+        XCTAssertNotNil(NSImage(data: data))
+        XCTAssertEqual(state.inputBarHeight, 140)
+        XCTAssertNil(state.runtimeError)
     }
 
     // Confirms command search is case-insensitive and matches beyond the beginning of the name.
@@ -41,11 +88,13 @@ final class SessionStateTests: XCTestCase {
 
     func testRuntimeSnapshotDecodesCommandDescriptions() throws {
         let data = Data(
-            #"{"providers":[],"models":[],"commands":[{"name":"review","description":"Review changes","source":"extension"},{"name":"skill:search","source":"skill"}]}"#.utf8
+            #"{"providers":[],"models":[{"id":"gpt-5.6","name":"GPT-5.6","providerId":"openai","providerName":"OpenAI","supportsImages":true,"supportsReasoning":true}],"commands":[{"name":"review","description":"Review changes","source":"extension"},{"name":"skill:search","source":"skill"}]}"#.utf8
         )
 
         let snapshot = try JSONDecoder().decode(RuntimeSnapshot.self, from: data)
 
+        XCTAssertEqual(snapshot.models.count, 1)
+        XCTAssertTrue(snapshot.models[0].supportsReasoning)
         XCTAssertEqual(snapshot.commands.count, 2)
         XCTAssertEqual(snapshot.commands[0].description, "Review changes")
         XCTAssertNil(snapshot.commands[1].description)
@@ -66,12 +115,16 @@ final class SessionStateTests: XCTestCase {
             startedAt: Date(timeIntervalSince1970: 0),
             sections: [
                 AnswerSection(id: UUID(), content: .extensionMessage("插件反馈")),
+                AnswerSection(
+                    id: UUID(),
+                    content: .fileLink(URL(fileURLWithPath: "/tmp/pi-session.html"))
+                ),
                 AnswerSection(id: UUID(), content: .markdown("模型回答")),
             ],
             status: .completed
         )
 
-        XCTAssertEqual(answer.answerText, "插件反馈\n\n模型回答")
+        XCTAssertEqual(answer.answerText, "插件反馈\n\n/tmp/pi-session.html\n\n模型回答")
     }
 
     func testPiCustomMessagePreservesRawProtocolFields() throws {
@@ -423,10 +476,10 @@ final class SessionStateTests: XCTestCase {
             #"{"type":"extension_ui_request","id":"1","method":"notify","message":"Saved","notifyType":"warning"}"#.utf8
         ))
         try runtime.consumeExtensionRequest(Data(
-            #"{"type":"extension_ui_request","id":"2","method":"setStatus","statusKey":"sync","statusText":"Syncing"}"#.utf8
+            #"{"type":"extension_ui_request","id":"2","method":"setStatus","statusKey":"sync","statusText":"\u001b[33mSyncing\u001b[0m"}"#.utf8
         ))
         try runtime.consumeExtensionRequest(Data(
-            #"{"type":"extension_ui_request","id":"3","method":"setWidget","widgetKey":"tasks","widgetLines":["Task 1","Task 2"],"widgetPlacement":"belowEditor"}"#.utf8
+            #"{"type":"extension_ui_request","id":"3","method":"setWidget","widgetKey":"tasks","widgetLines":["\u001b[2m☐ \u001b[0mTask 1","Task 2"],"widgetPlacement":"belowEditor"}"#.utf8
         ))
         try runtime.consumeExtensionRequest(Data(
             #"{"type":"extension_ui_request","id":"4","method":"setTitle","title":"Plugin workspace"}"#.utf8
@@ -443,7 +496,7 @@ final class SessionStateTests: XCTestCase {
         XCTAssertEqual(state.extensionStatuses, [ExtensionStatus(key: "sync", text: "Syncing")])
         XCTAssertEqual(
             state.extensionWidgets,
-            [ExtensionWidget(key: "tasks", lines: ["Task 1", "Task 2"], placement: .belowEditor)]
+            [ExtensionWidget(key: "tasks", lines: ["☐ Task 1", "Task 2"], placement: .belowEditor)]
         )
         XCTAssertEqual(state.extensionTitle, "Plugin workspace")
         XCTAssertEqual(state.draft, "prefilled")
@@ -471,6 +524,60 @@ final class SessionStateTests: XCTestCase {
 
         XCTAssertTrue(state.extensionStatuses.isEmpty)
         XCTAssertTrue(state.extensionWidgets.isEmpty)
+
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"plan-status","method":"setStatus","statusKey":"plan-mode","statusText":"📋 1/2"}"#.utf8
+        ))
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"plan-widget","method":"setWidget","widgetKey":"plan-todos","widgetLines":["☑ Inspect the chain","☐ Move the progress UI"]}"#.utf8
+        ))
+
+        XCTAssertEqual(
+            state.extensionStatuses,
+            [ExtensionStatus(key: ExtensionStatus.planModeKey, text: "📋 1/2")]
+        )
+        XCTAssertEqual(
+            state.extensionWidgets,
+            [ExtensionWidget(
+                key: ExtensionWidget.planModeKey,
+                lines: ["☑ Inspect the chain", "☐ Move the progress UI"],
+                placement: .aboveEditor
+            )]
+        )
+        XCTAssertEqual(state.inputBarHeight, 102)
+
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"clear-plan-status","method":"setStatus","statusKey":"plan-mode"}"#.utf8
+        ))
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"clear-plan-widget","method":"setWidget","widgetKey":"plan-todos"}"#.utf8
+        ))
+
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"10","method":"select","title":"Plan mode - what next?","options":["Execute the plan (track progress)","Stay in plan mode","Refine the plan"]}"#.utf8
+        ))
+        XCTAssertEqual(state.extensionPrompt, ExtensionPrompt(
+            requestId: "10",
+            method: "select",
+            title: "Plan mode - what next?",
+            message: nil,
+            placeholder: nil,
+            options: ["Execute the plan (track progress)", "Stay in plan mode", "Refine the plan"],
+            prefill: nil
+        ))
+
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"11","method":"editor","title":"Refine the plan:","prefill":"Keep the tests focused"}"#.utf8
+        ))
+        XCTAssertEqual(state.extensionPrompt, ExtensionPrompt(
+            requestId: "11",
+            method: "editor",
+            title: "Refine the plan:",
+            message: nil,
+            placeholder: nil,
+            options: [],
+            prefill: "Keep the tests focused"
+        ))
     }
 
     // Keeps concurrent event streams isolated and marks only unseen background completion.
@@ -643,10 +750,73 @@ final class SessionStateTests: XCTestCase {
         )
 
         XCTAssertThrowsError(try state.applySessionSnapshot(snapshot)) { error in
-            XCTAssertEqual(error.localizedDescription, "Pi 会话目录与当前范围不一致")
+            XCTAssertEqual(error.localizedDescription, "Pi 会话目录不属于当前项目")
         }
         XCTAssertTrue(state.sessions.isEmpty)
         XCTAssertNil(state.activeSessionID)
+    }
+
+    // Keeps one selected checkout and all of its managed worktree sessions in the same project scope.
+    @MainActor
+    func testManagedWorktreeSessionsUsePersistedWorkingDirectoryOwnership() throws {
+        let directory = try temporaryDirectory()
+        let localWorkspace = directory.appendingPathComponent("project", isDirectory: true)
+        let worktreeWorkspace = directory.appendingPathComponent("worktree", isDirectory: true)
+        let foreignWorkspace = directory.appendingPathComponent("foreign", isDirectory: true)
+        try FileManager.default.createDirectory(at: localWorkspace, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: worktreeWorkspace, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: foreignWorkspace, withIntermediateDirectories: true)
+
+        let localPath = localWorkspace.standardizedFileURL.resolvingSymlinksInPath().path
+        let worktreePath = worktreeWorkspace.standardizedFileURL.resolvingSymlinksInPath().path
+        let foreignPath = foreignWorkspace.standardizedFileURL.resolvingSymlinksInPath().path
+        let store = ConfigurationStore(applicationSupportDirectory: directory)
+        var settings = AppSettings.defaults
+        settings.workspacePath = localPath
+        _ = try store.save(settings)
+        try store.saveManagedWorktrees([ManagedWorktree(
+            id: "worktree-1",
+            repositoryPath: localPath,
+            localWorkspacePath: localPath,
+            worktreePath: worktreePath,
+            workspacePath: worktreePath,
+            baseCommit: "0123456789abcdef",
+            createdAt: 1_000,
+            branch: nil
+        )])
+        let state = try AppState(
+            applicationSupportDirectory: directory,
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        let localSession = conversationSession(id: "local", cwd: localPath, firstMessage: "本地")
+        let worktreeSession = conversationSession(id: "worktree", cwd: worktreePath, firstMessage: "Worktree")
+        let foreignSession = conversationSession(id: "foreign", cwd: foreignPath, firstMessage: "其他项目")
+
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: localPath,
+            activeSessionPath: localSession.path,
+            activeSessionId: localSession.id,
+            sessions: [localSession, worktreeSession, foreignSession],
+            messages: []
+        ))
+
+        XCTAssertEqual(state.sessions.map(\.id), [localSession.id, worktreeSession.id])
+        XCTAssertEqual(state.worktreeLabel(for: worktreeSession), "detached HEAD")
+        XCTAssertFalse(state.isManagedWorktreeSession(id: localSession.id))
+        XCTAssertTrue(state.isManagedWorktreeSession(id: worktreeSession.id))
+
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: worktreePath,
+            activeSessionPath: worktreeSession.path,
+            activeSessionId: worktreeSession.id,
+            sessions: [localSession, worktreeSession, foreignSession],
+            messages: []
+        ))
+
+        XCTAssertEqual(state.activeWorkingDirectoryURL.path, worktreePath)
+        XCTAssertEqual(state.activeManagedWorktree?.id, "worktree-1")
+        XCTAssertEqual(state.scopeTitle, "project")
     }
 
     private func conversationSession(id: String, cwd: String, firstMessage: String) -> ConversationSession {

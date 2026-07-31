@@ -110,16 +110,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     )
     private var panel: QuickPanel?
     private var settingsWindow: NSWindow?
+    private var gitWindow: NSWindow?
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
     private var shortcut: GlobalShortcut?
     private var state: AppState?
     private var resultContentHeight: CGFloat = 520
+    private var panelFrameBeforeZoom: NSRect?
+    private var pasteboardChangeCount = 0
 
     // Creates the menu-bar app, native panel, global shortcut, and managed Pi runtime.
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         installEditMenu()
+        pasteboardChangeCount = NSPasteboard.general.changeCount
 
         guard let baseDirectory = FileManager.default.urls(
             for: .applicationSupportDirectory,
@@ -142,9 +146,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             state = appState
             createPanel(state: appState)
             createSettingsWindow(state: appState)
+            createGitWindow(state: appState)
             createStatusItem()
             shortcut = try GlobalShortcut { [weak self] in
-                self?.togglePanel()
+                self?.handleGlobalShortcut()
             }
             appState.applyShortcut = { [weak self] value in
                 guard let shortcut = self?.shortcut else {
@@ -175,18 +180,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         state?.stop()
     }
 
+    // Marks the current clipboard content as seen before the user works in another application.
+    func applicationDidResignActive(_ notification: Notification) {
+        pasteboardChangeCount = NSPasteboard.general.changeCount
+    }
+
     // Hides app windows instead of destroying their persistent view state.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
         return false
-    }
-
-    // Uses the current screen's visible area for the panel's standard zoom frame.
-    func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame newFrame: NSRect) -> NSRect {
-        guard window === panel, let screen = window.screen else {
-            return newFrame
-        }
-        return screen.visibleFrame.insetBy(dx: 24, dy: 24)
     }
 
     // Preserves only user-driven result height changes while streamed events continue updating the panel.
@@ -196,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
               let resizedWindow = notification.object as? NSWindow,
               resizedWindow === panel,
               panel.inLiveResize,
+              panelFrameBeforeZoom == nil,
               state.slashCommandMenuHeight == 0,
               state.showsResultPanel else {
             return
@@ -239,15 +242,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.hidesOnDeactivate = UserDefaults.standard.bool(forKey: "hidePanelWhenInactive")
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
-        panel.contentMinSize = NSSize(width: panelMinimumWidth, height: 102)
         panel.delegate = self
-        panel.contentView = NSHostingView(rootView: ChatView(
+        let hostingView = NSHostingView(rootView: ChatView(
             state: state,
-            togglePanelZoom: { [weak panel] in
-                panel?.zoom(nil)
+            togglePanelZoom: { [unowned self] in
+                self.togglePanelZoom()
+            },
+            presentGitActions: { [unowned self] in
+                self.showGitActions()
             }
         )
         .dynamicTypeSize(.medium))
+        // AppKit owns panel sizing; SwiftUI must not rewrite it after the backing screen changes.
+        hostingView.sizingOptions = []
+        panel.contentView = hostingView
+        panel.contentMinSize = NSSize(width: panelMinimumWidth, height: 102)
         self.panel = panel
     }
 
@@ -273,6 +282,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         .dynamicTypeSize(.medium))
         window.center()
         settingsWindow = window
+    }
+
+    // Hosts Git operations in a persistent native window opened from the existing branch button.
+    private func createGitWindow(state: AppState) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 486),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Git"
+        window.isReleasedWhenClosed = false
+        window.level = .normal
+        window.tabbingMode = .disallowed
+        window.delegate = self
+        window.contentView = NSHostingView(rootView: GitActionsView(state: state)
+            .dynamicTypeSize(.medium))
+        window.center()
+        gitWindow = window
     }
 
     // Creates a left-click launcher and a right-click application menu.
@@ -343,9 +371,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    // Sends newly copied external text through the existing prompt path when the shortcut opens the panel.
+    private func handleGlobalShortcut() {
+        guard panel?.isKeyWindow != true else {
+            panel?.orderOut(nil)
+            return
+        }
+
+        let pasteboard = NSPasteboard.general
+        let changeCount = pasteboard.changeCount
+        let copiedText = !NSApp.isActive && changeCount != pasteboardChangeCount
+            ? pasteboard.string(forType: .string)
+            : nil
+        pasteboardChangeCount = changeCount
+        showPanel()
+
+        guard let copiedText,
+              !copiedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+        guard let state else {
+            preconditionFailure("全局快捷键必须在应用状态初始化后启用")
+        }
+        state.draft = copiedText
+        Task { await state.send() }
+    }
+
     // Activates the accessory app and moves keyboard focus into the prompt.
     private func showPanel() {
         positionPanelAtTopCenter()
+        updatePanelSize()
         NSApp.activate(ignoringOtherApps: true)
         panel?.makeKeyAndOrderFront(nil)
         NotificationCenter.default.post(name: .quickPiFocusInput, object: nil)
@@ -360,29 +415,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settingsWindow.makeKeyAndOrderFront(nil)
     }
 
+    // Opens the Git window without changing the branch entry in the main panel.
+    private func showGitActions() {
+        guard let gitWindow, let state else {
+            preconditionFailure("Git 窗口必须在打开前创建")
+        }
+        if !gitWindow.isVisible {
+            gitWindow.contentView = NSHostingView(rootView: GitActionsView(state: state)
+                .dynamicTypeSize(.medium))
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        gitWindow.makeKeyAndOrderFront(nil)
+    }
+
     // Expands results downward while keeping the input bar's top edge stationary.
     private func updatePanelSize() {
-        guard let panel, let state else {
+        guard let panel, let state, let screen = panel.screen else {
             return
         }
         panel.title = state.extensionTitle ?? "Quick Pi"
-        guard !panel.isZoomed else {
-            return
-        }
         let inputHeight = state.inputBarHeight
-        let targetHeight: CGFloat
+        let requestedHeight: CGFloat
+        let minimumHeight: CGFloat
         if state.slashCommandMenuHeight > 0 {
-            panel.contentMinSize = NSSize(
-                width: panelMinimumWidth,
-                height: inputHeight + state.slashCommandMenuHeight
-            )
-            targetHeight = inputHeight + state.slashCommandMenuHeight
+            minimumHeight = inputHeight + state.slashCommandMenuHeight
+            requestedHeight = minimumHeight
         } else if state.showsResultPanel {
-            panel.contentMinSize = NSSize(width: panelMinimumWidth, height: inputHeight + 241)
-            targetHeight = inputHeight + resultContentHeight
+            minimumHeight = inputHeight + 241
+            requestedHeight = inputHeight + resultContentHeight
         } else {
-            panel.contentMinSize = NSSize(width: panelMinimumWidth, height: inputHeight)
-            targetHeight = inputHeight
+            minimumHeight = inputHeight
+            requestedHeight = inputHeight
+        }
+        // Keep the existing 96-point top offset and a 24-point bottom margin on every screen.
+        let maximumHeight = max(inputHeight, screen.visibleFrame.height - 120)
+        let targetHeight = min(requestedHeight, maximumHeight)
+        panel.contentMinSize = NSSize(
+            width: panelMinimumWidth,
+            height: min(minimumHeight, maximumHeight)
+        )
+        if var restoredFrame = panelFrameBeforeZoom {
+            let top = restoredFrame.maxY
+            restoredFrame.size.height = targetHeight
+            restoredFrame.origin.y = max(screen.visibleFrame.minY + 24, top - targetHeight)
+            panelFrameBeforeZoom = restoredFrame
+            return
         }
         guard panel.frame.height != targetHeight else {
             return
@@ -390,8 +467,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var frame = panel.frame
         let top = frame.maxY
         frame.size.height = targetHeight
-        frame.origin.y = top - targetHeight
+        frame.origin.y = max(screen.visibleFrame.minY + 24, top - targetHeight)
         panel.setFrame(frame, display: true, animate: true)
+    }
+
+    // Enlarges the panel without creating a second window-size state inside NSWindow.
+    private func togglePanelZoom() {
+        guard let panel, let screen = panel.screen else {
+            return
+        }
+        if let restoredFrame = panelFrameBeforeZoom {
+            panelFrameBeforeZoom = nil
+            panel.setFrame(restoredFrame, display: true, animate: true)
+        } else {
+            panelFrameBeforeZoom = panel.frame
+            panel.setFrame(screen.visibleFrame.insetBy(dx: 24, dy: 24), display: true, animate: true)
+        }
     }
 
     // Places the panel near the top center of the screen containing the pointer.
@@ -406,9 +497,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let visibleFrame = screen.visibleFrame
+        if var restoredFrame = panelFrameBeforeZoom {
+            restoredFrame.origin.x = visibleFrame.midX - restoredFrame.width / 2
+            restoredFrame.origin.y = max(
+                visibleFrame.minY + 24,
+                visibleFrame.maxY - 96 - restoredFrame.height
+            )
+            panelFrameBeforeZoom = restoredFrame
+            panel.setFrame(visibleFrame.insetBy(dx: 24, dy: 24), display: false)
+            return
+        }
         var frame = panel.frame
         frame.origin.x = visibleFrame.midX - frame.width / 2
-        frame.origin.y = visibleFrame.maxY - 96 - frame.height
+        frame.origin.y = max(visibleFrame.minY + 24, visibleFrame.maxY - 96 - frame.height)
         panel.setFrame(frame, display: false)
     }
 

@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import ServiceManagement
+import UniformTypeIdentifiers
 
 @MainActor
 final class AppState: ObservableObject {
@@ -20,6 +21,8 @@ final class AppState: ObservableObject {
         var answerGeneration = 0
         var unreadCompletion = false
         var conversationLoaded = false
+        var thinkingLevel: ThinkingLevel = .off
+        var availableThinkingLevels: [ThinkingLevel] = [.off]
 
         var isAnswering: Bool {
             answer?.status == .waiting || answer?.status == .running
@@ -34,14 +37,21 @@ final class AppState: ObservableObject {
         }
     }
 
+    private struct RuntimeStartResult {
+        let modelError: String?
+        let thinkingState: PiThinkingState?
+    }
+
     private static let nativeSlashCommands = [
-        SlashCommand(name: "new", description: "新建会话", source: .app),
+        SlashCommand(name: "new", description: "在当前目录新建会话", source: .app),
+        SlashCommand(name: "worktree", description: "在新 Worktree 中新建会话", source: .app),
         SlashCommand(name: "settings", description: "打开设置", source: .app),
         SlashCommand(name: "copy", description: "复制最近回答", source: .app),
         SlashCommand(name: "name", description: "设置当前会话名称", source: .app),
         SlashCommand(name: "session", description: "查看当前会话统计", source: .app),
         SlashCommand(name: "compact", description: "压缩当前会话上下文", source: .app),
         SlashCommand(name: "clone", description: "克隆当前会话", source: .app),
+        SlashCommand(name: "branch", description: "为当前 Worktree 创建分支", source: .app),
         SlashCommand(name: "export", description: "导出当前会话为 HTML", source: .app),
     ]
 
@@ -50,8 +60,13 @@ final class AppState: ObservableObject {
     @Published private(set) var builtInModels: [ModelOption] = []
     @Published private(set) var slashCommands = AppState.nativeSlashCommands
     @Published private(set) var sessions: [ConversationSession] = []
+    @Published private(set) var managedWorktrees: [ManagedWorktree] = []
     @Published private(set) var activeSessionID: String?
     @Published private(set) var sessionChanging = false
+    @Published private(set) var gitOperationRunning = false
+    @Published private(set) var activeGitStatus: GitRepositoryStatus?
+    @Published private(set) var activeGitStatusError: String?
+    @Published private(set) var activeGitStatusLoading = false
     @Published var shortcutError: String?
     @Published var authSession: AuthSession?
     @Published private var sessionExecutions: [String: SessionExecution] = [:]
@@ -65,6 +80,7 @@ final class AppState: ObservableObject {
 
     private let store: ConfigurationStore
     private let applicationSupportDirectory: URL
+    private let worktreeManager: GitWorktreeManager
     let checkForUpdates: () -> Void
     let presentSettings: () -> Void
     private var runtimes: [String: PiRuntime] = [:]
@@ -72,6 +88,7 @@ final class AppState: ObservableObject {
     private var runtimeSessionIDs: [ObjectIdentifier: String] = [:]
     private var pendingRuntimeEvents: [ObjectIdentifier: [PiRuntimeEvent]] = [:]
     private var runtimeGeneration = 0
+    private var gitStatusGeneration = 0
 
     var applyShortcut: ((String) throws -> Void)?
     var panelContentChanged: (() -> Void)?
@@ -102,7 +119,8 @@ final class AppState: ObservableObject {
                     name: $0,
                     providerId: provider.id,
                     providerName: provider.name,
-                    supportsImages: true
+                    supportsImages: true,
+                    supportsReasoning: provider.modelThinkingLevels?[$0] != nil
                 )
             }
         }
@@ -118,6 +136,19 @@ final class AppState: ObservableObject {
         return modelOptions.first {
             $0.providerId == selection.providerId && $0.id == selection.modelId
         }
+    }
+
+    var thinkingLevel: ThinkingLevel {
+        activeSessionID.flatMap { sessionExecutions[$0] }?.thinkingLevel ?? .off
+    }
+
+    var availableThinkingLevels: [ThinkingLevel] {
+        activeSessionID.flatMap { sessionExecutions[$0] }?.availableThinkingLevels ?? [.off]
+    }
+
+    var supportsThinking: Bool {
+        selectedModel?.supportsReasoning == true
+            && availableThinkingLevels.contains(where: { $0 != .off })
     }
 
     var runtimeReady: Bool {
@@ -233,8 +264,49 @@ final class AppState: ObservableObject {
         return sessions.first { $0.id == activeSessionID }
     }
 
+    var activeManagedWorktree: ManagedWorktree? {
+        guard let activeSession else {
+            return nil
+        }
+        return managedWorktree(for: activeSession)
+    }
+
+    var activeWorkingDirectoryURL: URL {
+        if let activeSession {
+            return URL(fileURLWithPath: activeSession.cwd, isDirectory: true)
+        }
+        return settings.workspaceURL ?? FileManager.default.homeDirectoryForCurrentUser
+    }
+
     var scopeTitle: String {
-        settings.workspaceURL?.lastPathComponent ?? "主空间"
+        if let worktree = activeManagedWorktree {
+            return URL(fileURLWithPath: worktree.localWorkspacePath, isDirectory: true).lastPathComponent
+        }
+        return settings.workspaceURL?.lastPathComponent ?? "主空间"
+    }
+
+    var scopePath: String {
+        activeSession?.cwd ?? settings.workspacePath ?? "主空间"
+    }
+
+    // Identifies sessions whose working directory is owned by Quick Pi.
+    func isManagedWorktreeSession(id: String) -> Bool {
+        guard let session = sessions.first(where: { $0.id == id }) else {
+            return false
+        }
+        return managedWorktree(for: session) != nil
+    }
+
+    // Describes the branch state shared by every cloned session in one managed worktree.
+    func worktreeLabel(for session: ConversationSession) -> String? {
+        managedWorktree(for: session).map {
+            $0.branch ?? "detached HEAD"
+        }
+    }
+
+    // Resolves worktree ownership from Pi's persisted working directory, the shared session contract.
+    private func managedWorktree(for session: ConversationSession) -> ManagedWorktree? {
+        managedWorktrees.first { $0.workspacePath == session.cwd }
     }
 
     func title(for session: ConversationSession) -> String {
@@ -258,7 +330,7 @@ final class AppState: ObservableObject {
     // Matches the fixed SwiftUI bands used by the input bar so AppKit can resize without clipping plugin UI.
     var inputBarHeight: CGFloat {
         var height: CGFloat = attachments.isEmpty ? 102 : 140
-        for widget in extensionWidgets {
+        for widget in extensionWidgets where widget.key != ExtensionWidget.planModeKey {
             height += CGFloat(widget.lines.count * 16 + 12)
         }
         return height
@@ -288,7 +360,9 @@ final class AppState: ObservableObject {
     ) throws {
         self.applicationSupportDirectory = applicationSupportDirectory
         store = ConfigurationStore(applicationSupportDirectory: applicationSupportDirectory)
+        worktreeManager = GitWorktreeManager(applicationSupportDirectory: applicationSupportDirectory)
         settings = try store.load()
+        managedWorktrees = try store.loadManagedWorktrees()
         self.checkForUpdates = checkForUpdates
         self.presentSettings = presentSettings
     }
@@ -322,8 +396,9 @@ final class AppState: ObservableObject {
             settings = try store.save(next)
             notifyPanel()
             do {
-                for runtime in runtimes.values {
-                    try await runtime.selectModel(model.selection)
+                for (sessionID, runtime) in runtimes {
+                    let thinkingState = try await runtime.selectModel(model.selection)
+                    applyThinkingState(thinkingState, sessionID: sessionID)
                 }
                 runtimeError = nil
             } catch {
@@ -332,6 +407,36 @@ final class AppState: ObservableObject {
             }
         } catch {
             runtimeError = error.localizedDescription
+        }
+        notifyPanel()
+    }
+
+    // Changes reasoning only for the active Pi session after validating its reported capability.
+    func selectThinkingLevel(_ level: ThinkingLevel) async {
+        guard runtimeReady,
+              !hasRunningSessions,
+              !sessionChanging,
+              !gitOperationRunning,
+              let sessionID = activeSessionID,
+              let runtime = runtimes[sessionID] else {
+            return
+        }
+        guard availableThinkingLevels.contains(level) else {
+            setRuntimeError("当前模型不支持该推理强度", sessionID: sessionID)
+            notifyPanel()
+            return
+        }
+        guard level != thinkingLevel else {
+            return
+        }
+        do {
+            applyThinkingState(
+                try await runtime.selectThinkingLevel(level),
+                sessionID: sessionID
+            )
+            setRuntimeError(nil, sessionID: sessionID)
+        } catch {
+            setRuntimeError(error.localizedDescription, sessionID: sessionID)
         }
         notifyPanel()
     }
@@ -347,6 +452,48 @@ final class AppState: ObservableObject {
             var loaded = attachments
             for url in urls {
                 loaded.append(try AttachmentLoader.load(url: url))
+            }
+            if let sessionID = activeSessionID {
+                updateSession(sessionID) { $0.attachments = loaded }
+            } else {
+                pendingAttachments = loaded
+            }
+            runtimeError = nil
+        } catch {
+            runtimeError = error.localizedDescription
+        }
+        notifyPanel()
+    }
+
+    // Reads pasted image representations in clipboard order and appends them atomically.
+    func addPastedImages(providers: [NSItemProvider]) async {
+        guard attachments.count + providers.count <= 5 else {
+            runtimeError = "一次最多添加 5 个附件"
+            notifyPanel()
+            return
+        }
+        do {
+            var loaded = attachments
+            for (index, provider) in providers.enumerated() {
+                guard let contentType = provider.registeredContentTypes(conformingTo: .image).first else {
+                    throw QuickPiError.message("剪贴板中没有可读取的图片")
+                }
+                let data: Data = try await withCheckedThrowingContinuation { continuation in
+                    _ = provider.loadDataRepresentation(for: contentType) { data, error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                            return
+                        }
+                        guard let data else {
+                            continuation.resume(throwing: QuickPiError.message("粘贴图片读取结果为空"))
+                            return
+                        }
+                        continuation.resume(returning: data)
+                    }
+                }
+                let name = provider.suggestedName
+                    ?? (providers.count == 1 ? "粘贴图片" : "粘贴图片 \(index + 1)")
+                loaded.append(try AttachmentLoader.loadImage(data: data, name: name))
             }
             if let sessionID = activeSessionID {
                 updateSession(sessionID) { $0.attachments = loaded }
@@ -381,6 +528,11 @@ final class AppState: ObservableObject {
         }
         guard !sessionChanging else {
             runtimeError = "会话切换期间不能切换工作区"
+            notifyPanel()
+            return
+        }
+        guard !gitOperationRunning else {
+            runtimeError = "Git 操作执行期间不能切换工作区"
             notifyPanel()
             return
         }
@@ -427,6 +579,11 @@ final class AppState: ObservableObject {
             notifyPanel()
             return
         }
+        guard !gitOperationRunning else {
+            runtimeError = "Git 操作正在执行"
+            notifyPanel()
+            return
+        }
         guard !isBusy else {
             return
         }
@@ -456,7 +613,11 @@ final class AppState: ObservableObject {
                 return
             case "new":
                 updateSession(sessionID) { $0.draft = "" }
-                await createSession()
+                await createSession(usesIndependentWorktree: false)
+                return
+            case "worktree":
+                updateSession(sessionID) { $0.draft = "" }
+                await createSession(usesIndependentWorktree: true)
                 return
             case "copy":
                 guard let text = conversationAnswers.reversed().first(where: {
@@ -482,13 +643,18 @@ final class AppState: ObservableObject {
                 sessionChanging = true
                 setRuntimeError(nil, sessionID: sessionID)
                 notifyPanel()
+                var runtimeChangedSession = false
                 do {
                     let result = try await runtime.cloneSession()
                     guard !result.cancelled else {
                         throw QuickPiError.message("插件取消了会话克隆")
                     }
+                    runtimeChangedSession = true
                     let snapshot = try await runtime.sessionSnapshot()
                     try validateSessionSnapshot(snapshot)
+                    guard snapshot.activeSessionId != sessionID else {
+                        throw QuickPiError.message("Pi 没有创建独立的克隆会话")
+                    }
                     try applySessionSnapshot(snapshot)
                     rebindRuntime(runtime, from: sessionID, to: snapshot.activeSessionId)
                     presentCommandResult(
@@ -497,6 +663,9 @@ final class AppState: ObservableObject {
                         sessionID: snapshot.activeSessionId
                     )
                 } catch {
+                    if runtimeChangedSession {
+                        removeRuntime(runtime, stopping: true)
+                    }
                     setRuntimeError(error.localizedDescription, sessionID: sessionID)
                 }
                 sessionChanging = false
@@ -514,6 +683,7 @@ final class AppState: ObservableObject {
             updateSession(sessionID) { $0.extensionCommandRunning = true }
             notifyPanel()
             do {
+                var exportedFileURL: URL?
                 let markdown: String
                 switch commandName {
                 case "name":
@@ -554,9 +724,33 @@ final class AppState: ObservableObject {
 
                     \(result.summary)
                     """
+                case "branch":
+                    guard !commandArguments.isEmpty else {
+                        throw QuickPiError.message("用法：/branch 分支名")
+                    }
+                    guard let session = sessions.first(where: { $0.id == sessionID }),
+                          let worktree = managedWorktree(for: session) else {
+                        throw QuickPiError.message("当前会话不在 Quick Pi 托管的 Worktree 中")
+                    }
+                    if let branch = try await worktreeManager.currentBranch(in: worktree) {
+                        await refreshManagedWorktreeBranch(sessionID: sessionID)
+                        await refreshGitStatus()
+                        throw QuickPiError.message("当前 Worktree 已在分支 \(branch) 上")
+                    }
+                    _ = try await createGitBranch(named: commandArguments)
+                    markdown = "已在当前 Worktree 创建并切换到分支 **\(commandArguments)**。"
                 case "export":
                     let result = try await runtime.exportHTML()
-                    markdown = "会话已导出到：\n\n`\(result.path)`"
+                    let exportURL = URL(
+                        fileURLWithPath: result.path,
+                        relativeTo: activeWorkingDirectoryURL
+                    ).absoluteURL.standardizedFileURL
+                    let values = try exportURL.resourceValues(forKeys: [.isRegularFileKey])
+                    guard values.isRegularFile == true else {
+                        throw QuickPiError.message("Pi 导出的 HTML 文件不存在：\(exportURL.path)")
+                    }
+                    exportedFileURL = exportURL
+                    markdown = "会话已导出到："
                 default:
                     throw QuickPiError.message("未知的应用命令：/\(commandName)")
                 }
@@ -570,6 +764,12 @@ final class AppState: ObservableObject {
                         id: UUID(),
                         content: .extensionMessage(markdown)
                     ))
+                    if let exportedFileURL {
+                        execution.answer?.sections.append(AnswerSection(
+                            id: UUID(),
+                            content: .fileLink(exportedFileURL)
+                        ))
+                    }
                     execution.answer?.status = .completed
                     execution.extensionCommandRunning = false
                 }
@@ -751,9 +951,12 @@ final class AppState: ObservableObject {
         notifyPanel()
     }
 
-    // Creates a persistent empty session in the current main-directory or workspace scope.
-    func createSession() async {
-        guard activeSessionID != nil, !sessionChanging, !initialRuntimeStarting else {
+    // Creates a persistent session either in the current directory or an explicitly requested worktree.
+    func createSession(usesIndependentWorktree: Bool) async {
+        guard activeSessionID != nil,
+              !sessionChanging,
+              !initialRuntimeStarting,
+              !gitOperationRunning else {
             return
         }
         sessionChanging = true
@@ -761,11 +964,43 @@ final class AppState: ObservableObject {
         setRuntimeError(nil, sessionID: previousSessionID)
         let sessionID = UUID().uuidString
         let runtime = makeRuntime()
-        sessionExecutions[sessionID] = SessionExecution()
-        startingSessionIDs.insert(sessionID)
         notifyPanel()
+        var createdWorktree: ManagedWorktree?
         do {
-            let modelError = try await startRuntime(runtime, session: .new(id: sessionID))
+            let workingDirectoryURL: URL
+            if usesIndependentWorktree {
+                guard let workspaceURL = settings.workspaceURL else {
+                    throw QuickPiError.message("请先选择 Git 工作区")
+                }
+                guard try await worktreeManager.isGitRepository(at: workspaceURL) else {
+                    throw QuickPiError.message("当前工作区不是 Git 仓库")
+                }
+                let worktree = try await worktreeManager.create(
+                    sessionID: sessionID,
+                    workspaceURL: workspaceURL
+                )
+                var nextWorktrees = managedWorktrees
+                nextWorktrees.append(worktree)
+                do {
+                    try store.saveManagedWorktrees(nextWorktrees)
+                } catch {
+                    try await worktreeManager.discardNew(worktree)
+                    throw error
+                }
+                managedWorktrees = nextWorktrees
+                createdWorktree = worktree
+                workingDirectoryURL = URL(fileURLWithPath: worktree.workspacePath, isDirectory: true)
+            } else {
+                workingDirectoryURL = activeWorkingDirectoryURL
+            }
+
+            sessionExecutions[sessionID] = SessionExecution()
+            startingSessionIDs.insert(sessionID)
+            let startResult = try await startRuntime(
+                runtime,
+                session: .new(id: sessionID),
+                workingDirectoryURL: workingDirectoryURL
+            )
             let snapshot = try await runtime.sessionSnapshot()
             try validateSessionSnapshot(snapshot)
             guard snapshot.activeSessionId == sessionID else {
@@ -776,18 +1011,37 @@ final class AppState: ObservableObject {
             if runtimes[sessionID] === runtime {
                 readySessionIDs.insert(sessionID)
             }
+            applyThinkingState(startResult.thinkingState, sessionID: sessionID)
             startingSessionIDs.remove(sessionID)
             updateSession(sessionID) { execution in
-                execution.resultPresented = modelError != nil
-                execution.runtimeError = modelError
+                execution.resultPresented = startResult.modelError != nil
+                execution.runtimeError = startResult.modelError
             }
+            await refreshManagedWorktreeBranch(sessionID: sessionID)
             if let previousSessionID {
                 pruneRuntimeIfIdle(sessionID: previousSessionID)
             }
         } catch {
+            let creationError = error
             removeRuntime(runtime, stopping: true)
             sessionExecutions.removeValue(forKey: sessionID)
-            setRuntimeError(error.localizedDescription, sessionID: previousSessionID)
+            startingSessionIDs.remove(sessionID)
+            if let createdWorktree {
+                do {
+                    try await worktreeManager.discardNew(createdWorktree)
+                    managedWorktrees.removeAll { $0.id == createdWorktree.id }
+                    try store.saveManagedWorktrees(managedWorktrees)
+                } catch {
+                    setRuntimeError(
+                        "\(creationError.localizedDescription)\nWorktree 回滚失败：\(error.localizedDescription)",
+                        sessionID: previousSessionID
+                    )
+                    sessionChanging = false
+                    notifyPanel()
+                    return
+                }
+            }
+            setRuntimeError(creationError.localizedDescription, sessionID: previousSessionID)
         }
         sessionChanging = false
         notifyPanel()
@@ -795,7 +1049,7 @@ final class AppState: ObservableObject {
 
     // Opens a session through its own RPC process without interrupting work in other sessions.
     func switchSession(id: String) async {
-        guard !sessionChanging, !initialRuntimeStarting else {
+        guard !sessionChanging, !initialRuntimeStarting, !gitOperationRunning else {
             return
         }
         if id == activeSessionID, readySessionIDs.contains(id) {
@@ -826,7 +1080,11 @@ final class AppState: ObservableObject {
         startingSessionIDs.insert(id)
         notifyPanel()
         do {
-            let modelError = try await startRuntime(runtime, session: .existing(path: target.path))
+            let startResult = try await startRuntime(
+                runtime,
+                session: .existing(path: target.path),
+                workingDirectoryURL: URL(fileURLWithPath: target.cwd, isDirectory: true)
+            )
             let snapshot = try await runtime.sessionSnapshot()
             try validateSessionSnapshot(snapshot)
             guard snapshot.activeSessionId == target.id,
@@ -838,10 +1096,12 @@ final class AppState: ObservableObject {
             if runtimes[id] === runtime {
                 readySessionIDs.insert(id)
             }
+            applyThinkingState(startResult.thinkingState, sessionID: id)
             startingSessionIDs.remove(id)
-            if let modelError {
+            if let modelError = startResult.modelError {
                 setRuntimeError(modelError, sessionID: id)
             }
+            await refreshManagedWorktreeBranch(sessionID: id)
             if let previousSessionID, previousSessionID != id {
                 pruneRuntimeIfIdle(sessionID: previousSessionID)
             }
@@ -855,7 +1115,7 @@ final class AppState: ObservableObject {
 
     // Clones one completed turn into a new session and switches the current window to it.
     func cloneSession(from entryId: String) async {
-        guard runtimeReady, !isBusy, !sessionChanging else {
+        guard runtimeReady, !isBusy, !sessionChanging, !gitOperationRunning else {
             return
         }
         guard let sessionID = activeSessionID,
@@ -866,8 +1126,10 @@ final class AppState: ObservableObject {
         sessionChanging = true
         setRuntimeError(nil, sessionID: sessionID)
         notifyPanel()
+        var runtimeChangedSession = false
         do {
             let snapshot = try await runtime.cloneTurn(entryId: entryId)
+            runtimeChangedSession = true
             try validateSessionSnapshot(snapshot)
             guard snapshot.activeSessionId != sessionID,
                   snapshot.activeSessionPath != sourceSession.path,
@@ -877,32 +1139,135 @@ final class AppState: ObservableObject {
             try applySessionSnapshot(snapshot)
             rebindRuntime(runtime, from: sessionID, to: snapshot.activeSessionId)
         } catch {
+            if runtimeChangedSession {
+                removeRuntime(runtime, stopping: true)
+            }
             setRuntimeError(error.localizedDescription, sessionID: sessionID)
         }
         sessionChanging = false
         notifyPanel()
     }
 
-    // Deletes normal and workspace sessions, leaving one new empty session in the current scope.
-    func deleteAllSessions() async {
-        guard runtimeReady, !hasRunningSessions, !sessionChanging else {
+    // Deletes one inactive session and removes its worktree only after the last related clone is gone.
+    func deleteSession(id: String) async {
+        guard runtimeReady, !hasRunningSessions, !sessionChanging, !gitOperationRunning else {
             return
         }
-        guard let sessionID = activeSessionID, let runtime = runtimes[sessionID] else {
+        guard id != activeSessionID else {
+            runtimeError = "请先切换到其他会话，再删除当前会话"
+            notifyPanel()
+            return
+        }
+        guard let targetSession = sessions.first(where: { $0.id == id }),
+              let activeSessionID,
+              let runtime = runtimes[activeSessionID] else {
+            runtimeError = "要删除的会话不存在"
+            notifyPanel()
+            return
+        }
+
+        sessionChanging = true
+        setRuntimeError(nil, sessionID: activeSessionID)
+        notifyPanel()
+        do {
+            let worktreeIndex = managedWorktrees.firstIndex {
+                $0.workspacePath == targetSession.cwd
+            }
+            let removesWorktree = worktreeIndex.map { index in
+                sessions.filter { $0.cwd == managedWorktrees[index].workspacePath }.count == 1
+            } ?? false
+            if let worktreeIndex, removesWorktree {
+                try await worktreeManager.validateRemoval(of: managedWorktrees[worktreeIndex])
+                _ = try await worktreeManager.preserveDetachedHead(of: managedWorktrees[worktreeIndex])
+            }
+
+            removeRuntime(sessionID: id, stopping: true)
+            let snapshot = try await runtime.deleteSession(id: id)
+            try validateSessionSnapshot(snapshot)
+            try applySessionSnapshot(snapshot, preservingInput: true)
+            sessionExecutions.removeValue(forKey: id)
+
+            if let worktreeIndex, removesWorktree {
+                let worktree = managedWorktrees[worktreeIndex]
+                try await worktreeManager.remove(worktree)
+                var nextWorktrees = managedWorktrees
+                nextWorktrees.remove(at: worktreeIndex)
+                try store.saveManagedWorktrees(nextWorktrees)
+                managedWorktrees = nextWorktrees
+            }
+        } catch {
+            setRuntimeError(error.localizedDescription, sessionID: activeSessionID)
+        }
+        sessionChanging = false
+        notifyPanel()
+    }
+
+    // Deletes every Quick Pi session after all managed worktrees are proven safe to remove.
+    func deleteAllSessions() async {
+        guard runtimeReady, !hasRunningSessions, !sessionChanging, !gitOperationRunning else {
+            return
+        }
+        guard let originalSessionID = activeSessionID else {
             return
         }
         sessionChanging = true
-        setRuntimeError(nil, sessionID: sessionID)
-        for otherSessionID in Array(runtimes.keys) where otherSessionID != sessionID {
-            removeRuntime(sessionID: otherSessionID, stopping: true)
-        }
+        setRuntimeError(nil, sessionID: originalSessionID)
         notifyPanel()
         do {
+            for worktree in managedWorktrees {
+                try await worktreeManager.validateRemoval(of: worktree)
+            }
+            for worktree in managedWorktrees {
+                _ = try await worktreeManager.preserveDetachedHead(of: worktree)
+            }
+
+            if activeManagedWorktree != nil {
+                let localSessionID = UUID().uuidString
+                let localRuntime = makeRuntime()
+                sessionExecutions[localSessionID] = SessionExecution()
+                startingSessionIDs.insert(localSessionID)
+                let startResult = try await startRuntime(
+                    localRuntime,
+                    session: .new(id: localSessionID),
+                    workingDirectoryURL: settings.workspaceURL
+                        ?? FileManager.default.homeDirectoryForCurrentUser
+                )
+                let localSnapshot = try await localRuntime.sessionSnapshot()
+                try validateSessionSnapshot(localSnapshot)
+                guard localSnapshot.activeSessionId == localSessionID else {
+                    throw QuickPiError.message("Pi 没有创建本地清理会话")
+                }
+                try applySessionSnapshot(localSnapshot)
+                bindRuntime(localRuntime, to: localSessionID)
+                readySessionIDs.insert(localSessionID)
+                applyThinkingState(startResult.thinkingState, sessionID: localSessionID)
+                startingSessionIDs.remove(localSessionID)
+                if let modelError = startResult.modelError {
+                    setRuntimeError(modelError, sessionID: localSessionID)
+                }
+            }
+
+            guard let sessionID = activeSessionID, let runtime = runtimes[sessionID] else {
+                throw QuickPiError.message("本地清理会话没有可用的 Pi 进程")
+            }
+            for otherSessionID in Array(runtimes.keys) where otherSessionID != sessionID {
+                removeRuntime(sessionID: otherSessionID, stopping: true)
+            }
+
             let snapshot = try await runtime.deleteAllSessions()
             try validateSessionSnapshot(snapshot)
             guard snapshot.sessions.count == 1 else {
                 throw QuickPiError.message("删除后当前目录仍存在旧会话")
             }
+
+            while let worktree = managedWorktrees.first {
+                try await worktreeManager.remove(worktree)
+                var nextWorktrees = managedWorktrees
+                nextWorktrees.removeFirst()
+                try store.saveManagedWorktrees(nextWorktrees)
+                managedWorktrees = nextWorktrees
+            }
+
             try applySessionSnapshot(snapshot)
             rebindRuntime(runtime, from: sessionID, to: snapshot.activeSessionId)
             readySessionIDs = [snapshot.activeSessionId]
@@ -1023,7 +1388,8 @@ final class AppState: ObservableObject {
             kind: provider.kind,
             name: name,
             baseURL: baseURL,
-            models: provider.models
+            models: provider.models,
+            modelThinkingLevels: provider.modelThinkingLevels
         )
         var next = settings
         if let index = next.providers.firstIndex(where: { $0.id == storedProvider.id }) {
@@ -1198,6 +1564,228 @@ final class AppState: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    // Refreshes the branch and change summary for the active session without retaining stale results.
+    func refreshGitStatus() async {
+        gitStatusGeneration &+= 1
+        let generation = gitStatusGeneration
+        guard activeSessionID != nil else {
+            activeGitStatus = nil
+            activeGitStatusError = "当前没有活动会话"
+            activeGitStatusLoading = false
+            return
+        }
+
+        let workspaceURL = activeWorkingDirectoryURL
+        activeGitStatus = nil
+        activeGitStatusError = nil
+        activeGitStatusLoading = true
+        do {
+            let status = try await worktreeManager.repositoryStatus(at: workspaceURL)
+            guard generation == gitStatusGeneration,
+                  workspaceURL.path == activeWorkingDirectoryURL.path else {
+                return
+            }
+            activeGitStatus = status
+        } catch {
+            guard generation == gitStatusGeneration,
+                  workspaceURL.path == activeWorkingDirectoryURL.path else {
+                return
+            }
+            activeGitStatusError = error.localizedDescription
+        }
+        guard generation == gitStatusGeneration else {
+            return
+        }
+        activeGitStatusLoading = false
+    }
+
+    // Lists local branches from the active session's exact working directory.
+    func gitLocalBranches() async throws -> [GitLocalBranch] {
+        guard activeSessionID != nil else {
+            throw QuickPiError.message("当前没有活动会话")
+        }
+        return try await worktreeManager.localBranches(at: activeWorkingDirectoryURL)
+    }
+
+    // Reads the active working tree's bounded Diff snapshot.
+    func gitDiff() async throws -> GitDiffSnapshot {
+        guard activeSessionID != nil else {
+            throw QuickPiError.message("当前没有活动会话")
+        }
+        return try await worktreeManager.diff(at: activeWorkingDirectoryURL)
+    }
+
+    // Reads recent commits from the active session's repository.
+    func gitLog() async throws -> [GitLogEntry] {
+        guard activeSessionID != nil else {
+            throw QuickPiError.message("当前没有活动会话")
+        }
+        return try await worktreeManager.recentCommits(at: activeWorkingDirectoryURL)
+    }
+
+    // Commits the requested change set and optionally pushes the resulting commit.
+    func commitGitChanges(
+        message: String,
+        includingUnstaged: Bool,
+        pushAfterCommit: Bool
+    ) async throws -> String {
+        guard !hasRunningSessions else {
+            throw QuickPiError.message("仍有会话正在执行任务，不能提交 Git 更改")
+        }
+        guard !sessionChanging else {
+            throw QuickPiError.message("会话切换期间不能提交 Git 更改")
+        }
+        guard !gitOperationRunning else {
+            throw QuickPiError.message("另一个 Git 操作正在执行")
+        }
+        guard let sessionID = activeSessionID else {
+            throw QuickPiError.message("当前没有活动会话")
+        }
+
+        let workspaceURL = activeWorkingDirectoryURL
+        let requestedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let runtime: PiRuntime?
+        if requestedMessage.isEmpty {
+            guard runtimeReady else {
+                throw QuickPiError.message("Pi 尚未就绪，不能生成提交信息")
+            }
+            guard selectedModel != nil else {
+                throw QuickPiError.message("请先在设置中选择用于生成提交信息的模型")
+            }
+            guard let activeRuntime = runtimes[sessionID] else {
+                throw QuickPiError.message("当前会话没有可用的 Pi 进程")
+            }
+            runtime = activeRuntime
+        } else {
+            runtime = nil
+        }
+
+        gitOperationRunning = true
+        defer { gitOperationRunning = false }
+        let commitMessage: String
+        if let runtime {
+            let context = try await worktreeManager.commitMessageContext(
+                includingUnstaged: includingUnstaged,
+                at: workspaceURL
+            )
+            commitMessage = try await runtime.generateCommitMessage(context: context)
+        } else {
+            commitMessage = requestedMessage
+        }
+        let commitID = try await worktreeManager.commit(
+            message: commitMessage,
+            includingUnstaged: includingUnstaged,
+            at: workspaceURL
+        )
+        if pushAfterCommit {
+            do {
+                try await worktreeManager.push(at: workspaceURL)
+            } catch {
+                await refreshManagedWorktreeBranch(sessionID: sessionID)
+                await refreshGitStatus()
+                throw QuickPiError.message(
+                    "提交 \(commitID) 已完成，但推送失败：\(error.localizedDescription)"
+                )
+            }
+        }
+        await refreshManagedWorktreeBranch(sessionID: sessionID)
+        await refreshGitStatus()
+        return pushAfterCommit ? "已提交并推送 \(commitID)" : "已提交 \(commitID)"
+    }
+
+    // Pushes the active branch without creating or modifying a commit.
+    func pushGitBranch() async throws -> String {
+        guard !hasRunningSessions else {
+            throw QuickPiError.message("仍有会话正在执行任务，不能推送 Git 分支")
+        }
+        guard !sessionChanging else {
+            throw QuickPiError.message("会话切换期间不能推送 Git 分支")
+        }
+        guard !gitOperationRunning else {
+            throw QuickPiError.message("另一个 Git 操作正在执行")
+        }
+        guard let sessionID = activeSessionID else {
+            throw QuickPiError.message("当前没有活动会话")
+        }
+
+        let workspaceURL = activeWorkingDirectoryURL
+        gitOperationRunning = true
+        defer { gitOperationRunning = false }
+        try await worktreeManager.push(at: workspaceURL)
+        await refreshManagedWorktreeBranch(sessionID: sessionID)
+        await refreshGitStatus()
+        return "推送完成"
+    }
+
+    // Creates and checks out one local branch while preventing concurrent agent writes.
+    func createGitBranch(named name: String) async throws -> String {
+        guard !hasRunningSessions else {
+            throw QuickPiError.message("仍有会话正在执行任务，不能创建 Git 分支")
+        }
+        guard !sessionChanging else {
+            throw QuickPiError.message("会话切换期间不能创建 Git 分支")
+        }
+        guard !gitOperationRunning else {
+            throw QuickPiError.message("另一个 Git 操作正在执行")
+        }
+        guard let sessionID = activeSessionID else {
+            throw QuickPiError.message("当前没有活动会话")
+        }
+
+        let workspaceURL = activeWorkingDirectoryURL
+        gitOperationRunning = true
+        defer { gitOperationRunning = false }
+        let branch = try await worktreeManager.createBranch(named: name, at: workspaceURL)
+        await refreshManagedWorktreeBranch(sessionID: sessionID)
+        await refreshGitStatus()
+        return "已创建并切换到分支 \(branch)"
+    }
+
+    // Switches to one selected local branch while preventing concurrent agent writes.
+    func switchGitBranch(named name: String) async throws -> String {
+        guard !hasRunningSessions else {
+            throw QuickPiError.message("仍有会话正在执行任务，不能切换 Git 分支")
+        }
+        guard !sessionChanging else {
+            throw QuickPiError.message("会话切换期间不能切换 Git 分支")
+        }
+        guard !gitOperationRunning else {
+            throw QuickPiError.message("另一个 Git 操作正在执行")
+        }
+        guard let sessionID = activeSessionID else {
+            throw QuickPiError.message("当前没有活动会话")
+        }
+
+        let workspaceURL = activeWorkingDirectoryURL
+        gitOperationRunning = true
+        defer { gitOperationRunning = false }
+        try await worktreeManager.switchBranch(named: name, at: workspaceURL)
+        await refreshManagedWorktreeBranch(sessionID: sessionID)
+        await refreshGitStatus()
+        return "已切换到分支 \(name)"
+    }
+
+    // Opens one verified local result with the user's default macOS application.
+    func openLocalFile(_ url: URL) {
+        guard url.isFileURL else {
+            runtimeError = "只能打开本地文件"
+            notifyPanel()
+            return
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            runtimeError = "文件不存在：\(url.path)"
+            notifyPanel()
+            return
+        }
+        guard NSWorkspace.shared.open(url) else {
+            runtimeError = "无法打开文件：\(url.path)"
+            notifyPanel()
+            return
+        }
+    }
+
     // Stops the app-owned Pi process during normal application termination.
     func stop() {
         runtimeGeneration += 1
@@ -1234,7 +1822,12 @@ final class AppState: ObservableObject {
         let runtime = makeRuntime()
         do {
             try store.writeModels(for: settings)
-            let modelError = try await startRuntime(runtime, session: session)
+            let startResult = try await startRuntime(
+                runtime,
+                session: session,
+                workingDirectoryURL: settings.workspaceURL
+                    ?? FileManager.default.homeDirectoryForCurrentUser
+            )
             guard generation == runtimeGeneration else {
                 removeRuntime(runtime, stopping: true)
                 return
@@ -1262,9 +1855,11 @@ final class AppState: ObservableObject {
             if runtimes[sessionSnapshot.activeSessionId] === runtime {
                 readySessionIDs.insert(sessionSnapshot.activeSessionId)
             }
-            if let modelError {
+            applyThinkingState(startResult.thinkingState, sessionID: sessionSnapshot.activeSessionId)
+            if let modelError = startResult.modelError {
                 setRuntimeError(modelError, sessionID: sessionSnapshot.activeSessionId)
             }
+            await refreshManagedWorktreeBranch(sessionID: sessionSnapshot.activeSessionId)
         } catch {
             guard generation == runtimeGeneration else {
                 removeRuntime(runtime, stopping: true)
@@ -1329,7 +1924,7 @@ final class AppState: ObservableObject {
     // Restores one process-bound session without discarding transient plugin output already shown by the app.
     func applySessionSnapshot(_ snapshot: SessionSnapshot, preservingInput: Bool = false) throws {
         try validateSessionSnapshot(snapshot)
-        let answers = try restoredAnswers(from: snapshot.messages)
+        let answers = try restoredAnswers(from: snapshot.messages, workspacePath: snapshot.cwd)
         let wasWaitingForInitialSession = activeSessionID == nil
         applySessionList(snapshot.sessions)
         var execution = sessionExecutions[snapshot.activeSessionId] ?? SessionExecution()
@@ -1362,39 +1957,74 @@ final class AppState: ObservableObject {
         activeSessionID = snapshot.activeSessionId
     }
 
-    // Accepts session state only when every path belongs to the configured working directory.
+    // Accepts the active session only inside the selected checkout or one of its managed worktrees.
     private func validateSessionSnapshot(_ snapshot: SessionSnapshot) throws {
-        let expectedCwd = (settings.workspaceURL ?? FileManager.default.homeDirectoryForCurrentUser)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .path
-        guard snapshot.cwd == expectedCwd else {
-            throw QuickPiError.message("Pi 会话目录与当前范围不一致")
-        }
-        guard snapshot.sessions.allSatisfy({ $0.cwd == expectedCwd }) else {
-            throw QuickPiError.message("会话列表包含其他目录的会话")
+        guard sessionScopePaths().contains(snapshot.cwd) else {
+            throw QuickPiError.message("Pi 会话目录不属于当前项目")
         }
         guard Set(snapshot.sessions.map(\.id)).count == snapshot.sessions.count,
               Set(snapshot.sessions.map(\.path)).count == snapshot.sessions.count else {
             throw QuickPiError.message("Pi 会话列表包含重复项")
         }
         guard snapshot.sessions.contains(where: {
-            $0.id == snapshot.activeSessionId && $0.path == snapshot.activeSessionPath
+            $0.id == snapshot.activeSessionId
+                && $0.path == snapshot.activeSessionPath
+                && $0.cwd == snapshot.cwd
         }) else {
-            throw QuickPiError.message("活动会话不在当前目录的会话列表中")
+            throw QuickPiError.message("活动会话与 Pi 运行目录不一致")
         }
     }
 
-    // Replaces disk-backed session metadata and creates empty UI state for newly discovered sessions.
+    // Returns the local checkout plus every managed worktree belonging to the selected project.
+    private func sessionScopePaths() -> Set<String> {
+        let localPath = (settings.workspaceURL ?? FileManager.default.homeDirectoryForCurrentUser)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        var paths: Set<String> = [localPath]
+        for worktree in managedWorktrees where worktree.localWorkspacePath == localPath {
+            paths.insert(worktree.workspacePath)
+        }
+        return paths
+    }
+
+    // Replaces disk-backed metadata with sessions belonging to the selected project environment.
     private func applySessionList(_ values: [ConversationSession]) {
-        sessions = values
-        for session in values where sessionExecutions[session.id] == nil {
+        let paths = sessionScopePaths()
+        sessions = values.filter { paths.contains($0.cwd) }
+        for session in sessions where sessionExecutions[session.id] == nil {
             sessionExecutions[session.id] = SessionExecution()
         }
     }
 
+    // Synchronizes persisted branch display with Git after activation or a completed agent turn.
+    private func refreshManagedWorktreeBranch(sessionID: String) async {
+        guard let session = sessions.first(where: { $0.id == sessionID }),
+              let worktree = managedWorktree(for: session) else {
+            return
+        }
+        do {
+            let branch = try await worktreeManager.currentBranch(in: worktree)
+            guard let index = managedWorktrees.firstIndex(where: { $0.id == worktree.id }),
+                  managedWorktrees[index].branch != branch else {
+                return
+            }
+            var nextWorktrees = managedWorktrees
+            nextWorktrees[index].branch = branch
+            managedWorktrees = nextWorktrees
+            try store.saveManagedWorktrees(nextWorktrees)
+            notifyPanel()
+        } catch {
+            setRuntimeError("Worktree 分支状态刷新失败：\(error.localizedDescription)", sessionID: sessionID)
+            notifyPanel()
+        }
+    }
+
     // Reconstructs visible turns from Pi's active branch without changing the saved context.
-    private func restoredAnswers(from messages: [SavedSessionMessage]) throws -> [AnswerSession] {
+    private func restoredAnswers(
+        from messages: [SavedSessionMessage],
+        workspacePath: String
+    ) throws -> [AnswerSession] {
         var answers: [AnswerSession] = []
         var current: AnswerSession?
 
@@ -1412,7 +2042,7 @@ final class AppState: ObservableObject {
                     question: SubmittedQuestion(
                         text: text,
                         attachmentNames: [],
-                        workspacePath: settings.workspacePath
+                        workspacePath: workspacePath
                     ),
                     startedAt: Date(timeIntervalSince1970: message.timestamp / 1_000),
                     sections: [],
@@ -1594,6 +2224,7 @@ final class AppState: ObservableObject {
         attachmentNames: [String],
         status: AnswerStatus
     ) -> Int {
+        let workspacePath = sessions.first(where: { $0.id == sessionID })?.cwd
         updateSession(sessionID) { execution in
             if let answer = execution.answer {
                 execution.previousAnswers.append(answer)
@@ -1603,7 +2234,7 @@ final class AppState: ObservableObject {
                 question: SubmittedQuestion(
                     text: question,
                     attachmentNames: attachmentNames,
-                    workspacePath: settings.workspacePath
+                    workspacePath: workspacePath
                 ),
                 startedAt: Date(),
                 sections: [],
@@ -1646,19 +2277,43 @@ final class AppState: ObservableObject {
     }
 
     // Starts a process, reloads the public plugin catalog, and applies the selected model when available.
-    private func startRuntime(_ runtime: PiRuntime, session: PiSessionLaunch) async throws -> String? {
-        try await runtime.start(settings: settings, session: session)
+    private func startRuntime(
+        _ runtime: PiRuntime,
+        session: PiSessionLaunch,
+        workingDirectoryURL: URL
+    ) async throws -> RuntimeStartResult {
+        try await runtime.start(
+            settings: settings,
+            workingDirectoryURL: workingDirectoryURL,
+            session: session
+        )
         applyRuntimeSnapshot(try await runtime.snapshot())
         guard let selection = settings.selectedModel else {
-            return nil
+            return RuntimeStartResult(modelError: nil, thinkingState: nil)
         }
         guard modelOptions.contains(where: {
             $0.providerId == selection.providerId && $0.id == selection.modelId
         }) else {
-            return "已保存的模型不可用，请重新选择模型"
+            return RuntimeStartResult(
+                modelError: "已保存的模型不可用，请重新选择模型",
+                thinkingState: nil
+            )
         }
-        try await runtime.selectModel(selection)
-        return nil
+        return RuntimeStartResult(
+            modelError: nil,
+            thinkingState: try await runtime.selectModel(selection)
+        )
+    }
+
+    // Stores Pi's effective level beside the session that owns the queried process.
+    private func applyThinkingState(_ state: PiThinkingState?, sessionID: String) {
+        guard let state else {
+            return
+        }
+        updateSession(sessionID) { execution in
+            execution.thinkingLevel = state.level
+            execution.availableThinkingLevels = state.availableLevels
+        }
     }
 
     // Applies the provider, model, and command contracts reported by Pi.
@@ -1703,6 +2358,12 @@ final class AppState: ObservableObject {
         runtimeSessionIDs[identifier] = newSessionID
         if sessionExecutions[newSessionID] == nil {
             sessionExecutions[newSessionID] = SessionExecution()
+        }
+        if let previousExecution = sessionExecutions[oldSessionID] {
+            updateSession(newSessionID) { execution in
+                execution.thinkingLevel = previousExecution.thinkingLevel
+                execution.availableThinkingLevels = previousExecution.availableThinkingLevels
+            }
         }
         if wasReady {
             readySessionIDs.insert(newSessionID)
@@ -1887,6 +2548,12 @@ final class AppState: ObservableObject {
                 execution.answer?.retryMessage = nil
             }
             finishSessionExecution(sessionID)
+            Task {
+                await refreshManagedWorktreeBranch(sessionID: sessionID)
+                if sessionID == activeSessionID {
+                    await refreshGitStatus()
+                }
+            }
         case let .turnFailed(message, aborted):
             updateSession(sessionID) { execution in
                 execution.answer?.status = aborted ? .stopped : .running
@@ -2026,6 +2693,7 @@ final class AppState: ObservableObject {
 
     // Shows a native command result without adding the command to Pi's saved model conversation.
     private func presentCommandResult(question: String, markdown: String, sessionID: String) {
+        let workspacePath = sessions.first(where: { $0.id == sessionID })?.cwd
         updateSession(sessionID) { execution in
             if let answer = execution.answer {
                 execution.previousAnswers.append(answer)
@@ -2035,7 +2703,7 @@ final class AppState: ObservableObject {
                 question: SubmittedQuestion(
                     text: question,
                     attachmentNames: [],
-                    workspacePath: settings.workspacePath
+                    workspacePath: workspacePath
                 ),
                 startedAt: Date(),
                 sections: [AnswerSection(id: UUID(), content: .extensionMessage(markdown))],

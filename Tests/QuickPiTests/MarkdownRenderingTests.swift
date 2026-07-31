@@ -29,4 +29,14 @@ final class MarkdownRenderingTests: XCTestCase {
         XCTAssertTrue(html.contains("<table>"))
         XCTAssertTrue(html.contains("<pre><code class=\"language-swift\">"))
     }
+
+    // Documents why exported files use a native action instead of a sanitized Markdown file URL.
+    func testMarkdownParserSanitizesFileURL() {
+        let html = MarkdownContent(
+            "[pi-session.html](file:///tmp/Quick%20Pi/pi-session.html)"
+        ).renderHTML()
+
+        XCTAssertTrue(html.contains("href=\"\""))
+        XCTAssertTrue(html.contains(">pi-session.html</a>"))
+    }
 }
