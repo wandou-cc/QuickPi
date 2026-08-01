@@ -409,7 +409,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    // Sends newly copied external text through the existing prompt path when the shortcut opens the panel.
+    // Optionally fills the prompt with newly copied external text when the shortcut opens the panel.
     private func handleGlobalShortcut() {
         guard panel?.isKeyWindow != true else {
             panel?.orderOut(nil)
@@ -418,7 +418,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let pasteboard = NSPasteboard.general
         let changeCount = pasteboard.changeCount
-        let copiedText = !NSApp.isActive && changeCount != pasteboardChangeCount
+        let copiedText = state?.settings.fillInputFromClipboardOnShortcut == true
+            && !NSApp.isActive
+            && changeCount != pasteboardChangeCount
             ? pasteboard.string(forType: .string)
             : nil
         pasteboardChangeCount = changeCount
@@ -432,7 +434,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             preconditionFailure("全局快捷键必须在应用状态初始化后启用")
         }
         state.draft = copiedText
-        Task { await state.send() }
     }
 
     // Activates the accessory app and moves keyboard focus into the prompt.

@@ -9,6 +9,66 @@ final class ConfigurationStoreTests: XCTestCase {
         let store = ConfigurationStore(applicationSupportDirectory: directory)
 
         XCTAssertEqual(try store.load(), .defaults)
+        XCTAssertFalse(try store.load().fillInputFromClipboardOnShortcut)
+    }
+
+    // Uses Quick Pi's default until the native global file is explicitly customized.
+    func testAgentInstructionsDefaultAndPersistence() throws {
+        let directory = try temporaryDirectory()
+        let agentDirectory = directory.appendingPathComponent("agent", isDirectory: true)
+        let store = ConfigurationStore(
+            applicationSupportDirectory: directory,
+            agentDirectory: agentDirectory
+        )
+        let instructionsURL = agentDirectory.appendingPathComponent("AGENTS.md")
+
+        XCTAssertEqual(try store.loadAgentInstructions(), ConfigurationStore.defaultAgentInstructions)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: instructionsURL.path))
+
+        let custom = "# 个性化\n\n- 保留原始 Markdown。\n"
+        XCTAssertEqual(try store.saveAgentInstructions(custom), custom)
+        XCTAssertEqual(try String(contentsOf: instructionsURL, encoding: .utf8), custom)
+        XCTAssertEqual(try store.loadAgentInstructions(), custom)
+        XCTAssertEqual(
+            try FileManager.default.attributesOfItem(atPath: instructionsURL.path)[.posixPermissions] as? Int,
+            0o600
+        )
+        XCTAssertThrowsError(try store.saveAgentInstructions(String(repeating: "a", count: 200_001))) {
+            XCTAssertEqual($0.localizedDescription, "AGENTS.md 不能超过 200 KB")
+        }
+    }
+
+    // Resolves the default, native context-file, and no-workspace launch modes without duplicating instructions.
+    func testAgentInstructionsControlPiContextArguments() throws {
+        let directory = try temporaryDirectory()
+        let agentDirectory = directory.appendingPathComponent("agent", isDirectory: true)
+        let instructionsURL = agentDirectory.appendingPathComponent("AGENTS.md")
+        let store = ConfigurationStore(
+            applicationSupportDirectory: directory,
+            agentDirectory: agentDirectory
+        )
+
+        XCTAssertEqual(try PiRuntime.contextArguments(
+            workspaceEnabled: true,
+            agentInstructionsURL: instructionsURL
+        ), [
+            "--approve",
+            "--append-system-prompt",
+            ConfigurationStore.defaultAgentInstructions,
+        ])
+
+        let custom = "# Agent\n\nAlways verify changes."
+        _ = try store.saveAgentInstructions(custom)
+        XCTAssertEqual(try PiRuntime.contextArguments(
+            workspaceEnabled: true,
+            agentInstructionsURL: instructionsURL
+        ), ["--approve"])
+
+        let generalArguments = try PiRuntime.contextArguments(
+            workspaceEnabled: false,
+            agentInstructionsURL: instructionsURL
+        )
+        XCTAssertEqual(Array(generalArguments.suffix(2)), ["--append-system-prompt", custom])
     }
 
     // Persists the exact worktree paths used to recover project scope across app launches.
@@ -321,11 +381,13 @@ final class ConfigurationStoreTests: XCTestCase {
                         "model-b": [.off, .low, .high, .max],
                     ]
                 ),
-            ]
+            ],
+            fillInputFromClipboardOnShortcut: true
         )
 
         XCTAssertEqual(try store.save(settings), settings)
         XCTAssertEqual(try store.load().workspacePath, settings.workspacePath)
+        XCTAssertTrue(try store.load().fillInputFromClipboardOnShortcut)
         let storedSettings = try XCTUnwrap(
             try JSONSerialization.jsonObject(
                 with: Data(contentsOf: directory.appendingPathComponent("settings.json"))
@@ -333,6 +395,7 @@ final class ConfigurationStoreTests: XCTestCase {
         )
         XCTAssertNil(storedSettings["terminalAccess"])
         XCTAssertNil(storedSettings["fileSystemAccess"])
+        XCTAssertEqual(storedSettings["fillInputFromClipboardOnShortcut"] as? Bool, true)
         try store.writeModels(for: try store.load())
 
         let modelsURL = directory.appendingPathComponent("pi/models.json")
@@ -419,6 +482,7 @@ final class ConfigurationStoreTests: XCTestCase {
         let store = ConfigurationStore(applicationSupportDirectory: directory)
 
         XCTAssertNil(try store.load().workspacePath)
+        XCTAssertFalse(try store.load().fillInputFromClipboardOnShortcut)
     }
 
     // Keeps existing Provider settings readable while leaving undeclared reasoning disabled.

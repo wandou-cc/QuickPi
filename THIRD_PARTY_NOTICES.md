@@ -10,6 +10,7 @@ applications under `Contents/Resources/Licenses`.
 | Sparkle | 2.9.4 | MIT and bundled third-party notices | `licenses/Sparkle-LICENSE` |
 | Swift Markdown UI | 2.4.1 | MIT | `licenses/Swift-Markdown-UI-LICENSE` |
 | NetworkImage | 6.0.0 | MIT | `licenses/NetworkImage-LICENSE` |
+| Lobe Icons Static PNG | 1.95.0 | MIT | `licenses/Lobe-Icons-LICENSE` |
 | swift-cmark | 0.5.0 | BSD-2-Clause, MIT, and component-specific terms | `licenses/swift-cmark-COPYING` |
 
 The version list reflects `Package.swift`, `Package.resolved`, and the Pi

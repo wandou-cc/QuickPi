@@ -4,6 +4,7 @@ import { complete } from "@earendil-works/pi-ai/compat";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 const prefix = "quickpi:";
+const attachmentMetadataType = "quick-pi-message-attachments";
 const commitMessageSystemPrompt = `你负责为当前 Git 项目生成提交信息。先检查用户提供的“Git 校验与提交约定”和最近提交历史；如果项目存在 commit.template、commit-msg、commitlint、Conventional Commits 或其他提交校验，生成结果必须符合这些规则和项目既有风格。然后根据当前 Git 状态和待提交 Diff，生成准确、简洁的提交信息。只输出可以直接用于 git commit 的最终提交信息，不要解释，不要使用 Markdown，不要添加引号。`;
 
 // Reads Pi's credential document; absence is the documented first-launch state.
@@ -45,6 +46,84 @@ function decodeCommitMessageRequest(value) {
   }
   if (typeof request.context !== "string" || !request.context || request.context.length > 200_000) {
     throw new Error("提交信息生成上下文无效");
+  }
+  return request;
+}
+
+function decodeQueueRequest(value) {
+  const encoded = value.trim();
+  if (!encoded) {
+    throw new Error("缺少队列消息请求");
+  }
+  const request = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  if (typeof request?.id !== "string" || !request.id) {
+    throw new Error("队列消息缺少 ID");
+  }
+  if (typeof request.text !== "string" || !request.text.trim()) {
+    throw new Error("队列消息不能为空");
+  }
+  if (request.delivery !== "steer" && request.delivery !== "followUp") {
+    throw new Error("队列消息交付方式无效");
+  }
+  if (!Array.isArray(request.images) || !request.images.every((image) => (
+    image?.type === "image"
+      && typeof image.data === "string"
+      && typeof image.mimeType === "string"
+  ))) {
+    throw new Error("队列消息图片无效");
+  }
+  if (!Array.isArray(request.documentSections)
+    || !request.documentSections.every((section) => typeof section === "string")) {
+    throw new Error("队列消息文档无效");
+  }
+  if (!Array.isArray(request.attachmentNames)
+    || !request.attachmentNames.every((name) => typeof name === "string")) {
+    throw new Error("队列消息附件名称无效");
+  }
+  if (!Array.isArray(request.attachments)
+    || !request.attachments.every((attachment) => (
+      typeof attachment?.id === "string"
+        && typeof attachment.name === "string"
+        && (attachment.kind === "image" || attachment.kind === "document")
+    ))) {
+    throw new Error("队列消息附件元数据无效");
+  }
+  return request;
+}
+
+function decodeQueueEditRequest(value) {
+  const encoded = value.trim();
+  if (!encoded) {
+    throw new Error("缺少队列编辑请求");
+  }
+  const request = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  if (typeof request?.id !== "string" || !request.id) {
+    throw new Error("队列编辑请求缺少 ID");
+  }
+  if (typeof request.text !== "string" || !request.text.trim()) {
+    throw new Error("编辑后的队列消息不能为空");
+  }
+  return request;
+}
+
+function decodeAttachmentMetadataRequest(value) {
+  const encoded = value.trim();
+  if (!encoded) {
+    throw new Error("缺少附件元数据请求");
+  }
+  const request = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  if (typeof request?.question !== "string" || !request.question.trim()) {
+    throw new Error("附件元数据缺少问题文本");
+  }
+  if (!Array.isArray(request.attachments)
+    || request.attachments.length === 0
+    || request.attachments.length > 5
+    || !request.attachments.every((attachment) => (
+      typeof attachment?.id === "string"
+        && typeof attachment.name === "string"
+        && (attachment.kind === "image" || attachment.kind === "document")
+    ))) {
+    throw new Error("附件元数据无效");
   }
   return request;
 }
@@ -126,17 +205,66 @@ function assistantContent(content) {
   });
 }
 
-function savedMessage(entry) {
+function userTextContent(content) {
+  const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
+  return blocks
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function attachmentMetadataMatches(content, metadata) {
+  const text = normalizeUserText(userTextContent(content));
+  return text === metadata.question || text.startsWith(`${metadata.question}\n\n---\n\n`);
+}
+
+function userMessageContent(content, metadata, entryId) {
+  const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content;
+  const text = userTextContent(content);
+  const images = blocks.filter((block) => block.type === "image");
+  let imageIndex = 0;
+  const attachments = (metadata?.attachments ?? []).map((attachment) => {
+    if (attachment.kind !== "image") {
+      return { ...attachment };
+    }
+    const image = images[imageIndex];
+    imageIndex += 1;
+    return {
+      ...attachment,
+      data: image?.data,
+      mimeType: image?.mimeType,
+    };
+  });
+  while (imageIndex < images.length) {
+    const image = images[imageIndex];
+    attachments.push({
+      id: `${entryId}-image-${imageIndex}`,
+      name: images.length === 1 ? "图片" : `图片 ${imageIndex + 1}`,
+      kind: "image",
+      data: image.data,
+      mimeType: image.mimeType,
+    });
+    imageIndex += 1;
+  }
+  return {
+    text: metadata?.question ?? normalizeUserText(text),
+    attachments,
+  };
+}
+
+function savedMessage(entry, attachmentMetadata) {
   if (entry.type !== "message") {
     return undefined;
   }
   const message = entry.message;
   if (message.role === "user") {
+    const userContent = userMessageContent(message.content, attachmentMetadata, entry.id);
     return {
       entryId: entry.id,
       role: "user",
       timestamp: message.timestamp,
-      text: normalizeUserText(textContent(message.content)),
+      text: userContent.text,
+      attachments: userContent.attachments,
     };
   }
   if (message.role === "assistant") {
@@ -184,6 +312,34 @@ function savedMessage(entry) {
     };
   }
   return undefined;
+}
+
+function savedMessages(entries) {
+  const messages = [];
+  const pendingAttachmentMetadata = [];
+  for (const entry of entries) {
+    if (entry.type === "custom" && entry.customType === attachmentMetadataType) {
+      pendingAttachmentMetadata.push(entry.data);
+      continue;
+    }
+    let metadata;
+    if (entry.type === "message" && entry.message.role === "user") {
+      const metadataIndex = pendingAttachmentMetadata.findIndex((candidate) => (
+        attachmentMetadataMatches(entry.message.content, candidate)
+      ));
+      if (metadataIndex >= 0) {
+        [metadata] = pendingAttachmentMetadata.splice(metadataIndex, 1);
+        pendingAttachmentMetadata.splice(0, metadataIndex);
+      } else {
+        pendingAttachmentMetadata.length = 0;
+      }
+    }
+    const message = savedMessage(entry, metadata);
+    if (message !== undefined) {
+      messages.push(message);
+    }
+  }
+  return messages;
 }
 
 async function sessionSnapshot(ctx) {
@@ -248,7 +404,7 @@ async function sessionSnapshot(ctx) {
       messageCount: session.messageCount,
       firstMessage: session.messageCount === 0 ? "" : normalizeUserText(session.firstMessage),
     })),
-    messages: ctx.sessionManager.getBranch().map(savedMessage).filter((message) => message !== undefined),
+    messages: savedMessages(ctx.sessionManager.getBranch()),
   };
 }
 
@@ -359,6 +515,71 @@ export default async function quickPiExtension(pi) {
     providerIndex += 1;
   }
 
+  const managedQueue = [];
+  const queuedMessagePayload = (message, editable) => ({
+    id: message.id,
+    text: message.text,
+    delivery: message.delivery,
+    attachmentNames: message.attachmentNames,
+    editable,
+  });
+  const sendManagedQueue = (ctx) => {
+    notify(ctx, {
+      kind: "managedQueueChanged",
+      queuedMessages: managedQueue.map((message) => queuedMessagePayload(message, true)),
+    });
+  };
+  let steerDispatchedThisTurn = false;
+  const dispatchManagedMessage = (delivery, ctx) => {
+    const index = managedQueue.findIndex((message) => message.delivery === delivery);
+    if (index < 0) {
+      return false;
+    }
+    const [message] = managedQueue.splice(index, 1);
+    const prompt = message.documentSections.length === 0
+      ? message.text
+      : `${message.text}\n\n---\n\n${message.documentSections.join("\n\n---\n\n")}`;
+    notify(ctx, {
+      kind: "managedQueueDispatching",
+      queuedMessage: queuedMessagePayload(message, false),
+      runtimeText: prompt,
+    });
+    sendManagedQueue(ctx);
+    pi.appendEntry(attachmentMetadataType, {
+      question: message.text,
+      attachments: message.attachments,
+    });
+    const content = message.images.length === 0
+      ? prompt
+      : [
+        { type: "text", text: prompt },
+        ...message.images,
+      ];
+    pi.sendUserMessage(content, { deliverAs: delivery });
+    return true;
+  };
+
+  pi.on("turn_start", () => {
+    steerDispatchedThisTurn = false;
+  });
+  pi.on("tool_execution_end", (_event, ctx) => {
+    if (!steerDispatchedThisTurn) {
+      steerDispatchedThisTurn = dispatchManagedMessage("steer", ctx);
+    }
+  });
+  pi.on("turn_end", (_event, ctx) => {
+    if (!steerDispatchedThisTurn) {
+      steerDispatchedThisTurn = dispatchManagedMessage("steer", ctx);
+    }
+  });
+  pi.on("agent_end", (_event, ctx) => {
+    if (managedQueue.some((message) => message.delivery === "steer")) {
+      dispatchManagedMessage("steer", ctx);
+      return;
+    }
+    dispatchManagedMessage("followUp", ctx);
+  });
+
   pi.registerCommand("quick-snapshot", {
     description: "Return Provider and model state to Quick Pi",
     handler: async (_args, ctx) => {
@@ -387,6 +608,73 @@ export default async function quickPiExtension(pi) {
           error: error instanceof Error ? error.message : String(error),
         });
       }
+    },
+  });
+
+  pi.registerCommand("quick-record-message-attachments", {
+    description: "Record Quick Pi attachment metadata for the next user message",
+    handler: async (args) => {
+      const request = decodeAttachmentMetadataRequest(args);
+      pi.appendEntry(attachmentMetadataType, request);
+    },
+  });
+
+  pi.registerCommand("quick-queue-message", {
+    description: "Queue one editable Quick Pi user message",
+    handler: async (args, ctx) => {
+      const request = decodeQueueRequest(args);
+      if (managedQueue.some((message) => message.id === request.id)) {
+        throw new Error("队列消息 ID 重复");
+      }
+      managedQueue.push(request);
+      sendManagedQueue(ctx);
+    },
+  });
+
+  pi.registerCommand("quick-edit-queued-message", {
+    description: "Edit one pending Quick Pi user message",
+    handler: async (args, ctx) => {
+      const request = decodeQueueEditRequest(args);
+      const message = managedQueue.find((candidate) => candidate.id === request.id);
+      if (!message) {
+        throw new Error("要编辑的队列消息已经开始发送");
+      }
+      message.text = request.text;
+      sendManagedQueue(ctx);
+    },
+  });
+
+  pi.registerCommand("quick-cancel-queued-message", {
+    description: "Cancel one pending Quick Pi user message",
+    handler: async (args, ctx) => {
+      const id = args.trim();
+      const index = managedQueue.findIndex((message) => message.id === id);
+      if (index < 0) {
+        throw new Error("要取消的队列消息已经开始发送");
+      }
+      managedQueue.splice(index, 1);
+      sendManagedQueue(ctx);
+    },
+  });
+
+  pi.registerCommand("quick-rewind-message", {
+    description: "Move the active Quick Pi branch before one user message",
+    handler: async (args, ctx) => {
+      const entryId = args.trim();
+      const entry = ctx.sessionManager.getBranch().find((candidate) => (
+        candidate.id === entryId
+          && candidate.type === "message"
+          && candidate.message.role === "user"
+      ));
+      if (!entry) {
+        throw new Error("编辑节点不属于当前会话分支");
+      }
+
+      const result = await ctx.navigateTree(entryId, { summarize: false });
+      if (result.cancelled) {
+        throw new Error("插件取消了消息编辑");
+      }
+      await sendSessionSnapshot(ctx, "sessionRewound");
     },
   });
 

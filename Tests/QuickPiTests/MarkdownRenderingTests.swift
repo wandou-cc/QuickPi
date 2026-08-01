@@ -30,6 +30,19 @@ final class MarkdownRenderingTests: XCTestCase {
         XCTAssertTrue(html.contains("<pre><code class=\"language-swift\">"))
     }
 
+    // Verifies the compact Plan fallback can render the supported inline rich-text forms.
+    func testPlanLineMarkdownProducesInlineRichText() {
+        let html = MarkdownContent(
+            "**bold** _italic_ `code` ~~done~~ [docs](https://example.com)"
+        ).renderHTML()
+
+        XCTAssertTrue(html.contains("<strong>bold</strong>"))
+        XCTAssertTrue(html.contains("<em>italic</em>"))
+        XCTAssertTrue(html.contains("<code>code</code>"))
+        XCTAssertTrue(html.contains("<del>done</del>"))
+        XCTAssertTrue(html.contains("href=\"https://example.com\""))
+    }
+
     // Documents why exported files use a native action instead of a sanitized Markdown file URL.
     func testMarkdownParserSanitizesFileURL() {
         let html = MarkdownContent(

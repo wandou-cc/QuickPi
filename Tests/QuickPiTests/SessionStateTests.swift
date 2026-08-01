@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 import XCTest
 @testable import QuickPi
 
@@ -24,6 +25,43 @@ final class SessionStateTests: XCTestCase {
 
         state.draft = "/settings"
         XCTAssertTrue(state.draftMatchesSlashCommand)
+    }
+
+    func testExtensionChoicePromptsShareIndexedPresentationItems() {
+        let selectPrompt = ExtensionPrompt(
+            requestId: "select",
+            method: "select",
+            title: "Plan mode - what next?",
+            message: nil,
+            placeholder: nil,
+            options: [
+                "Execute the plan (track progress)",
+                "Stay in plan mode",
+                "Refine the plan",
+            ],
+            prefill: nil
+        )
+        XCTAssertEqual(extensionPromptChoiceItems(selectPrompt), [
+            PromptChoiceItem(
+                id: 0,
+                title: "Execute the plan (track progress)",
+                description: nil,
+                recommended: false
+            ),
+            PromptChoiceItem(id: 1, title: "Stay in plan mode", description: nil, recommended: false),
+            PromptChoiceItem(id: 2, title: "Refine the plan", description: nil, recommended: false),
+        ])
+
+        let confirmPrompt = ExtensionPrompt(
+            requestId: "confirm",
+            method: "confirm",
+            title: "Continue?",
+            message: "Review the operation before continuing.",
+            placeholder: nil,
+            options: [],
+            prefill: nil
+        )
+        XCTAssertEqual(extensionPromptChoiceItems(confirmPrompt).map(\.title), ["确认", "否"])
     }
 
     @MainActor
@@ -64,20 +102,7 @@ final class SessionStateTests: XCTestCase {
             checkForUpdates: {},
             presentSettings: {}
         )
-        let bitmap = try XCTUnwrap(NSBitmapImageRep(
-            bitmapDataPlanes: nil,
-            pixelsWide: 4,
-            pixelsHigh: 2,
-            bitsPerSample: 8,
-            samplesPerPixel: 4,
-            hasAlpha: true,
-            isPlanar: false,
-            colorSpaceName: .deviceRGB,
-            bytesPerRow: 0,
-            bitsPerPixel: 0
-        ))
-        let image = NSImage(size: NSSize(width: 4, height: 2))
-        image.addRepresentation(bitmap)
+        let image = try testImage()
         let pasteboard = NSPasteboard(name: NSPasteboard.Name("QuickPiTests-\(UUID().uuidString)"))
         pasteboard.clearContents()
         defer { pasteboard.clearContents() }
@@ -96,8 +121,178 @@ final class SessionStateTests: XCTestCase {
         }
         XCTAssertEqual(mimeType, "image/jpeg")
         XCTAssertNotNil(NSImage(data: data))
-        XCTAssertEqual(state.inputBarHeight, 192)
+        XCTAssertEqual(state.inputBarHeight, 206)
         XCTAssertNil(state.runtimeError)
+    }
+
+    // Accepts large uncompressed screenshot payloads when the normalized attachment is within the limit.
+    func testLargeClipboardTIFFIsCheckedAfterNormalization() throws {
+        let image = try testImage(width: 2_048, height: 2_048)
+        let tiff = try XCTUnwrap(image.tiffRepresentation)
+        XCTAssertGreaterThan(tiff.count, 10 * 1_024 * 1_024)
+
+        let attachment = try AttachmentLoader.loadImage(data: tiff, name: "微信截图")
+
+        guard case let .image(data, mimeType) = attachment.content else {
+            return XCTFail("大尺寸剪贴板图片未生成图片附件")
+        }
+        XCTAssertEqual(mimeType, "image/jpeg")
+        XCTAssertLessThanOrEqual(data.count, 10 * 1_024 * 1_024)
+        XCTAssertNotNil(NSImage(data: data))
+    }
+
+    // Advertises pure image clipboards so AppKit enables and dispatches the Command-V action.
+    @MainActor
+    func testPurePNGClipboardIsReadableForCommandV() throws {
+        let image = try testImage()
+        let item = NSPasteboardItem()
+        item.setData(
+            try imageData(image, fileType: .png),
+            forType: NSPasteboard.PasteboardType(UTType.png.identifier)
+        )
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("QuickPiTests-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        defer { pasteboard.clearContents() }
+        XCTAssertTrue(pasteboard.writeObjects([item]))
+
+        let editor = PromptTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 96))
+        XCTAssertEqual(
+            pasteboard.availableType(from: editor.readablePasteboardTypes)?.rawValue,
+            UTType.png.identifier
+        )
+    }
+
+    // Keeps one image per pasteboard item while also inserting its explicit plain-text representation.
+    @MainActor
+    func testMixedImageAndTextPasteKeepsBothRepresentations() throws {
+        let image = try testImage()
+        let item = NSPasteboardItem()
+        item.setData(try XCTUnwrap(image.tiffRepresentation), forType: .tiff)
+        item.setString("附带说明", forType: .string)
+        item.setData(
+            try imageData(image, fileType: .png),
+            forType: NSPasteboard.PasteboardType(UTType.png.identifier)
+        )
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("QuickPiTests-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        defer { pasteboard.clearContents() }
+        XCTAssertTrue(pasteboard.writeObjects([item]))
+
+        let editor = PromptTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 96))
+        editor.string = "前后"
+        editor.setSelectedRange(NSRange(location: 1, length: 0))
+        var pastedProviders: [NSItemProvider] = []
+        editor.onPasteImages = { pastedProviders = $0 }
+
+        XCTAssertTrue(editor.handleImagePaste(from: pasteboard))
+        XCTAssertEqual(editor.string, "前附带说明后")
+        XCTAssertEqual(pastedProviders.count, 1)
+        XCTAssertEqual(
+            pastedProviders[0].registeredContentTypes(conformingTo: .image).first?.identifier,
+            UTType.png.identifier
+        )
+    }
+
+    // Preserves the item order when the clipboard contains multiple image data formats.
+    @MainActor
+    func testMultipleImagePastePreservesPasteboardOrder() throws {
+        let image = try testImage()
+        let jpegItem = NSPasteboardItem()
+        jpegItem.setData(
+            try imageData(image, fileType: .jpeg),
+            forType: NSPasteboard.PasteboardType(UTType.jpeg.identifier)
+        )
+        let pngItem = NSPasteboardItem()
+        pngItem.setData(
+            try imageData(image, fileType: .png),
+            forType: NSPasteboard.PasteboardType(UTType.png.identifier)
+        )
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("QuickPiTests-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        defer { pasteboard.clearContents() }
+        XCTAssertTrue(pasteboard.writeObjects([jpegItem, pngItem]))
+
+        let providers = PromptTextView.imageProviders(from: pasteboard)
+
+        XCTAssertEqual(
+            providers.compactMap { $0.registeredContentTypes(conformingTo: .image).first?.identifier },
+            [UTType.jpeg.identifier, UTType.png.identifier]
+        )
+    }
+
+    // Loads an image file URL copied from Finder and keeps its filename in the attachment preview.
+    @MainActor
+    func testFinderImageFilePasteBecomesNamedAttachment() async throws {
+        let imageURL = try temporaryDirectory().appendingPathComponent("finder-image.png")
+        try imageData(try testImage(), fileType: .png).write(to: imageURL)
+        let item = NSPasteboardItem()
+        item.setString(imageURL.absoluteString, forType: .fileURL)
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("QuickPiTests-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        defer { pasteboard.clearContents() }
+        XCTAssertTrue(pasteboard.writeObjects([item]))
+
+        let providers = PromptTextView.imageProviders(from: pasteboard)
+        XCTAssertEqual(providers.count, 1)
+        XCTAssertEqual(providers[0].suggestedName, "finder-image.png")
+
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        await state.addPastedImages(providers: providers)
+
+        XCTAssertEqual(state.attachments.first?.name, "finder-image.png")
+        guard case .image = try XCTUnwrap(state.attachments.first).content else {
+            return XCTFail("Finder 图片未生成图片附件")
+        }
+        XCTAssertNil(state.runtimeError)
+    }
+
+    // Leaves text-only clipboard contents to NSTextView's native paste implementation.
+    @MainActor
+    func testTextOnlyPasteFallsBackToNativeHandling() throws {
+        let item = NSPasteboardItem()
+        item.setString("普通文本", forType: .string)
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("QuickPiTests-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        defer { pasteboard.clearContents() }
+        XCTAssertTrue(pasteboard.writeObjects([item]))
+
+        let editor = PromptTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 96))
+        editor.string = "原内容"
+        editor.onPasteImages = { _ in XCTFail("纯文本粘贴不应触发图片回调") }
+
+        XCTAssertFalse(editor.handleImagePaste(from: pasteboard))
+        XCTAssertEqual(editor.string, "原内容")
+    }
+
+    // Rejects an image paste atomically when it would exceed the shared five-attachment limit.
+    @MainActor
+    func testPastedImagesRespectAttachmentLimit() async throws {
+        let image = try testImage()
+        let provider = NSItemProvider()
+        let data = try imageData(image, fileType: .png)
+        provider.registerDataRepresentation(
+            forTypeIdentifier: UTType.png.identifier,
+            visibility: .all
+        ) { completion in
+            completion(data, nil)
+            return nil
+        }
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+
+        await state.addPastedImages(providers: Array(repeating: provider, count: 5))
+        XCTAssertEqual(state.attachments.count, 5)
+
+        await state.addPastedImages(providers: [provider])
+        XCTAssertEqual(state.attachments.count, 5)
+        XCTAssertEqual(state.runtimeError, "一次最多添加 5 个附件")
     }
 
     // Confirms command search is case-insensitive and matches beyond the beginning of the name.
@@ -321,6 +516,61 @@ final class SessionStateTests: XCTestCase {
         XCTAssertTrue(state.showsResultPanel)
     }
 
+    @MainActor
+    func testSessionSnapshotRestoresConversationAttachments() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        let cwd = FileManager.default.homeDirectoryForCurrentUser
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        let session = conversationSession(id: "session-attachments", cwd: cwd, firstMessage: "检查附件")
+        let attachments = [
+            MessageAttachment(
+                id: "image-1",
+                name: "screen.jpg",
+                kind: .image,
+                data: Data("jpeg-preview".utf8),
+                mimeType: "image/jpeg"
+            ),
+            MessageAttachment(id: "document-1", name: "notes.pdf", kind: .document),
+        ]
+
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: session.path,
+            activeSessionId: session.id,
+            sessions: [session],
+            messages: [
+                message(
+                    entryId: "user-attachments",
+                    role: .user,
+                    timestamp: 1_000,
+                    text: "检查附件",
+                    attachments: attachments
+                ),
+                message(
+                    entryId: "assistant-attachments",
+                    role: .assistant,
+                    timestamp: 2_000,
+                    content: [content(type: .text, text: "附件已收到。")],
+                    provider: "provider",
+                    model: "model",
+                    usage: PiUsage(input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01),
+                    stopReason: "stop"
+                ),
+            ]
+        ))
+
+        let question = try XCTUnwrap(state.conversationAnswers.first?.question)
+        XCTAssertEqual(question.text, "检查附件")
+        XCTAssertEqual(question.attachments, attachments)
+        XCTAssertEqual(question.attachmentNames, ["screen.jpg", "notes.pdf"])
+    }
+
     // Switches the current window to the cloned session while keeping the source session record.
     @MainActor
     func testClonedTurnBecomesActiveSessionWithEmptyDraft() throws {
@@ -383,6 +633,68 @@ final class SessionStateTests: XCTestCase {
         XCTAssertEqual(state.conversationAnswers.map { $0.question?.text }, ["第一轮"])
         XCTAssertEqual(state.conversationAnswers.first?.answerText, "第一轮回答")
         XCTAssertTrue(state.draft.isEmpty)
+    }
+
+    // Applying Pi's rewound active branch removes later turns while retaining unrelated editor input.
+    @MainActor
+    func testRewoundSessionSnapshotRemovesLaterTurnsAndPreservesDraft() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        let cwd = FileManager.default.homeDirectoryForCurrentUser
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        let session = conversationSession(id: "session-1", cwd: cwd, firstMessage: "第一轮")
+        let firstTurn = [
+            message(entryId: "user-1", role: .user, timestamp: 1_000, text: "第一轮"),
+            message(
+                entryId: "assistant-1",
+                role: .assistant,
+                timestamp: 2_000,
+                content: [content(type: .text, text: "第一轮回答")],
+                provider: "provider",
+                model: "model",
+                usage: PiUsage(input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01),
+                stopReason: "stop"
+            ),
+        ]
+        let laterTurn = [
+            message(entryId: "user-2", role: .user, timestamp: 3_000, text: "第二轮"),
+            message(
+                entryId: "assistant-2",
+                role: .assistant,
+                timestamp: 4_000,
+                content: [content(type: .text, text: "第二轮回答")],
+                provider: "provider",
+                model: "model",
+                usage: PiUsage(input: 12, output: 6, cacheRead: 0, cacheWrite: 0, cost: 0.02),
+                stopReason: "stop"
+            ),
+        ]
+
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: session.path,
+            activeSessionId: session.id,
+            sessions: [session],
+            messages: firstTurn + laterTurn
+        ))
+        state.draft = "尚未发送的草稿"
+
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: session.path,
+            activeSessionId: session.id,
+            sessions: [session],
+            messages: firstTurn
+        ), preservingInput: true, replacingLoadedConversation: true)
+
+        XCTAssertEqual(state.conversationAnswers.map { $0.question?.text }, ["第一轮"])
+        XCTAssertEqual(state.conversationAnswers.first?.answerText, "第一轮回答")
+        XCTAssertEqual(state.draft, "尚未发送的草稿")
     }
 
     @MainActor
@@ -467,6 +779,80 @@ final class SessionStateTests: XCTestCase {
         XCTAssertEqual(state.answer?.answerText, "排队回答")
         XCTAssertTrue(state.queuedSteeringMessages.isEmpty)
         XCTAssertTrue(state.queuedFollowUpMessages.isEmpty)
+    }
+
+    // Tracks duplicate pending texts by stable extension IDs so edits and cancellation target one message.
+    @MainActor
+    func testManagedQueuedMessagesRemainIndividuallyEditable() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        _ = try applyEmptySession(to: state, id: "session-managed-queue")
+        state.consume(.managedQueueChanged([
+            QueuedUserMessage(id: "queue-1", text: "重复消息", delivery: .steer),
+            QueuedUserMessage(id: "queue-2", text: "重复消息", delivery: .followUp),
+        ]))
+
+        XCTAssertEqual(state.queuedMessages.map(\.id), ["queue-1", "queue-2"])
+        XCTAssertEqual(state.queuedMessages.map(\.isSteering), [true, false])
+        XCTAssertTrue(state.queuedMessages.allSatisfy(\.editable))
+        XCTAssertTrue(state.showsResultPanel)
+
+        state.consume(.managedQueueChanged([
+            QueuedUserMessage(id: "queue-2", text: "编辑后的消息", delivery: .followUp),
+        ]))
+
+        XCTAssertEqual(state.queuedMessages.map(\.id), ["queue-2"])
+        XCTAssertEqual(state.queuedMessages.first?.text, "编辑后的消息")
+
+        state.consume(.queueChanged(steering: ["正在交付"], followUp: []))
+        XCTAssertEqual(state.queuedMessages.map(\.editable), [true, false])
+        state.consume(.managedQueueChanged([]))
+        state.consume(.queueChanged(steering: [], followUp: []))
+        XCTAssertTrue(state.queuedMessages.isEmpty)
+    }
+
+    @MainActor
+    func testManagedQueueKeepsAttachmentsThroughDelivery() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        _ = try applyEmptySession(to: state, id: "session-managed-attachment")
+        let attachment = MessageAttachment(
+            id: "queue-image",
+            name: "queued.jpg",
+            kind: .image,
+            data: Data("jpeg-preview".utf8),
+            mimeType: "image/jpeg"
+        )
+        let queuedMessage = QueuedUserMessage(
+            id: "queue-with-image",
+            text: "查看图片",
+            delivery: .followUp,
+            attachmentNames: [attachment.name],
+            attachments: [attachment]
+        )
+
+        state.consume(.managedQueueChanged([queuedMessage]))
+        state.consume(.managedQueueDispatching(
+            message: queuedMessage,
+            runtimeText: "查看图片"
+        ))
+        state.consume(.managedQueueChanged([]))
+
+        XCTAssertEqual(state.queuedMessages.count, 1)
+        XCTAssertFalse(try XCTUnwrap(state.queuedMessages.first).editable)
+        XCTAssertEqual(state.queuedMessages.first?.attachments, [attachment])
+
+        state.consume(.userMessage("查看图片\n[图片：image/jpeg]"))
+
+        XCTAssertTrue(state.queuedMessages.isEmpty)
+        XCTAssertEqual(state.answer?.question?.text, "查看图片")
+        XCTAssertEqual(state.answer?.question?.attachments, [attachment])
     }
 
     // Keeps a plugin command and its fire-and-forget notification in the same visible conversation turn.
@@ -595,14 +981,27 @@ final class SessionStateTests: XCTestCase {
             return XCTFail("notify 应进入正文")
         }
         XCTAssertEqual(notification.kind, .warning)
-        XCTAssertEqual(state.extensionStatuses, [ExtensionStatus(key: "sync", text: "Syncing")])
-        XCTAssertEqual(
-            state.extensionWidgets,
-            [ExtensionWidget(key: "tasks", lines: ["☐ Task 1", "Task 2"], placement: .belowEditor)]
-        )
+        let syncStatus = try XCTUnwrap(state.extensionStatuses.first)
+        XCTAssertEqual(syncStatus.key, "sync")
+        XCTAssertEqual(syncStatus.text, "Syncing")
+        XCTAssertEqual(syncStatus.richText?.runs.first?.style.foreground, .indexed(3))
+        let tasksWidget = try XCTUnwrap(state.extensionWidgets.first)
+        XCTAssertEqual(tasksWidget.key, "tasks")
+        XCTAssertEqual(tasksWidget.lines, ["☐ Task 1", "Task 2"])
+        XCTAssertEqual(tasksWidget.placement, .belowEditor)
+        let richTaskLines = try XCTUnwrap(tasksWidget.richLines)
+        XCTAssertEqual(richTaskLines.map(\.plainText), tasksWidget.lines)
+        XCTAssertTrue(richTaskLines[0].runs.first?.style.dimmed == true)
         XCTAssertEqual(state.extensionTitle, "Plugin workspace")
         XCTAssertEqual(state.draft, "prefilled")
         XCTAssertEqual(state.inputBarHeight, 198)
+
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"queue","method":"notify","message":"quickpi:{\"kind\":\"managedQueueChanged\",\"queuedMessages\":[{\"id\":\"queue-1\",\"text\":\"待编辑\",\"delivery\":\"steer\",\"attachmentNames\":[],\"editable\":true}]}","notifyType":"info"}"#.utf8
+        ))
+        XCTAssertEqual(state.queuedMessages, [
+            QueuedUserMessage(id: "queue-1", text: "待编辑", delivery: .steer),
+        ])
 
         try runtime.consumeExtensionRequest(Data(
             #"{"type":"extension_ui_request","id":"6","method":"setStatus","statusKey":"sync","statusText":"Done"}"#.utf8
@@ -628,24 +1027,30 @@ final class SessionStateTests: XCTestCase {
         XCTAssertTrue(state.extensionWidgets.isEmpty)
 
         try runtime.consumeExtensionRequest(Data(
-            #"{"type":"extension_ui_request","id":"plan-status","method":"setStatus","statusKey":"plan-mode","statusText":"📋 1/2"}"#.utf8
+            #"{"type":"extension_ui_request","id":"plan-status","method":"setStatus","statusKey":"plan-mode","statusText":"\u001b[38;2;40;120;220m📋 1/2\u001b[0m"}"#.utf8
         ))
         try runtime.consumeExtensionRequest(Data(
-            #"{"type":"extension_ui_request","id":"plan-widget","method":"setWidget","widgetKey":"plan-todos","widgetLines":["☑ Inspect the chain","☐ Move the progress UI"]}"#.utf8
+            #"{"type":"extension_ui_request","id":"plan-widget","method":"setWidget","widgetKey":"plan-todos","widgetLines":["\u001b[32m☑ \u001b[0m\u001b[2;9mInspect the chain\u001b[0m","\u001b[2m☐ \u001b[0mMove the progress UI"]}"#.utf8
         ))
 
+        let planStatus = try XCTUnwrap(state.extensionStatuses.first)
+        XCTAssertEqual(planStatus.key, ExtensionStatus.planModeKey)
+        XCTAssertEqual(planStatus.text, "📋 1/2")
         XCTAssertEqual(
-            state.extensionStatuses,
-            [ExtensionStatus(key: ExtensionStatus.planModeKey, text: "📋 1/2")]
+            planStatus.richText?.runs.first?.style.foreground,
+            .rgb(red: 40, green: 120, blue: 220)
         )
-        XCTAssertEqual(
-            state.extensionWidgets,
-            [ExtensionWidget(
-                key: ExtensionWidget.planModeKey,
-                lines: ["☑ Inspect the chain", "☐ Move the progress UI"],
-                placement: .aboveEditor
-            )]
-        )
+        let planWidget = try XCTUnwrap(state.extensionWidgets.first)
+        XCTAssertEqual(planWidget.key, ExtensionWidget.planModeKey)
+        XCTAssertEqual(planWidget.lines, ["☑ Inspect the chain", "☐ Move the progress UI"])
+        XCTAssertEqual(planWidget.placement, .aboveEditor)
+        let planRichLines = try XCTUnwrap(planWidget.richLines)
+        XCTAssertEqual(planRichLines[0].plainText, "☑ Inspect the chain")
+        XCTAssertEqual(planRichLines[0].runs.count, 2)
+        XCTAssertEqual(planRichLines[0].runs[0].style.foreground, .indexed(2))
+        XCTAssertTrue(planRichLines[0].runs[1].style.dimmed)
+        XCTAssertTrue(planRichLines[0].runs[1].style.strikethrough)
+        XCTAssertTrue(planRichLines[1].runs[0].style.dimmed)
         XCTAssertEqual(state.inputBarHeight, 154)
 
         try runtime.consumeExtensionRequest(Data(
@@ -679,6 +1084,35 @@ final class SessionStateTests: XCTestCase {
             placeholder: nil,
             options: [],
             prefill: "Keep the tests focused"
+        ))
+
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"questionnaire-1","method":"input","title":"quickpi:{\"kind\":\"questionnaire\",\"questionnaire\":{\"questions\":[{\"id\":\"delivery\",\"label\":\"交付方式\",\"prompt\":\"你希望最终如何交付？\",\"options\":[{\"value\":\"direct\",\"label\":\"直接实现\",\"description\":\"按计划完成代码和验证\",\"recommended\":true},{\"value\":\"review\",\"label\":\"仅输出方案\",\"description\":null,\"recommended\":false}],\"allowOther\":true}]}}","placeholder":""}"#.utf8
+        ))
+        XCTAssertEqual(state.questionnairePrompt, QuestionnairePrompt(
+            requestId: "questionnaire-1",
+            definition: QuestionnaireDefinition(questions: [
+                QuestionnaireDefinition.Question(
+                    id: "delivery",
+                    label: "交付方式",
+                    prompt: "你希望最终如何交付？",
+                    options: [
+                        QuestionnaireDefinition.Question.Option(
+                            value: "direct",
+                            label: "直接实现",
+                            description: "按计划完成代码和验证",
+                            recommended: true
+                        ),
+                        QuestionnaireDefinition.Question.Option(
+                            value: "review",
+                            label: "仅输出方案",
+                            description: nil,
+                            recommended: false
+                        ),
+                    ],
+                    allowOther: true
+                ),
+            ])
         ))
     }
 
@@ -1023,6 +1457,7 @@ final class SessionStateTests: XCTestCase {
         role: SavedSessionMessage.Role,
         timestamp: Double,
         text: String? = nil,
+        attachments: [MessageAttachment]? = nil,
         content: [SavedAssistantContent]? = nil,
         provider: String? = nil,
         model: String? = nil,
@@ -1039,6 +1474,7 @@ final class SessionStateTests: XCTestCase {
             role: role,
             timestamp: timestamp,
             text: text,
+            attachments: attachments,
             content: content,
             provider: provider,
             model: model,
@@ -1050,6 +1486,30 @@ final class SessionStateTests: XCTestCase {
             isError: isError,
             customMessage: customMessage
         )
+    }
+
+    private func testImage(width: Int = 4, height: Int = 2) throws -> NSImage {
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: width,
+            pixelsHigh: height,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        let image = NSImage(size: NSSize(width: CGFloat(width), height: CGFloat(height)))
+        image.addRepresentation(bitmap)
+        return image
+    }
+
+    private func imageData(_ image: NSImage, fileType: NSBitmapImageRep.FileType) throws -> Data {
+        let tiff = try XCTUnwrap(image.tiffRepresentation)
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: tiff))
+        return try XCTUnwrap(bitmap.representation(using: fileType, properties: [:]))
     }
 
     private func temporaryDirectory() throws -> URL {

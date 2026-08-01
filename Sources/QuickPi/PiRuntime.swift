@@ -16,6 +16,8 @@ enum PiRuntimeEvent {
     case userMessage(String)
     case userMessagePersisted
     case queueChanged(steering: [String], followUp: [String])
+    case managedQueueChanged([QueuedUserMessage])
+    case managedQueueDispatching(message: QueuedUserMessage, runtimeText: String)
     case textDelta(String)
     case thinkingDelta(String)
     case toolStarted(id: String, name: String, input: String)
@@ -31,11 +33,17 @@ enum PiRuntimeEvent {
     case logoutCompleted(String)
     case customMessage(PiCustomMessage)
     case extensionNotification(ExtensionNotification)
-    case extensionStatus(key: String, text: String?)
-    case extensionWidget(key: String, lines: [String]?, placement: ExtensionWidget.Placement)
+    case extensionStatus(key: String, text: String?, richText: ExtensionRichText?)
+    case extensionWidget(
+        key: String,
+        lines: [String]?,
+        richLines: [ExtensionRichText]?,
+        placement: ExtensionWidget.Placement
+    )
     case extensionTitle(String)
     case extensionEditorText(String)
     case extensionPrompt(ExtensionPrompt)
+    case questionnairePrompt(QuestionnairePrompt)
     case operationFailed(String)
     case runtimeExited(String)
 }
@@ -99,6 +107,32 @@ final class PiRuntime {
     private struct CommitMessageRequest: Encodable {
         let requestId: String
         let context: String
+    }
+
+    private struct ManagedQueueRequest: Encodable {
+        let id: String
+        let text: String
+        let delivery: QueuedUserMessage.Delivery
+        let images: [ImagePayload]
+        let documentSections: [String]
+        let attachmentNames: [String]
+        let attachments: [MessageAttachmentMetadata]
+    }
+
+    private struct ManagedQueueEditRequest: Encodable {
+        let id: String
+        let text: String
+    }
+
+    private struct MessageAttachmentMetadata: Encodable {
+        let id: String
+        let name: String
+        let kind: MessageAttachment.Kind
+    }
+
+    private struct RecordMessageAttachmentsRequest: Encodable {
+        let question: String
+        let attachments: [MessageAttachmentMetadata]
     }
 
     private struct EnvelopeType: Decodable {
@@ -294,10 +328,14 @@ final class PiRuntime {
         let sessionSnapshot: SessionSnapshot?
         let event: WireAuthEvent?
         let prompt: WirePrompt?
+        let questionnaire: QuestionnaireDefinition?
         let providerId: String?
         let requestId: String?
         let message: String?
         let error: String?
+        let queuedMessages: [QueuedUserMessage]?
+        let queuedMessage: QueuedUserMessage?
+        let runtimeText: String?
     }
 
     private let applicationSupportDirectory: URL
@@ -313,6 +351,7 @@ final class PiRuntime {
     private var commitMessageContinuations: [String: (Result<String, Error>) -> Void] = [:]
     private var snapshotContinuation: CheckedContinuation<RuntimeSnapshot, Error>?
     private var sessionSnapshotContinuation: CheckedContinuation<SessionSnapshot, Error>?
+    private var rewindMessageContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var cloneTurnContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var deleteSessionContinuation: CheckedContinuation<SessionSnapshot, Error>?
     private var deleteSessionsContinuation: CheckedContinuation<SessionSnapshot, Error>?
@@ -336,6 +375,10 @@ final class PiRuntime {
         }
         guard let piURL = Bundle.main.url(forResource: "pi", withExtension: nil, subdirectory: "pi-runtime"),
               let extensionURL = Bundle.main.url(forResource: "quick-pi-extension", withExtension: "js"),
+              let questionnaireURL = Bundle.main.url(
+                forResource: "quick-pi-questionnaire",
+                withExtension: "js"
+              ),
               let planModeURL = Bundle.main.url(
                 forResource: "index",
                 withExtension: "ts",
@@ -360,9 +403,10 @@ final class PiRuntime {
         let errorPipe = Pipe()
         nextProcess.executableURL = piURL
         nextProcess.currentDirectoryURL = currentDirectoryURL
-        nextProcess.arguments = arguments(
+        nextProcess.arguments = try arguments(
             settings: settings,
             extensionURL: extensionURL,
+            questionnaireURL: questionnaireURL,
             planModeURL: planModeURL,
             session: session
         )
@@ -371,8 +415,7 @@ final class PiRuntime {
         nextProcess.standardError = errorPipe
         var environment = ProcessInfo.processInfo.environment
         let quickPiDirectory = applicationSupportDirectory.appendingPathComponent("pi", isDirectory: true)
-        environment["PI_CODING_AGENT_DIR"] = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".pi/agent", isDirectory: true).path
+        environment["PI_CODING_AGENT_DIR"] = ConfigurationStore.globalAgentDirectory.path
         environment["PI_CODING_AGENT_SESSION_DIR"] = quickPiDirectory
             .appendingPathComponent("sessions", isDirectory: true).path
         environment["QUICK_PI_DATA_DIR"] = quickPiDirectory.path
@@ -562,6 +605,58 @@ final class PiRuntime {
         )
     }
 
+    // Stores an editable user message in the extension until its Pi delivery boundary arrives.
+    func queueMessage(
+        id: String,
+        text: String,
+        delivery: QueuedUserMessage.Delivery,
+        images: [ImagePayload],
+        documentSections: [String],
+        attachmentNames: [String],
+        attachments: [MessageAttachment]
+    ) async throws {
+        let request = ManagedQueueRequest(
+            id: id,
+            text: text,
+            delivery: delivery,
+            images: images,
+            documentSections: documentSections,
+            attachmentNames: attachmentNames,
+            attachments: attachments.map {
+                MessageAttachmentMetadata(id: $0.id, name: $0.name, kind: $0.kind)
+            }
+        )
+        let encoded = try JSONEncoder().encode(request).base64EncodedString()
+        try await sendCommand(type: "prompt", message: "/quick-queue-message \(encoded)")
+    }
+
+    // Persists UI-only attachment metadata immediately before its user message session entry.
+    func recordMessageAttachments(
+        question: String,
+        attachments: [MessageAttachment]
+    ) async throws {
+        let request = RecordMessageAttachmentsRequest(
+            question: question,
+            attachments: attachments.map {
+                MessageAttachmentMetadata(id: $0.id, name: $0.name, kind: $0.kind)
+            }
+        )
+        let encoded = try JSONEncoder().encode(request).base64EncodedString()
+        try await sendCommand(type: "prompt", message: "/quick-record-message-attachments \(encoded)")
+    }
+
+    // Replaces the editable text while preserving one queued message's delivery mode and attachments.
+    func editQueuedMessage(id: String, text: String) async throws {
+        let request = ManagedQueueEditRequest(id: id, text: text)
+        let encoded = try JSONEncoder().encode(request).base64EncodedString()
+        try await sendCommand(type: "prompt", message: "/quick-edit-queued-message \(encoded)")
+    }
+
+    // Removes one extension-managed message before it enters Pi's real delivery queue.
+    func cancelQueuedMessage(id: String) async throws {
+        try await sendCommand(type: "prompt", message: "/quick-cancel-queued-message \(id)")
+    }
+
     // Uses the active Pi model for one isolated completion that does not enter the conversation history.
     func generateCommitMessage(context: String) async throws -> String {
         let requestId = UUID().uuidString
@@ -608,6 +703,22 @@ final class PiRuntime {
             customInstructions: instructions,
             response: PiCompactionResult.self
         )
+    }
+
+    // Moves the active Pi branch before one persisted user message and returns the shortened branch.
+    func rewindToUserMessage(entryId: String) async throws -> SessionSnapshot {
+        guard rewindMessageContinuation == nil else {
+            throw QuickPiError.message("另一条消息正在编辑")
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            rewindMessageContinuation = continuation
+            do {
+                try sendWithoutResponse(type: "prompt", message: "/quick-rewind-message \(entryId)")
+            } catch {
+                rewindMessageContinuation = nil
+                continuation.resume(throwing: error)
+            }
+        }
     }
 
     // Clones the current branch into a new Pi session.
@@ -677,16 +788,57 @@ final class PiRuntime {
         }
     }
 
+    // Resolves Quick Pi's default instructions against Pi's native global AGENTS.md discovery.
+    nonisolated static func contextArguments(
+        workspaceEnabled: Bool,
+        agentInstructionsURL: URL = ConfigurationStore.globalAgentInstructionsURL
+    ) throws -> [String] {
+        var isDirectory: ObjCBool = false
+        let hasAgentInstructions = FileManager.default.fileExists(
+            atPath: agentInstructionsURL.path,
+            isDirectory: &isDirectory
+        )
+        if hasAgentInstructions && isDirectory.boolValue {
+            throw QuickPiError.message("AGENTS.md 不能是目录")
+        }
+        let customInstructions = hasAgentInstructions
+            ? try String(contentsOf: agentInstructionsURL, encoding: .utf8)
+            : nil
+
+        if workspaceEnabled {
+            if hasAgentInstructions {
+                return ["--approve"]
+            }
+            return [
+                "--approve",
+                "--append-system-prompt",
+                ConfigurationStore.defaultAgentInstructions,
+            ]
+        }
+
+        var values = [
+            "--no-context-files",
+            "--system-prompt",
+            "You are a concise, accurate general-purpose assistant. Answer in the user's language and use Markdown when it improves clarity.",
+        ]
+        if let customInstructions, !customInstructions.isEmpty {
+            values.append(contentsOf: ["--append-system-prompt", customInstructions])
+        }
+        return values
+    }
+
     // Enables Pi's native tools and resource discovery in the selected working directory.
     private func arguments(
         settings: AppSettings,
         extensionURL: URL,
+        questionnaireURL: URL,
         planModeURL: URL,
         session: PiSessionLaunch
-    ) -> [String] {
+    ) throws -> [String] {
         var values = [
             "--mode", "rpc",
             "--extension", extensionURL.path,
+            "--extension", questionnaireURL.path,
             "--extension", planModeURL.path,
             "--offline",
         ]
@@ -698,19 +850,9 @@ final class PiRuntime {
         case .new(let id):
             values.append(contentsOf: ["--session-id", id])
         }
-        if settings.workspacePath != nil {
-            values.append(contentsOf: [
-                "--approve",
-                "--append-system-prompt",
-                "The user selected the current working directory as the project workspace. Inspect the project before editing, keep file operations inside this workspace unless the user explicitly asks otherwise, and answer in the user's language.",
-            ])
-        } else {
-            values.append(contentsOf: [
-                "--no-context-files",
-                "--system-prompt",
-                "You are a concise, accurate general-purpose assistant. Answer in the user's language and use Markdown when it improves clarity.",
-            ])
-        }
+        values.append(contentsOf: try Self.contextArguments(
+            workspaceEnabled: settings.workspacePath != nil
+        ))
         return values
     }
 
@@ -1087,15 +1229,6 @@ final class PiRuntime {
         }.joined(separator: "\n")
     }
 
-    // Removes terminal SGR styling because native SwiftUI renders extension status text itself.
-    private func plainExtensionText(_ text: String) -> String {
-        text.replacingOccurrences(
-            of: "\u{001B}\\[[0-9;]*m",
-            with: "",
-            options: .regularExpression
-        )
-    }
-
     // Decodes Quick Pi control messages and public interaction requests from loaded extensions.
     func consumeExtensionRequest(_ record: Data) throws {
         let envelope = try JSONDecoder().decode(ExtensionRequestEnvelope.self, from: record)
@@ -1119,7 +1252,12 @@ final class PiRuntime {
             guard let key = envelope.statusKey else {
                 throw QuickPiError.message("Pi 扩展状态缺少标识")
             }
-            onEvent?(.extensionStatus(key: key, text: envelope.statusText.map(plainExtensionText)))
+            let richText = envelope.statusText.map { ExtensionRichText(ansi: $0) }
+            onEvent?(.extensionStatus(
+                key: key,
+                text: richText?.plainText,
+                richText: richText?.hasFormatting == true ? richText : nil
+            ))
             return
         }
         if envelope.method == "setWidget" {
@@ -1130,9 +1268,11 @@ final class PiRuntime {
             guard let placement = ExtensionWidget.Placement(rawValue: rawPlacement) else {
                 throw QuickPiError.message("未知的 Pi 扩展 Widget 位置：\(rawPlacement)")
             }
+            let richLines = envelope.widgetLines?.map { ExtensionRichText(ansi: $0) }
             onEvent?(.extensionWidget(
                 key: key,
-                lines: envelope.widgetLines?.map(plainExtensionText),
+                lines: richLines?.map(\.plainText),
+                richLines: richLines?.contains(where: \.hasFormatting) == true ? richLines : nil,
                 placement: placement
             ))
             return
@@ -1156,6 +1296,14 @@ final class PiRuntime {
                let title = envelope.title,
                title.hasPrefix("quickpi:") {
                 let payload = try decodeExtensionPayload(String(title.dropFirst("quickpi:".count)))
+                if payload.kind == "questionnaire", let questionnaire = payload.questionnaire {
+                    try validateQuestionnaire(questionnaire)
+                    onEvent?(.questionnairePrompt(QuestionnairePrompt(
+                        requestId: requestId,
+                        definition: questionnaire
+                    )))
+                    return
+                }
                 guard payload.kind == "authPrompt", let prompt = payload.prompt else {
                     throw QuickPiError.message("Pi 登录提示无效")
                 }
@@ -1215,6 +1363,34 @@ final class PiRuntime {
         )))
     }
 
+    // Rejects malformed or unbounded questionnaire payloads before they reach native layout.
+    private func validateQuestionnaire(_ definition: QuestionnaireDefinition) throws {
+        guard !definition.questions.isEmpty, definition.questions.count <= 20 else {
+            throw QuickPiError.message("Pi 问卷问题数量无效")
+        }
+        let ids = definition.questions.map(\.id)
+        guard Set(ids).count == ids.count else {
+            throw QuickPiError.message("Pi 问卷问题 ID 重复")
+        }
+        for question in definition.questions {
+            let optionValues = question.options.map(\.value)
+            guard !question.id.isEmpty,
+                  !question.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  question.prompt.count <= 8_000,
+                  question.options.count <= 20,
+                  Set(optionValues).count == optionValues.count,
+                  question.options.allSatisfy({
+                      !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          && !$0.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          && $0.value.count <= 2_000
+                          && $0.label.count <= 2_000
+                          && ($0.description?.count ?? 0) <= 4_000
+                  }) else {
+                throw QuickPiError.message("Pi 问卷内容无效")
+            }
+        }
+    }
+
     // Decodes one JSON payload sent through the extension notification prefix.
     private func decodeExtensionPayload(_ text: String) throws -> ExtensionPayload {
         try JSONDecoder().decode(ExtensionPayload.self, from: Data(text.utf8))
@@ -1234,6 +1410,23 @@ final class PiRuntime {
                 throw QuickPiError.message("Pi 会话状态响应无效")
             }
             sessionSnapshotContinuation = nil
+            continuation.resume(returning: snapshot)
+        case "managedQueueChanged":
+            guard let queuedMessages = payload.queuedMessages else {
+                throw QuickPiError.message("Pi 可编辑队列响应无效")
+            }
+            onEvent?(.managedQueueChanged(queuedMessages))
+        case "managedQueueDispatching":
+            guard let queuedMessage = payload.queuedMessage,
+                  let runtimeText = payload.runtimeText else {
+                throw QuickPiError.message("Pi 队列交付响应无效")
+            }
+            onEvent?(.managedQueueDispatching(message: queuedMessage, runtimeText: runtimeText))
+        case "sessionRewound":
+            guard let snapshot = payload.sessionSnapshot, let continuation = rewindMessageContinuation else {
+                throw QuickPiError.message("Pi 消息编辑响应无效")
+            }
+            rewindMessageContinuation = nil
             continuation.resume(returning: snapshot)
         case "sessionCloned":
             guard let snapshot = payload.sessionSnapshot, let continuation = cloneTurnContinuation else {
@@ -1339,6 +1532,10 @@ final class PiRuntime {
             sessionSnapshotContinuation = nil
             continuation.resume(throwing: error)
         }
+        if let continuation = rewindMessageContinuation {
+            rewindMessageContinuation = nil
+            continuation.resume(throwing: error)
+        }
         if let continuation = cloneTurnContinuation {
             cloneTurnContinuation = nil
             continuation.resume(throwing: error)
@@ -1374,6 +1571,10 @@ final class PiRuntime {
         }
         if let continuation = sessionSnapshotContinuation {
             sessionSnapshotContinuation = nil
+            continuation.resume(throwing: error)
+        }
+        if let continuation = rewindMessageContinuation {
+            rewindMessageContinuation = nil
             continuation.resume(throwing: error)
         }
         if let continuation = cloneTurnContinuation {

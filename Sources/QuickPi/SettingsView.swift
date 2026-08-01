@@ -2,19 +2,33 @@ import SwiftUI
 
 private enum SettingsPane {
     case general
+    case personalization
     case providers
 }
+
+private let providerGridColumns = [
+    GridItem(.flexible(), spacing: 12),
+    GridItem(.flexible(), spacing: 12),
+]
 
 struct SettingsView: View {
     @ObservedObject var state: AppState
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(QuickPiTheme.storageKey) private var theme = QuickPiTheme.system
     @AppStorage("showSystemStatus") private var showSystemStatus = true
     @AppStorage("hidePanelWhenInactive") private var hidePanelWhenInactive = false
     @State private var selectedPane: SettingsPane = .general
     @State private var shortcut: String
     @State private var launchAtLogin: Bool
+    @State private var fillInputFromClipboardOnShortcut: Bool
     @State private var savingGeneral = false
     @State private var generalMessage: String?
+    @State private var agentInstructions = ""
+    @State private var savedAgentInstructions = ""
+    @State private var loadingAgentInstructions = true
+    @State private var savingAgentInstructions = false
+    @State private var personalizationMessage: String?
+    @State private var personalizationMessageIsError = false
     @State private var showingProviderForm = false
     @State private var provider = ProviderConfiguration(
         id: "custom-\(UUID().uuidString.lowercased())",
@@ -37,6 +51,9 @@ struct SettingsView: View {
         self.setPanelHidesOnDeactivate = setPanelHidesOnDeactivate
         _shortcut = State(initialValue: state.settings.shortcut)
         _launchAtLogin = State(initialValue: state.settings.launchAtLogin)
+        _fillInputFromClipboardOnShortcut = State(
+            initialValue: state.settings.fillInputFromClipboardOnShortcut
+        )
     }
 
     private var isEditingProvider: Bool {
@@ -82,6 +99,26 @@ struct SettingsView: View {
                 .foregroundStyle(selectedPane == .general ? Color.accentColor : Color.primary)
 
                 Button {
+                    selectedPane = .personalization
+                } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: "person.crop.circle")
+                            .frame(width: 18)
+                        Text("个性化")
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
+                    .contentShape(Rectangle())
+                    .background(
+                        selectedPane == .personalization ? Color.accentColor.opacity(0.12) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(selectedPane == .personalization ? Color.accentColor : Color.primary)
+
+                Button {
                     selectedPane = .providers
                 } label: {
                     HStack(spacing: 9) {
@@ -106,7 +143,7 @@ struct SettingsView: View {
             .padding(12)
             .frame(width: 164)
             .frame(maxHeight: .infinity)
-            .background(Color.white)
+            .background(Color.quickPiWindowBackground)
 
             Divider()
 
@@ -115,6 +152,8 @@ struct SettingsView: View {
                     Group {
                         if selectedPane == .general {
                             Text("通用")
+                        } else if selectedPane == .personalization {
+                            Text("个性化")
                         } else if showingProviderForm {
                             Text(isEditingProvider ? "编辑 Provider" : "添加 Provider")
                         } else {
@@ -123,7 +162,8 @@ struct SettingsView: View {
                     }
                     .font(.title3.weight(.semibold))
 
-                    if selectedPane == .general && savingGeneral {
+                    if (selectedPane == .general && savingGeneral)
+                        || (selectedPane == .personalization && savingAgentInstructions) {
                         ProgressView()
                             .controlSize(.small)
                     }
@@ -160,12 +200,15 @@ struct SettingsView: View {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: "xmark.circle.fill")
+                        Image(systemName: "xmark")
                     }
-                    .buttonStyle(.plain)
-                    .frame(width: 28, height: 28)
-                    .foregroundStyle(.secondary)
-                    .disabled(savingGeneral || syncingModels || savingProvider)
+                    .buttonStyle(SettingsIconButtonStyle())
+                    .disabled(
+                        savingGeneral
+                            || savingAgentInstructions
+                            || syncingModels
+                            || savingProvider
+                    )
                     .help("关闭设置")
                 }
                 .padding(.horizontal, 24)
@@ -175,15 +218,24 @@ struct SettingsView: View {
 
                 if selectedPane == .general {
                     generalTab
+                } else if selectedPane == .personalization {
+                    personalizationTab
                 } else {
                     providersTab
                 }
             }
         }
+        .buttonStyle(SettingsActionButtonStyle())
+        .font(.system(size: QuickPiTypography.settingsSize))
         .frame(width: 780, height: 660)
-        .background(Color.white)
-        .preferredColorScheme(.light)
-        .interactiveDismissDisabled(savingGeneral || syncingModels || savingProvider)
+        .background(Color.quickPiWindowBackground)
+        .preferredColorScheme(theme.colorScheme)
+        .interactiveDismissDisabled(
+            savingGeneral || savingAgentInstructions || syncingModels || savingProvider
+        )
+        .task {
+            loadAgentInstructions()
+        }
         .sheet(isPresented: Binding(
             get: { state.authSession != nil },
             set: { presented in
@@ -204,7 +256,8 @@ struct SettingsView: View {
                     set: { value in
                         persistGeneralSettings(
                             shortcut: value,
-                            launchAtLogin: launchAtLogin
+                            launchAtLogin: launchAtLogin,
+                            fillInputFromClipboardOnShortcut: fillInputFromClipboardOnShortcut
                         )
                     }
                 )) {
@@ -218,7 +271,18 @@ struct SettingsView: View {
                     set: { enabled in
                         persistGeneralSettings(
                             shortcut: shortcut,
-                            launchAtLogin: enabled
+                            launchAtLogin: enabled,
+                            fillInputFromClipboardOnShortcut: fillInputFromClipboardOnShortcut
+                        )
+                    }
+                ))
+                Toggle("快捷键打开时填入新复制的文本", isOn: Binding(
+                    get: { fillInputFromClipboardOnShortcut },
+                    set: { enabled in
+                        persistGeneralSettings(
+                            shortcut: shortcut,
+                            launchAtLogin: launchAtLogin,
+                            fillInputFromClipboardOnShortcut: enabled
                         )
                     }
                 ))
@@ -250,13 +314,13 @@ struct SettingsView: View {
                 Section {
                     if let generalMessage {
                         Text(generalMessage)
-                            .font(.caption)
+                            .font(.system(size: QuickPiTypography.settingsSize))
                             .foregroundStyle(.red)
                             .textSelection(.enabled)
                     }
                     if let shortcutError = state.shortcutError {
                         Text(shortcutError)
-                            .font(.caption)
+                            .font(.system(size: QuickPiTypography.settingsSize))
                             .foregroundStyle(.red)
                             .textSelection(.enabled)
                     }
@@ -265,8 +329,102 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
-        .background(Color.white)
+        .background(Color.quickPiWindowBackground)
         .disabled(savingGeneral)
+    }
+
+    private var personalizationTab: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(spacing: 16) {
+                Text("主题")
+                    .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
+
+                Spacer()
+
+                Picker("主题", selection: $theme) {
+                    ForEach(QuickPiTheme.allCases) { option in
+                        Label(option.title, systemImage: option.systemImage)
+                            .tag(option)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 390)
+            }
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Text("全局 AGENTS.md")
+                    .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
+
+                Spacer()
+
+                Button {
+                    agentInstructions = state.defaultAgentInstructions
+                    personalizationMessage = nil
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                }
+                .buttonStyle(SettingsIconButtonStyle())
+                .disabled(loadingAgentInstructions || savingAgentInstructions)
+                .help("恢复默认")
+
+                Button {
+                    savePersonalizationSettings()
+                } label: {
+                    Label("保存", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(SettingsActionButtonStyle(prominence: .primary))
+                .disabled(
+                    loadingAgentInstructions
+                        || savingAgentInstructions
+                        || agentInstructions == savedAgentInstructions
+                        || !state.canSaveAgentInstructions
+                )
+            }
+
+            Group {
+                if loadingAgentInstructions {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("正在读取 AGENTS.md")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    TextEditor(text: $agentInstructions)
+                        .font(.system(size: QuickPiTypography.settingsSize, design: .monospaced))
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .background(Color(nsColor: .textBackgroundColor))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                        }
+                        .accessibilityLabel("全局 AGENTS.md")
+                        .disabled(savingAgentInstructions)
+                }
+            }
+            .frame(
+                maxWidth: .infinity,
+                minHeight: 180,
+                idealHeight: 220,
+                maxHeight: 240
+            )
+
+            if let personalizationMessage {
+                Text(personalizationMessage)
+                    .font(.system(size: QuickPiTypography.settingsSize))
+                    .foregroundStyle(personalizationMessageIsError ? Color.red : Color.green)
+                    .textSelection(.enabled)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(24)
+        .background(Color.quickPiWindowBackground)
     }
 
     private var providersTab: some View {
@@ -281,38 +439,60 @@ struct SettingsView: View {
 
     private var providerList: some View {
         VStack(spacing: 0) {
-            List {
-                Section("自定义 Provider") {
-                    if state.settings.providers.isEmpty {
-                        HStack(spacing: 8) {
-                            Image(systemName: "plus.circle.dashed")
-                            Text("尚未添加自定义 Provider")
-                        }
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 6)
-                    } else {
-                        ForEach(state.settings.providers) { item in
-                            customProviderRow(item)
-                        }
-                    }
-                }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("自定义 Provider")
+                            .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
 
-                Section("内置 Provider") {
-                    ForEach(state.providerOptions.filter { item in
-                        !state.settings.providers.contains { $0.id == item.id }
-                    }) { item in
-                        builtInProviderRow(item)
+                        if state.settings.providers.isEmpty {
+                            HStack(spacing: 8) {
+                                Image(systemName: "plus.circle.dashed")
+                                Text("尚未添加自定义 Provider")
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 14)
+                            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+                            .background(
+                                Color.quickPiControlBackground,
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .stroke(Color.primary.opacity(0.10), lineWidth: 1)
+                            }
+                        } else {
+                            LazyVGrid(columns: providerGridColumns, alignment: .leading, spacing: 12) {
+                                ForEach(state.settings.providers) { item in
+                                    customProviderCard(item)
+                                }
+                            }
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("内置 Provider")
+                            .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
+
+                        LazyVGrid(columns: providerGridColumns, alignment: .leading, spacing: 12) {
+                            ForEach(state.providerOptions.filter { item in
+                                !state.settings.providers.contains { $0.id == item.id }
+                            }) { item in
+                                builtInProviderCard(item)
+                            }
+                        }
                     }
                 }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 20)
             }
-            .listStyle(.inset)
-            .scrollContentBackground(.hidden)
-            .background(Color.white)
+            .scrollIndicators(.visible)
+            .background(Color.quickPiWindowBackground)
 
             if let providerMessage {
                 Divider()
                 Text(providerMessage)
-                    .font(.caption)
+                    .font(.system(size: QuickPiTypography.settingsSize))
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
@@ -333,10 +513,10 @@ struct SettingsView: View {
 
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Coding Force 中转站")
-                                .font(.subheadline.weight(.semibold))
+                                .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
                                 .foregroundStyle(.primary)
                             Text("codeingforce.com")
-                                .font(.caption)
+                                .font(.system(size: QuickPiTypography.settingsSize))
                                 .foregroundStyle(.secondary)
                         }
 
@@ -455,7 +635,7 @@ struct SettingsView: View {
 
             if let providerMessage {
                 Text(providerMessage)
-                    .font(.caption)
+                    .font(.system(size: QuickPiTypography.settingsSize))
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
@@ -473,7 +653,7 @@ struct SettingsView: View {
                             Text("保存 Provider")
                         }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(SettingsActionButtonStyle(prominence: .primary))
                     .disabled(
                         provider.models.isEmpty
                             || selectedModelId.isEmpty
@@ -487,33 +667,74 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
-        .background(Color.white)
+        .background(Color.quickPiWindowBackground)
         .onChange(of: provider.kind) { _, _ in resetSyncedModels() }
         .onChange(of: provider.baseURL) { _, _ in resetSyncedModels() }
         .onChange(of: apiKey) { _, _ in resetSyncedModels() }
     }
 
+    // Reads the native Pi context file once when the settings window opens.
+    private func loadAgentInstructions() {
+        guard loadingAgentInstructions else {
+            return
+        }
+        do {
+            let instructions = try state.loadAgentInstructions()
+            agentInstructions = instructions
+            savedAgentInstructions = instructions
+            personalizationMessage = nil
+        } catch {
+            personalizationMessage = error.localizedDescription
+            personalizationMessageIsError = true
+        }
+        loadingAgentInstructions = false
+    }
+
+    // Saves the Markdown exactly as entered; AppState owns runtime restart coordination.
+    private func savePersonalizationSettings() {
+        guard !loadingAgentInstructions && !savingAgentInstructions else {
+            return
+        }
+        savingAgentInstructions = true
+        personalizationMessage = nil
+        do {
+            let saved = try state.saveAgentInstructions(agentInstructions)
+            agentInstructions = saved
+            savedAgentInstructions = saved
+            personalizationMessage = "已保存"
+            personalizationMessageIsError = false
+        } catch {
+            personalizationMessage = error.localizedDescription
+            personalizationMessageIsError = true
+        }
+        savingAgentInstructions = false
+    }
+
     // Persists one control change immediately and restores the disk values if macOS rejects it.
     private func persistGeneralSettings(
         shortcut nextShortcut: String,
-        launchAtLogin nextLaunchAtLogin: Bool
+        launchAtLogin nextLaunchAtLogin: Bool,
+        fillInputFromClipboardOnShortcut nextFillInputFromClipboardOnShortcut: Bool
     ) {
         guard !savingGeneral else {
             return
         }
         shortcut = nextShortcut
         launchAtLogin = nextLaunchAtLogin
+        fillInputFromClipboardOnShortcut = nextFillInputFromClipboardOnShortcut
         savingGeneral = true
         generalMessage = nil
         Task {
             do {
                 try await state.saveDesktopSettings(
                     shortcut: nextShortcut,
-                    launchAtLogin: nextLaunchAtLogin
+                    launchAtLogin: nextLaunchAtLogin,
+                    fillInputFromClipboardOnShortcut: nextFillInputFromClipboardOnShortcut
                 )
             } catch {
                 shortcut = state.settings.shortcut
                 launchAtLogin = state.settings.launchAtLogin
+                fillInputFromClipboardOnShortcut = state.settings.fillInputFromClipboardOnShortcut
                 generalMessage = error.localizedDescription
             }
             savingGeneral = false
@@ -617,91 +838,395 @@ struct SettingsView: View {
         )
     }
 
-    // Shows one disk-backed custom Provider and deletes it from all app-owned files.
-    private func customProviderRow(_ item: ProviderConfiguration) -> some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(item.name)
-                    .lineLimit(1)
-                Text("\(item.kind.title) · \(item.models.count) 个模型")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            if state.settings.selectedModel?.providerId == item.id {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .help("当前 Provider")
-            }
-            Button {
-                provider = item
-                apiKey = ""
-                if let selection = state.settings.selectedModel,
-                   selection.providerId == item.id,
-                   item.models.contains(selection.modelId) {
-                    selectedModelId = selection.modelId
-                } else {
-                    selectedModelId = item.models.first ?? ""
+    // Shows one disk-backed custom Provider and its local management actions.
+    private func customProviderCard(_ item: ProviderConfiguration) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                ProviderBrandIcon(id: item.id, name: item.name)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.name)
+                        .fontWeight(.medium)
+                        .lineLimit(1)
+                    Text("\(item.kind.title) · \(item.models.count) 个模型")
+                        .font(.system(size: QuickPiTypography.settingsSize))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                providerMessage = nil
-                showingProviderForm = true
-            } label: {
-                Image(systemName: "pencil")
+
+                Spacer(minLength: 0)
             }
-            .buttonStyle(.plain)
-            .help("编辑 Provider")
-            Button {
-                Task {
-                    do {
-                        try state.deleteProvider(id: item.id)
-                        providerMessage = nil
-                    } catch {
-                        providerMessage = error.localizedDescription
+
+            Spacer(minLength: 0)
+
+            HStack(spacing: 6) {
+                if state.settings.selectedModel?.providerId == item.id {
+                    Label("当前", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: QuickPiTypography.settingsSize))
+                        .foregroundStyle(.green)
+                }
+
+                Spacer(minLength: 0)
+
+                Button {
+                    provider = item
+                    apiKey = ""
+                    if let selection = state.settings.selectedModel,
+                       selection.providerId == item.id,
+                       item.models.contains(selection.modelId) {
+                        selectedModelId = selection.modelId
+                    } else {
+                        selectedModelId = item.models.first ?? ""
                     }
+                    providerMessage = nil
+                    showingProviderForm = true
+                } label: {
+                    Image(systemName: "pencil")
                 }
-            } label: {
-                Image(systemName: "trash")
+                .buttonStyle(SettingsIconButtonStyle())
+                .help("编辑 Provider")
+
+                Button {
+                    Task {
+                        do {
+                            try state.deleteProvider(id: item.id)
+                            providerMessage = nil
+                        } catch {
+                            providerMessage = error.localizedDescription
+                        }
+                    }
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(SettingsIconButtonStyle(tint: .red))
+                .help("删除 Provider")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.red)
-            .help("删除 Provider")
         }
-        .padding(.vertical, 3)
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 118, alignment: .topLeading)
+        .background(
+            Color.quickPiControlBackground,
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.primary.opacity(0.10), lineWidth: 1)
+        }
     }
 
-    // Shows authentication actions reported by a built-in Pi Provider.
-    private func builtInProviderRow(_ item: ProviderStatus) -> some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(item.name)
-                    .lineLimit(1)
-                Text(item.configured ? "已连接" : item.id)
-                    .font(.caption)
-                    .foregroundStyle(item.configured ? Color.green : Color.secondary)
+    // Shows one built-in Provider and the authentication methods it supports.
+    private func builtInProviderCard(_ item: ProviderStatus) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                ProviderBrandIcon(id: item.id, name: item.name)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.name)
+                        .fontWeight(.medium)
+                        .lineLimit(1)
+                    Text(item.configured ? "已连接" : item.id)
+                        .font(.system(size: QuickPiTypography.settingsSize))
+                        .foregroundStyle(item.configured ? Color.green : Color.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
             }
-            Spacer()
+
+            Spacer(minLength: 0)
+
             if item.configured {
-                Button("退出") {
-                    Task { await state.logout(providerId: item.id) }
-                }
-                .controlSize(.small)
-            } else {
-                if item.supportsAPIKeyLogin {
-                    Button("API Key") {
-                        state.startAuth(provider: item, type: "api_key")
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await state.logout(providerId: item.id) }
+                    } label: {
+                        Label("退出", systemImage: "rectangle.portrait.and.arrow.right")
                     }
-                    .controlSize(.small)
+                    .buttonStyle(SettingsActionButtonStyle(compact: true))
                 }
-                if item.supportsOAuthLogin {
-                    Button("登录") {
-                        state.startAuth(provider: item, type: "oauth")
+            } else if item.supportsAPIKeyLogin || item.supportsOAuthLogin {
+                HStack(spacing: 8) {
+                    if item.supportsAPIKeyLogin {
+                        ProviderAuthButton(title: "API Key", systemImage: "key.fill") {
+                            state.startAuth(provider: item, type: "api_key")
+                        }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    if item.supportsOAuthLogin {
+                        ProviderAuthButton(title: "登录", systemImage: "person.crop.circle.badge.checkmark") {
+                            state.startAuth(provider: item, type: "oauth")
+                        }
+                    }
                 }
             }
         }
-        .padding(.vertical, 3)
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 118, alignment: .topLeading)
+        .background(
+            Color.quickPiControlBackground,
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.primary.opacity(0.10), lineWidth: 1)
+        }
+    }
+}
+
+private enum SettingsButtonProminence: Equatable {
+    case standard
+    case primary
+}
+
+private struct SettingsActionButtonStyle: ButtonStyle {
+    var prominence = SettingsButtonProminence.standard
+    var compact = false
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        let isPrimary = prominence == .primary
+        configuration.label
+            .font(.system(size: QuickPiTypography.settingsSize, weight: .medium))
+            .foregroundStyle(isPrimary ? Color.white : Color.primary)
+            .padding(.horizontal, compact ? 9 : 12)
+            .frame(minHeight: compact ? 30 : 32)
+            .background(
+                isPrimary
+                    ? Color.accentColor.opacity(configuration.isPressed ? 0.78 : 1)
+                    : Color.quickPiControlBackground,
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(
+                        isPrimary ? Color.clear : Color.primary.opacity(0.14),
+                        lineWidth: 1
+                    )
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .opacity(isEnabled ? 1 : 0.45)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+private struct SettingsIconButtonStyle: ButtonStyle {
+    var tint = Color.secondary
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(tint)
+            .frame(width: 30, height: 30)
+            .background(Color.clear)
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .opacity(isEnabled ? (configuration.isPressed ? 0.65 : 1) : 0.4)
+    }
+}
+
+private struct ProviderAuthButton: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 15)
+                Text(title)
+                    .lineLimit(1)
+            }
+            .font(.system(size: QuickPiTypography.settingsSize, weight: .medium))
+            .frame(maxWidth: .infinity, minHeight: 32)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .foregroundStyle(Color.primary.opacity(0.9))
+        .background(
+            isHovering ? Color.accentColor.opacity(0.08) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(
+                    isHovering ? Color.accentColor.opacity(0.42) : Color.primary.opacity(0.16),
+                    lineWidth: 1
+                )
+        }
+        .onHover { hovering in
+            isHovering = hovering
+        }
+        .animation(.easeOut(duration: 0.12), value: isHovering)
+        .accessibilityLabel(title)
+    }
+}
+
+private struct ProviderBrandIcon: View {
+    let id: String
+    let name: String
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Group {
+            if let imageResourceName, let image = brandImage(named: imageResourceName) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .padding(3)
+            } else {
+                Image(systemName: "server.rack")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 36, height: 36)
+        .accessibilityHidden(true)
+    }
+
+    private var imageResourceName: String? {
+        guard let resourceName else {
+            return nil
+        }
+        guard Self.themedResourceNames.contains(resourceName) else {
+            return resourceName
+        }
+        let appearance = colorScheme == .dark ? "dark" : "light"
+        return "\(resourceName)-\(appearance)"
+    }
+
+    private static let themedResourceNames: Set<String> = [
+        "anthropic",
+        "github-copilot",
+        "groq",
+        "openai",
+        "opencode",
+        "vercel",
+        "xai",
+        "xiaomi-mimo",
+        "zai",
+    ]
+
+    private var resourceName: String? {
+        let value = "\(id) \(name)".lowercased()
+        if value.contains("github") || value.contains("copilot") {
+            return "github-copilot"
+        }
+        if value.contains("anthropic") || value.contains("claude") {
+            return "anthropic"
+        }
+        if value.contains("azure") {
+            return "azure-openai"
+        }
+        if value.contains("codex") {
+            return "openai-codex"
+        }
+        if value.contains("openai") || value.contains("chatgpt") {
+            return "openai"
+        }
+        if value.contains("deepseek") {
+            return "deepseek"
+        }
+        if value.contains("nvidia") {
+            return "nvidia"
+        }
+        if value.contains("vertex") {
+            return "google-vertex"
+        }
+        if value.contains("google cloud") || value.contains("google-cloud") {
+            return "google-cloud"
+        }
+        if value.contains("google") || value.contains("gemini") {
+            return "google-gemini"
+        }
+        if value.contains("amazon") || value.contains("bedrock") {
+            return "amazon-bedrock"
+        }
+        if value.contains("mistral") {
+            return "mistral"
+        }
+        if value.contains("groq") {
+            return "groq"
+        }
+        if value.contains("cerebras") {
+            return "cerebras"
+        }
+        if value.contains("cloudflare") && value.contains("worker") {
+            return "cloudflare-workers"
+        }
+        if value.contains("cloudflare") {
+            return "cloudflare"
+        }
+        if value.contains("openrouter") {
+            return "openrouter"
+        }
+        if value.contains("vercel") {
+            return "vercel"
+        }
+        if value.contains("opencode") {
+            return "opencode"
+        }
+        if value.contains("huggingface") || value.contains("hugging face") {
+            return "huggingface"
+        }
+        if value.contains("fireworks") {
+            return "fireworks"
+        }
+        if value.contains("together") {
+            return "together"
+        }
+        if value.contains("kimi") || value.contains("moonshot") {
+            return "kimi"
+        }
+        if value.contains("minimax") {
+            return "minimax"
+        }
+        if value.contains("qwen") {
+            return "qwen"
+        }
+        if value.contains("xiaomi") || value.contains("mimo") {
+            return "xiaomi-mimo"
+        }
+        if value.contains("xai") || value.contains("grok") {
+            return "xai"
+        }
+        if value.contains("zai") {
+            return "zai"
+        }
+        if value.contains("ant-ling") || value.contains("ant ling") {
+            return "ant-ling"
+        }
+        return nil
+    }
+
+    private func brandImage(named resourceName: String) -> NSImage? {
+        if let url = Bundle.main.url(
+            forResource: resourceName,
+            withExtension: "png",
+            subdirectory: "ProviderIcons"
+        ), let image = NSImage(contentsOf: url) {
+            return image
+        }
+#if SWIFT_PACKAGE
+        if let url = Bundle.module.url(
+            forResource: resourceName,
+            withExtension: "png",
+            subdirectory: "ProviderIcons"
+        ) {
+            return NSImage(contentsOf: url)
+        }
+#endif
+        return nil
     }
 }
 
@@ -711,49 +1236,75 @@ private struct AuthView: View {
 
     var body: some View {
         Group {
-            if let session = state.authSession {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("连接 \(session.providerName)")
-                        .font(.headline)
-
-                    if let event = session.event {
-                        authEvent(event)
-                    }
-                    if let prompt = session.prompt {
-                        promptView(prompt)
-                    } else if session.event == nil && session.error == nil {
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("正在准备登录")
-                                .foregroundStyle(.secondary)
+            if let session = state.authSession,
+               let prompt = session.prompt,
+               prompt.type == "select" {
+                PromptChoicePanel(
+                    title: prompt.message,
+                    subtitle: "连接 \(session.providerName)",
+                    choices: prompt.options.enumerated().map { index, option in
+                        PromptChoiceItem(
+                            id: index,
+                            title: option.label,
+                            description: option.description,
+                            recommended: false
+                        )
+                    },
+                    onSelect: { index in
+                        guard prompt.options.indices.contains(index) else {
+                            return
                         }
-                    }
-                    if let error = session.error {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .textSelection(.enabled)
-                    }
-
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        Button("取消") {
-                            state.cancelAuth()
-                        }
-                        .keyboardShortcut(.cancelAction)
-                    }
-                }
-                .padding(20)
+                        state.respondToAuth(value: prompt.options[index].id)
+                    },
+                    onCancel: state.cancelAuth
+                )
+            } else if let session = state.authSession {
+                standardAuthView(session)
             }
         }
-        .frame(width: 400, height: 330)
-        .background(Color.white)
-        .preferredColorScheme(.light)
+        .background(Color.quickPiWindowBackground)
+        .buttonStyle(SettingsActionButtonStyle())
         .onChange(of: state.authSession?.prompt) { _, _ in
             value = ""
         }
+    }
+
+    private func standardAuthView(_ session: AuthSession) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("连接 \(session.providerName)")
+                .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
+
+            if let event = session.event {
+                authEvent(event)
+            }
+            if let prompt = session.prompt {
+                promptView(prompt)
+            } else if session.event == nil && session.error == nil {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在准备登录")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let error = session.error {
+                Text(error)
+                    .font(.system(size: QuickPiTypography.settingsSize))
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+
+            Spacer()
+            HStack {
+                Spacer()
+                Button("取消") {
+                    state.cancelAuth()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 400, height: 330)
     }
 
     // Renders the provider-owned OAuth status and verified external links.
@@ -775,15 +1326,15 @@ private struct AuthView: View {
             Button("打开授权页面", systemImage: "arrow.up.right.square") {
                 state.openExternal(url)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(SettingsActionButtonStyle(prominence: .primary))
         case .deviceCode(let userCode, let verificationURI):
             Text(userCode)
-                .font(.system(.title3, design: .monospaced, weight: .semibold))
+                .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold, design: .monospaced))
                 .textSelection(.enabled)
             Button("打开验证页面", systemImage: "arrow.up.right.square") {
                 state.openExternal(verificationURI)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(SettingsActionButtonStyle(prominence: .primary))
         case .progress(let message):
             HStack(spacing: 8) {
                 ProgressView()
@@ -798,7 +1349,7 @@ private struct AuthView: View {
     private func promptView(_ prompt: AuthPrompt) -> some View {
         if prompt.type == "select" {
             Text(prompt.message)
-                .font(.subheadline.weight(.medium))
+                .font(.system(size: QuickPiTypography.settingsSize, weight: .medium))
             ForEach(prompt.options, id: \.id) { option in
                 Button {
                     state.respondToAuth(value: option.id)
@@ -807,7 +1358,7 @@ private struct AuthView: View {
                         Text(option.label)
                         if let description = option.description {
                             Text(description)
-                                .font(.caption)
+                                .font(.system(size: QuickPiTypography.settingsSize))
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -816,7 +1367,7 @@ private struct AuthView: View {
             }
         } else {
             Text(prompt.message)
-                .font(.subheadline.weight(.medium))
+                .font(.system(size: QuickPiTypography.settingsSize, weight: .medium))
             if prompt.type == "secret" {
                 SecureField(prompt.placeholder ?? "", text: $value)
                     .textFieldStyle(.roundedBorder)
@@ -829,7 +1380,7 @@ private struct AuthView: View {
             Button("继续") {
                 submit(prompt)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(SettingsActionButtonStyle(prominence: .primary))
             .disabled(value.isEmpty)
         }
     }

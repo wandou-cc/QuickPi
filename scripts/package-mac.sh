@@ -84,6 +84,7 @@ rm -rf "$STAGING_APP_PATH" "$ASSET_CATALOG_PATH" "$ASSET_OUTPUT_PATH" "$ASSET_IN
 mkdir -p \
   "$CONTENTS_PATH/MacOS" \
   "$CONTENTS_PATH/Resources/plan-mode" \
+  "$CONTENTS_PATH/Resources/ProviderIcons" \
   "$CONTENTS_PATH/Resources/pi-runtime/theme" \
   "$FRAMEWORKS_PATH" \
   "$LICENSES_PATH" \
@@ -95,6 +96,8 @@ cp "$PROJECT_ROOT/resources/Info.plist" "$CONTENTS_PATH/Info.plist"
   "Set :SUFeedURL https://github.com/wandou-cc/QuickPi/releases/latest/download/appcast-$MACHINE_ARCH.xml" \
   "$CONTENTS_PATH/Info.plist"
 cp "$PROJECT_ROOT/resources/quick-pi-extension.js" "$CONTENTS_PATH/Resources/quick-pi-extension.js"
+cp "$PROJECT_ROOT/resources/quick-pi-questionnaire.js" "$CONTENTS_PATH/Resources/quick-pi-questionnaire.js"
+ditto "$PROJECT_ROOT/Sources/QuickPi/Resources/ProviderIcons" "$CONTENTS_PATH/Resources/ProviderIcons"
 if [ ! -f "$RUNTIME_DIRECTORY/examples/extensions/plan-mode/index.ts" ] || \
    [ ! -f "$RUNTIME_DIRECTORY/examples/extensions/plan-mode/utils.ts" ]; then
   echo "Official Pi archive does not contain the plan-mode extension" >&2

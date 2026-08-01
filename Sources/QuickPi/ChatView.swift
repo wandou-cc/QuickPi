@@ -8,7 +8,7 @@ import SystemConfiguration
 import SwiftUI
 import UniformTypeIdentifiers
 
-private let chatMessageFontSize: CGFloat = 16
+private let chatMessageFontSize = QuickPiTypography.bodySize
 private let qrCodeContext = CIContext()
 
 private struct SlashCommandScrollRequest: Equatable {
@@ -32,6 +32,13 @@ private final class ResultScrollTracker {
 }
 
 final class PromptTextView: NSTextView {
+    private static let preferredImageTypeIdentifiers = [
+        UTType.png.identifier,
+        UTType.jpeg.identifier,
+        UTType.heic.identifier,
+        UTType.tiff.identifier,
+    ]
+
     var onPasteImages: (([NSItemProvider]) -> Void)?
     var onSubmit: (() -> Void)?
     var onMoveSuggestion: ((Int) -> Bool)?
@@ -89,23 +96,89 @@ final class PromptTextView: NSTextView {
         return ceil(textBottom + textContainerInset.height * 2)
     }
 
-    // Converts native image objects from the pasteboard into the existing attachment input contract.
+    // Lets AppKit route Command-V for image-only clipboards to the custom paste handler.
+    override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
+        var types = super.readablePasteboardTypes
+        for identifier in Self.preferredImageTypeIdentifiers {
+            let type = NSPasteboard.PasteboardType(identifier)
+            if !types.contains(type) {
+                types.append(type)
+            }
+        }
+        return types
+    }
+
+    // Converts every clipboard image representation into the existing attachment input contract.
     static func imageProviders(from pasteboard: NSPasteboard) -> [NSItemProvider] {
+        var providers: [NSItemProvider] = []
+        for item in pasteboard.pasteboardItems ?? [] {
+            let imageTypes = item.types.filter { pasteboardType in
+                UTType(pasteboardType.rawValue)?.conforms(to: .image) == true
+            }
+            let preferredType = preferredImageTypeIdentifiers.lazy.compactMap { identifier in
+                imageTypes.first(where: { $0.rawValue == identifier })
+            }.first ?? imageTypes.first
+            if let preferredType, let data = item.data(forType: preferredType) {
+                let provider = NSItemProvider()
+                provider.registerDataRepresentation(
+                    forTypeIdentifier: preferredType.rawValue,
+                    visibility: .all
+                ) { completion in
+                    completion(data, nil)
+                    return nil
+                }
+                providers.append(provider)
+                continue
+            }
+
+            if let value = item.string(forType: .fileURL),
+               let url = URL(string: value),
+               url.isFileURL,
+               isImageFile(url),
+               let provider = NSItemProvider(contentsOf: url) {
+                provider.suggestedName = url.lastPathComponent
+                providers.append(provider)
+            }
+        }
+        if !providers.isEmpty {
+            return providers
+        }
+
         let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage] ?? []
         return images.map { NSItemProvider(object: $0) }
     }
 
-    // Sends image paste commands to the attachment pipeline while preserving native text paste.
-    override func paste(_ sender: Any?) {
-        let providers = Self.imageProviders(from: .general)
+    // Recognizes extension-based and extensionless image files copied from Finder.
+    private static func isImageFile(_ url: URL) -> Bool {
+        if let contentType = UTType(filenameExtension: url.pathExtension) {
+            return contentType.conforms(to: .image)
+        }
+        return (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType)?
+            .conforms(to: .image) == true
+    }
+
+    // Adds image attachments and inserts an accompanying plain-text representation at the selection.
+    @discardableResult
+    func handleImagePaste(from pasteboard: NSPasteboard) -> Bool {
+        let providers = Self.imageProviders(from: pasteboard)
         guard !providers.isEmpty else {
-            super.paste(sender)
-            return
+            return false
         }
         guard let onPasteImages else {
             preconditionFailure("PromptTextView image paste handler is not configured")
         }
+        if let text = pasteboard.string(forType: .string), !text.isEmpty {
+            insertText(text, replacementRange: selectedRange())
+        }
         onPasteImages(providers)
+        return true
+    }
+
+    // Sends image paste commands to the attachment pipeline while preserving native text paste.
+    override func paste(_ sender: Any?) {
+        if !handleImagePaste(from: .general) {
+            super.paste(sender)
+        }
     }
 
     // Preserves submit and slash-command navigation before passing ordinary editing keys to AppKit.
@@ -270,6 +343,7 @@ struct ChatView: View {
     let togglePanelZoom: () -> Void
     let presentGitActions: () -> Void
     let setPanelHidesOnDeactivate: (Bool) -> Void
+    @AppStorage(QuickPiTheme.storageKey) private var theme = QuickPiTheme.system
     @AppStorage("showSystemStatus") private var showSystemStatus = true
     @State private var promptFocused = false
     @State private var confirmsDeletingSessions = false
@@ -281,6 +355,12 @@ struct ChatView: View {
     @State private var modelMenuPresented = false
     @State private var resultScrollTracker = ResultScrollTracker()
     @State private var activeModal: AppModal?
+    @State private var editingAnswerID: UUID?
+    @State private var editedQuestion = ""
+    @State private var editingQueuedMessageID: String?
+    @State private var editedQueuedMessage = ""
+    @FocusState private var editedQuestionFocused: Bool
+    @FocusState private var editedQueuedMessageFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -293,7 +373,7 @@ struct ChatView: View {
             inputBar
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.white)
+        .background(Color.quickPiWindowBackground)
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -310,6 +390,18 @@ struct ChatView: View {
             case .git:
                 GitActionsView(state: state)
                     .dynamicTypeSize(.medium)
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { state.questionnairePrompt != nil },
+            set: { presented in
+                if !presented && state.questionnairePrompt != nil {
+                    state.cancelQuestionnaire()
+                }
+            }
+        )) {
+            if let prompt = state.questionnairePrompt {
+                QuestionnairePromptView(state: state, prompt: prompt)
             }
         }
         .sheet(isPresented: Binding(
@@ -358,7 +450,7 @@ struct ChatView: View {
                 Text("会话记录删除后无法恢复。")
             }
         }
-        .preferredColorScheme(.light)
+        .preferredColorScheme(theme.colorScheme)
         .task(id: "\(state.activeSessionID ?? "")\0\(state.scopePath)") {
             await state.refreshGitStatus()
         }
@@ -381,6 +473,22 @@ struct ChatView: View {
             if !state.slashCommandSuggestions.isEmpty {
                 modelMenuPresented = false
             }
+        }
+        .onChange(of: state.activeSessionID) { _, _ in
+            editingAnswerID = nil
+            editedQuestion = ""
+            editedQuestionFocused = false
+            editingQueuedMessageID = nil
+            editedQueuedMessage = ""
+            editedQueuedMessageFocused = false
+        }
+        .onChange(of: state.queuedMessages.map(\.id)) { _, ids in
+            guard let editingQueuedMessageID, !ids.contains(editingQueuedMessageID) else {
+                return
+            }
+            self.editingQueuedMessageID = nil
+            editedQueuedMessage = ""
+            editedQueuedMessageFocused = false
         }
     }
 
@@ -405,41 +513,21 @@ struct ChatView: View {
                 .background(.primary.opacity(0.025))
             }
 
-            if !state.attachments.isEmpty {
-                ScrollView(.horizontal) {
-                    HStack(spacing: 7) {
-                        ForEach(state.attachments) { attachment in
-                            HStack(spacing: 5) {
-                                Image(systemName: "doc")
-                                    .font(.caption)
-                                Text(attachment.name)
-                                    .font(.caption)
-                                    .lineLimit(1)
-                                Button {
-                                    state.removeAttachment(id: attachment.id)
-                                } label: {
-                                    Image(systemName: "xmark.circle.fill")
-                                }
-                                .buttonStyle(.plain)
-                                .help("移除附件")
+            VStack(spacing: 0) {
+                if !state.attachments.isEmpty {
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 8) {
+                            ForEach(state.attachments) { attachment in
+                                inputAttachmentView(attachment)
                             }
-                            .foregroundStyle(.secondary)
-                            .padding(.leading, 9)
-                            .padding(.trailing, 6)
-                            .frame(height: 26)
-                            .background(
-                                .primary.opacity(0.055),
-                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            )
                         }
+                        .padding(.horizontal, 8)
                     }
-                    .padding(.horizontal, 18)
+                    .scrollIndicators(.hidden)
+                    .frame(height: 52)
                 }
-                .scrollIndicators(.hidden)
-                .frame(height: 38)
-            }
 
-            HStack(spacing: 8) {
+                HStack(spacing: 8) {
                 Button {
                     chooseAttachments()
                 } label: {
@@ -620,10 +708,11 @@ struct ChatView: View {
                 }
 
             }
-            .padding(.horizontal, 8)
-            .frame(minHeight: 44)
+                .padding(.horizontal, 8)
+                .frame(minHeight: 44)
+            }
             .background(
-                Color.white,
+                Color.quickPiControlBackground,
                 in: RoundedRectangle(cornerRadius: 14, style: .continuous)
             )
             .overlay {
@@ -658,6 +747,50 @@ struct ChatView: View {
             }
         }
         .frame(height: state.inputEditorBarHeight)
+    }
+
+    private func inputAttachmentView(_ attachment: PendingAttachment) -> some View {
+        HStack(spacing: 7) {
+            switch attachment.content {
+            case let .image(data, _):
+                if let image = NSImage(data: data) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.medium)
+                        .scaledToFill()
+                        .frame(width: 34, height: 34)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                } else {
+                    Image(systemName: "photo")
+                        .frame(width: 34, height: 34)
+                }
+            case .text:
+                Image(systemName: "doc.text")
+                    .font(.system(size: 17))
+                    .frame(width: 28, height: 34)
+            }
+
+            Text(attachment.name)
+                .font(.caption)
+                .lineLimit(2)
+                .frame(maxWidth: 116, alignment: .leading)
+
+            Button {
+                state.removeAttachment(id: attachment.id)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .help("移除附件")
+        }
+        .foregroundStyle(.secondary)
+        .padding(.leading, 5)
+        .padding(.trailing, 6)
+        .frame(height: 42)
+        .background(
+            .primary.opacity(0.055),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
     }
 
     private var slashCommandMenu: some View {
@@ -1005,14 +1138,14 @@ struct ChatView: View {
                     planPresented.toggle()
                 } label: {
                     HStack(spacing: 5) {
-                        Text(planStatus.text)
+                        PlanStatusTextView(status: planStatus)
                             .lineLimit(1)
                         Spacer(minLength: 0)
                         Image(systemName: "chevron.down")
                             .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
                     }
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 9)
                     .frame(width: 104, height: 28, alignment: .leading)
                     .background(
@@ -1029,8 +1162,7 @@ struct ChatView: View {
                         HStack(spacing: 8) {
                             Label("Plan 进度", systemImage: "list.bullet.clipboard")
                             Spacer()
-                            Text(planStatus.text)
-                                .foregroundStyle(.secondary)
+                            PlanStatusTextView(status: planStatus)
                         }
                         .font(.caption.weight(.medium))
                         .padding(.horizontal, 12)
@@ -1043,11 +1175,16 @@ struct ChatView: View {
                         }) {
                             ScrollView(.vertical) {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    ForEach(Array(planWidget.lines.enumerated()), id: \.offset) { _, line in
-                                        Text(line)
-                                            .font(.system(size: 13))
-                                            .lineLimit(2)
-                                            .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+                                    ForEach(Array(planWidget.lines.enumerated()), id: \.offset) { index, line in
+                                        PlanProgressLineView(
+                                            source: line,
+                                            richText: planWidget.richLines.flatMap {
+                                                $0.indices.contains(index) ? $0[index] : nil
+                                            },
+                                            baseURL: state.activeWorkingDirectoryURL
+                                        )
+                                        .lineLimit(2)
+                                        .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
                                     }
                                 }
                                 .padding(12)
@@ -1141,11 +1278,22 @@ struct ChatView: View {
             Button {
                 Task { await state.createSession(usesIndependentWorktree: false) }
             } label: {
-                Image(systemName: "square.and.pencil")
+                HStack(spacing: 6) {
+                    Image(systemName: "plus")
+                    Text("新建会话")
+                }
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .frame(width: 96, height: 30)
+                .background(
+                    .primary.opacity(0.055),
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                )
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .frame(width: 30, height: 28)
-            .foregroundStyle(.secondary)
+            .frame(width: 96, height: 30)
             .disabled(
                 state.activeSessionID == nil
                     || state.runtimeStarting
@@ -1180,10 +1328,20 @@ struct ChatView: View {
                                     id: \.element.id
                                 ) { index, answer in
                                     let toolGroups = toolActivityGroupsByCallID(in: answer.sections)
+                                    let hasRunningTool = answer.sections.contains { section in
+                                        if case .tool(let tool) = section.content {
+                                            return tool.status == .running
+                                        }
+                                        return false
+                                    }
 
                                     VStack(alignment: .leading, spacing: 16) {
                                         if let question = answer.question {
-                                            questionView(question)
+                                            questionView(
+                                                question,
+                                                answerID: answer.id,
+                                                entryID: answer.cloneEntryId
+                                            )
                                         }
 
                                         VStack(alignment: .leading, spacing: 12) {
@@ -1196,17 +1354,18 @@ struct ChatView: View {
                                                 )
                                             }
 
-                                            if answer.id == state.answer?.id
-                                                && answer.sections.isEmpty
-                                                && state.isAnswering {
+                                            if answer.id == state.answer?.id && state.isAnswering {
                                                 HStack(spacing: 8) {
                                                     ProgressView()
                                                         .controlSize(.small)
                                                     Text(
                                                         answer.status == .waiting
                                                             ? "正在连接模型"
-                                                            : "正在思考"
+                                                            : hasRunningTool
+                                                                ? "正在调用工具"
+                                                                : "正在思考"
                                                     )
+                                                    .font(.system(size: QuickPiTypography.supportingSize))
                                                     .foregroundStyle(.secondary)
                                                 }
                                             }
@@ -1224,7 +1383,7 @@ struct ChatView: View {
                                                     .textSelection(.enabled)
                                             } else if answer.status == .stopped {
                                                 Label("已停止", systemImage: "stop.circle")
-                                                    .font(.caption)
+                                                    .font(.system(size: QuickPiTypography.supportingSize))
                                                     .foregroundStyle(.secondary)
                                             }
 
@@ -1303,41 +1462,9 @@ struct ChatView: View {
                                     }
                                 }
 
-                                let queuedMessages = state.queuedSteeringMessages.map {
-                                    (text: $0, steering: true)
-                                } + state.queuedFollowUpMessages.map {
-                                    (text: $0, steering: false)
-                                }
-                                ForEach(Array(queuedMessages.enumerated()), id: \.offset) { _, message in
-                                    HStack(alignment: .top) {
-                                        Spacer(minLength: 120)
-
-                                        VStack(alignment: .trailing, spacing: 6) {
-                                            Text(message.text)
-                                                .font(.system(size: chatMessageFontSize))
-                                                .lineSpacing(3)
-                                                .lineLimit(3)
-                                                .truncationMode(.tail)
-                                                .textSelection(.enabled)
-                                                .padding(.horizontal, 13)
-                                                .padding(.vertical, 10)
-                                                .background(
-                                                    Color.secondary.opacity(0.08),
-                                                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                )
-                                                .help(message.text)
-
-                                            Label(
-                                                message.steering ? "将插队" : "已排队",
-                                                systemImage: message.steering
-                                                    ? "arrowshape.turn.up.right.fill"
-                                                    : "clock"
-                                            )
-                                            .font(.caption)
-                                            .foregroundStyle(message.steering ? Color.orange : Color.secondary)
-                                        }
-                                    }
-                                    .padding(.top, 14)
+                                ForEach(state.queuedMessages) { message in
+                                    queuedMessageView(message)
+                                        .padding(.top, 14)
                                 }
 
                                 if let runtimeError = state.runtimeError {
@@ -1383,7 +1510,7 @@ struct ChatView: View {
                             proxy.scrollTo("result-bottom", anchor: .bottom)
                         }
                     }
-                    .onChange(of: state.queuedSteeringMessages + state.queuedFollowUpMessages) { _, _ in
+                    .onChange(of: state.queuedMessages) { _, _ in
                         let shouldFollow = resultScrollTracker.followsPendingAnswerChange
                         resultScrollTracker.followsPendingAnswerChange = false
                         guard shouldFollow else {
@@ -1398,24 +1525,199 @@ struct ChatView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.white)
+        .background(Color.quickPiWindowBackground)
     }
 
-    // Renders the submitted question and attachment names without session-directory metadata.
-    private func questionView(_ question: SubmittedQuestion) -> some View {
-        HStack(alignment: .top) {
+    // Keeps one pending message editable until the extension hands it to Pi for delivery.
+    private func queuedMessageView(_ message: QueuedUserMessage) -> some View {
+        let isEditing = editingQueuedMessageID == message.id
+        let editLineCount = max(
+            editedQueuedMessage.split(separator: "\n", omittingEmptySubsequences: false).count,
+            2
+        )
+        let editHeight = min(max(CGFloat(editLineCount) * 22 + 18, 68), 170)
+
+        return HStack(alignment: .top) {
             Spacer(minLength: 120)
 
             VStack(alignment: .trailing, spacing: 6) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(question.text)
-                        .font(.system(size: chatMessageFontSize))
-                        .lineSpacing(3)
-                        .textSelection(.enabled)
-                    if !question.attachmentNames.isEmpty {
-                        Label(question.attachmentNames.joined(separator: " · "), systemImage: "paperclip")
+                    if isEditing {
+                        TextEditor(text: $editedQueuedMessage)
+                            .font(.system(size: chatMessageFontSize))
+                            .lineSpacing(3)
+                            .scrollContentBackground(.hidden)
+                            .focused($editedQueuedMessageFocused)
+                            .frame(height: editHeight)
+                    } else {
+                        Text(message.text)
+                            .font(.system(size: chatMessageFontSize))
+                            .lineSpacing(3)
+                            .lineLimit(3)
+                            .truncationMode(.tail)
+                            .textSelection(.enabled)
+                            .help(message.text)
+                    }
+                    if !message.attachments.isEmpty {
+                        messageAttachmentsView(message.attachments)
+                    } else if !message.attachmentNames.isEmpty {
+                        Label(message.attachmentNames.joined(separator: " · "), systemImage: "paperclip")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 13)
+                .padding(.vertical, 10)
+                .background(
+                    Color.secondary.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(
+                            isEditing ? Color.accentColor.opacity(0.45) : Color.clear,
+                            lineWidth: isEditing ? 1.5 : 0
+                        )
+                }
+
+                HStack(spacing: 10) {
+                    Label(
+                        message.isSteering ? "将插队" : "已排队",
+                        systemImage: message.isSteering
+                            ? "arrowshape.turn.up.right.fill"
+                            : "clock"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(message.isSteering ? Color.orange : Color.secondary)
+
+                    if isEditing {
+                        Button {
+                            editingQueuedMessageID = nil
+                            editedQueuedMessage = ""
+                            editedQueuedMessageFocused = false
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .help("取消编辑")
+
+                        Button {
+                            let replacement = editedQueuedMessage
+                            Task {
+                                if await state.editQueuedMessage(
+                                    id: message.id,
+                                    replacement: replacement
+                                ) {
+                                    editingQueuedMessageID = nil
+                                    editedQueuedMessage = ""
+                                    editedQueuedMessageFocused = false
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .disabled(
+                            editedQueuedMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || state.promptSubmissionRunning
+                        )
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .help("保存队列消息")
+                    } else if message.editable {
+                        Button {
+                            editingAnswerID = nil
+                            editedQuestion = ""
+                            editedQuestionFocused = false
+                            editingQueuedMessageID = message.id
+                            editedQueuedMessage = message.text
+                            Task { @MainActor in
+                                editedQueuedMessageFocused = true
+                            }
+                        } label: {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .disabled(state.promptSubmissionRunning || editingQueuedMessageID != nil)
+                        .help("编辑队列消息")
+
+                        Button {
+                            Task { await state.cancelQueuedMessage(id: message.id) }
+                        } label: {
+                            Image(systemName: "xmark.circle")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .disabled(state.promptSubmissionRunning)
+                        .help("取消发送")
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func messageAttachmentsView(_ attachments: [MessageAttachment]) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            ForEach(attachments) { attachment in
+                VStack(alignment: .leading, spacing: 4) {
+                    if attachment.kind == .image,
+                       let data = attachment.data,
+                       let image = NSImage(data: data) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .interpolation(.medium)
+                            .scaledToFill()
+                            .frame(width: 72, height: 64)
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    } else {
+                        Image(systemName: attachment.kind == .image ? "photo" : "doc.text")
+                            .font(.system(size: 22))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 72, height: 64)
+                            .background(.primary.opacity(0.045))
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    Text(attachment.name)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .frame(width: 72, alignment: .leading)
+                }
+                .help(attachment.name)
+            }
+        }
+    }
+
+    // Edits a persisted question in place before Pi replaces the active branch from that turn.
+    private func questionView(
+        _ question: SubmittedQuestion,
+        answerID: UUID,
+        entryID: String?
+    ) -> some View {
+        let isEditing = editingAnswerID == answerID
+        let editLineCount = max(editedQuestion.split(separator: "\n", omittingEmptySubsequences: false).count, 2)
+        let editHeight = min(max(CGFloat(editLineCount) * 22 + 18, 68), 170)
+
+        return HStack(alignment: .top) {
+            Spacer(minLength: 120)
+
+            VStack(alignment: .trailing, spacing: 6) {
+                VStack(alignment: .leading, spacing: 5) {
+                    if isEditing {
+                        TextEditor(text: $editedQuestion)
+                            .font(.system(size: chatMessageFontSize))
+                            .lineSpacing(3)
+                            .scrollContentBackground(.hidden)
+                            .focused($editedQuestionFocused)
+                            .frame(height: editHeight)
+                    } else {
+                        Text(question.text)
+                            .font(.system(size: chatMessageFontSize))
+                            .lineSpacing(3)
+                            .textSelection(.enabled)
+                    }
+                    if !question.attachments.isEmpty {
+                        messageAttachmentsView(question.attachments)
                     }
                 }
                 .padding(.horizontal, 13)
@@ -1426,53 +1728,130 @@ struct ChatView: View {
                 )
                 .overlay {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Color.accentColor.opacity(0.12))
+                        .stroke(
+                            isEditing
+                                ? Color.accentColor.opacity(0.45)
+                                : Color.accentColor.opacity(0.12),
+                            lineWidth: isEditing ? 1.5 : 1
+                        )
                 }
 
-                Button {
-                    copy(question.text)
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                        .font(.system(size: 12, weight: .medium))
+                HStack(spacing: 10) {
+                    if isEditing, let entryID {
+                        Button {
+                            editingAnswerID = nil
+                            editedQuestion = ""
+                            editedQuestionFocused = false
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .buttonStyle(.plain)
+                        .frame(width: 24, height: 24)
+                        .help("取消编辑")
+
+                        Button {
+                            let replacement = editedQuestion
+                            Task {
+                                if await state.editMessage(entryId: entryID, replacement: replacement) {
+                                    editingAnswerID = nil
+                                    editedQuestion = ""
+                                    editedQuestionFocused = false
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .frame(width: 24, height: 24)
+                        .disabled(
+                            editedQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || state.sessionChanging
+                        )
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .help("提交编辑并重新回答")
+                    } else {
+                        Button {
+                            copy(question.text)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .buttonStyle(.plain)
+                        .frame(width: 24, height: 24)
+                        .help("复制问题")
+
+                        if entryID != nil {
+                            Button {
+                                editingAnswerID = answerID
+                                editedQuestion = question.text
+                                Task { @MainActor in
+                                    editedQuestionFocused = true
+                                }
+                            } label: {
+                                Image(systemName: "pencil")
+                                    .font(.system(size: 12, weight: .medium))
+                            }
+                            .buttonStyle(.plain)
+                            .frame(width: 24, height: 24)
+                            .disabled(
+                                !state.runtimeReady
+                                    || state.isBusy
+                                    || state.sessionChanging
+                                    || editingAnswerID != nil
+                                    || editingQueuedMessageID != nil
+                            )
+                            .help("编辑此问题并重新回答")
+                        }
+                    }
                 }
-                .buttonStyle(.plain)
-                .frame(width: 24, height: 24)
                 .foregroundStyle(.secondary)
-                .help("复制问题")
             }
         }
     }
 
-    // Shows model, detailed token usage, cost, and non-normal stop metadata after assistant turns arrive.
+    // Keeps model and total tokens together, followed by detailed usage and exceptional metadata.
     @ViewBuilder
     private func answerMetadata(_ answer: AnswerSession) -> some View {
         if answer.model != nil || answer.usage.totalTokens > 0 || answer.stopReason == "length" {
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     if let model = answer.model {
                         Text(model)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .layoutPriority(1)
+                    }
+                    if answer.usage.totalTokens > 0 {
+                        Text("总 Token \(answer.usage.totalTokens.formatted())")
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .layoutPriority(2)
                     }
                     if answer.usage.cost > 0 {
                         Text(answer.usage.cost, format: .currency(code: "USD"))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     if answer.stopReason == "length" {
                         Label("达到输出上限", systemImage: "exclamationmark.triangle")
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                             .foregroundStyle(.orange)
                     }
                 }
 
                 if answer.usage.totalTokens > 0 {
                     Text(
-                        "Token：总计 \(answer.usage.totalTokens.formatted())"
-                            + " · 输入 \(answer.usage.input.formatted())"
+                        "输入 \(answer.usage.input.formatted())"
                             + " · 输出 \(answer.usage.output.formatted())"
                             + " · 缓存读取 \(answer.usage.cacheRead.formatted())"
-                            + " · 缓存写入 \(answer.usage.cacheWrite.formatted())"
                     )
                     .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .font(.caption2)
+            .font(.system(size: QuickPiTypography.metadataSize))
             .foregroundStyle(.tertiary)
             .textSelection(.enabled)
         }
@@ -1546,6 +1925,61 @@ private enum GitAction: String, CaseIterable, Identifiable {
     }
 }
 
+private enum GitButtonProminence: Equatable {
+    case standard
+    case primary
+}
+
+private struct GitButtonStyle: ButtonStyle {
+    var prominence = GitButtonProminence.standard
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        let isPrimary = prominence == .primary
+        configuration.label
+            .font(.system(size: QuickPiTypography.settingsSize, weight: .medium))
+            .foregroundStyle(isPrimary ? Color.white : Color.primary)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 32)
+            .background(
+                isPrimary
+                    ? Color.accentColor.opacity(configuration.isPressed ? 0.78 : 1)
+                    : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(
+                        isPrimary ? Color.clear : Color.primary.opacity(0.14),
+                        lineWidth: 1
+                    )
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .opacity(isEnabled ? 1 : 0.45)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+private struct GitIconButtonStyle: ButtonStyle {
+    var tint = Color.secondary
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(tint)
+            .frame(width: 30, height: 30)
+            .background(Color.clear)
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .opacity(isEnabled ? (configuration.isPressed ? 0.65 : 1) : 0.4)
+    }
+}
+
 struct GitActionsView: View {
     @ObservedObject var state: AppState
     @Environment(\.dismiss) private var dismiss
@@ -1582,73 +2016,19 @@ struct GitActionsView: View {
         VStack(alignment: .leading, spacing: 0) {
             gitHeader
             Divider()
+            gitActionTabs
+            Divider()
 
-            HStack(spacing: 0) {
-                VStack(spacing: 4) {
-                    ForEach(GitAction.allCases) { action in
-                        Button {
-                            selectedAction = action
-                            feedback = nil
-                        } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: action.systemImage)
-                                    .frame(width: 16)
-                                Text(action.title)
-                                Spacer(minLength: 8)
-                            }
-                            .padding(.horizontal, 10)
-                            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
-                            .contentShape(Rectangle())
-                            .background(
-                                action == selectedAction
-                                    ? Color.accentColor.opacity(0.12)
-                                    : Color.clear,
-                                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(action == selectedAction ? Color.accentColor : Color.primary)
-                        .disabled(state.activeGitStatus == nil)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .padding(8)
-                .frame(width: 148, height: 388, alignment: .top)
-                .background(.primary.opacity(0.025))
-
-                Divider()
-
-                selectedContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            }
-            .frame(height: 388)
+            selectedContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
             Divider()
-            Group {
-                if let feedback {
-                    Text(feedback)
-                        .foregroundStyle(feedbackIsError ? Color.red : Color.secondary)
-                        .help(feedback)
-                } else if let status = state.activeGitStatus {
-                    Text("\(status.changedFileCount) 个改动文件")
-                        .foregroundStyle(.secondary)
-                } else if state.activeGitStatusLoading {
-                    Text("正在读取 Git 状态")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(state.activeGitStatusError ?? "Git 状态不可用")
-                        .foregroundStyle(.red)
-                        .help(state.activeGitStatusError ?? "Git 状态不可用")
-                }
-            }
-            .font(.caption)
-            .lineLimit(2)
-            .padding(.horizontal, 12)
-            .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+            gitFooter
         }
-        .frame(width: 680, height: 486)
-        .background(Color.white)
-        .preferredColorScheme(.light)
+        .buttonStyle(GitButtonStyle())
+        .font(.system(size: QuickPiTypography.settingsSize))
+        .frame(width: 760, height: 540)
+        .background(Color.quickPiWindowBackground)
         .interactiveDismissDisabled(state.gitOperationRunning)
         .task(id: "\(state.activeSessionID ?? "")\0\(state.scopePath)") {
             feedback = nil
@@ -1661,27 +2041,41 @@ struct GitActionsView: View {
     }
 
     private var gitHeader: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: 12) {
             Image(systemName: "arrow.triangle.branch")
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(state.activeGitStatus.map { $0.branch ?? "detached HEAD" } ?? "Git")
-                    .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 24)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(state.activeWorkingDirectoryURL.lastPathComponent)
+                    .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
                     .lineLimit(1)
-                if let upstream = state.activeGitStatus?.upstream {
-                    Text(upstream)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+
+                HStack(spacing: 6) {
+                    Text(state.activeGitStatus.map { $0.branch ?? "detached HEAD" } ?? "Git")
+                    if let upstream = state.activeGitStatus?.upstream {
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(upstream)
+                    }
                 }
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
+
             Spacer(minLength: 12)
+
             if let status = state.activeGitStatus, status.hasChanges {
-                Text("+\(status.additions)")
-                    .foregroundStyle(.green)
-                Text("-\(status.deletions)")
-                    .foregroundStyle(.red)
+                HStack(spacing: 10) {
+                    Text("+\(status.additions)")
+                        .foregroundStyle(.green)
+                    Text("-\(status.deletions)")
+                        .foregroundStyle(.red)
+                }
+                .monospacedDigit()
             }
+
             Button {
                 feedback = nil
                 Task {
@@ -1696,24 +2090,80 @@ struct GitActionsView: View {
                     Image(systemName: "arrow.clockwise")
                 }
             }
-            .buttonStyle(.plain)
-            .frame(width: 26, height: 26)
+            .buttonStyle(GitIconButtonStyle())
             .disabled(state.activeGitStatusLoading || state.gitOperationRunning)
             .help("刷新 Git 状态")
+
             Button {
                 dismiss()
             } label: {
-                Image(systemName: "xmark.circle.fill")
+                Image(systemName: "xmark")
             }
-            .buttonStyle(.plain)
-            .frame(width: 26, height: 26)
-            .foregroundStyle(.secondary)
+            .buttonStyle(GitIconButtonStyle())
             .disabled(state.gitOperationRunning)
             .help("关闭 Git")
         }
-        .font(.caption.monospacedDigit())
-        .padding(.horizontal, 12)
-        .frame(height: 50)
+        .padding(.horizontal, 18)
+        .frame(height: 62)
+    }
+
+    private var gitActionTabs: some View {
+        HStack(spacing: 0) {
+            ForEach(GitAction.allCases) { action in
+                Button {
+                    selectedAction = action
+                    feedback = nil
+                } label: {
+                    Label(action.title, systemImage: action.systemImage)
+                        .font(.system(size: QuickPiTypography.settingsSize, weight: .medium))
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .contentShape(Rectangle())
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(action == selectedAction ? Color.accentColor : Color.clear)
+                                .frame(height: 2)
+                        }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(action == selectedAction ? Color.accentColor : Color.secondary)
+                .background(action == selectedAction ? Color.accentColor.opacity(0.06) : Color.clear)
+                .disabled(state.activeGitStatus == nil)
+            }
+        }
+        .frame(height: 44)
+    }
+
+    private var gitFooter: some View {
+        HStack(spacing: 8) {
+            if let feedback {
+                Image(systemName: feedbackIsError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                    .foregroundStyle(feedbackIsError ? Color.red : Color.green)
+                Text(feedback)
+                    .foregroundStyle(feedbackIsError ? Color.red : Color.secondary)
+                    .help(feedback)
+            } else if let status = state.activeGitStatus {
+                Image(systemName: status.hasChanges ? "circle.fill" : "checkmark.circle.fill")
+                    .font(.system(size: status.hasChanges ? 7 : 14))
+                    .foregroundStyle(status.hasChanges ? Color.orange : Color.green)
+                Text(status.hasChanges ? "\(status.changedFileCount) 个改动文件" : "工作树已同步")
+                    .foregroundStyle(.secondary)
+            } else if state.activeGitStatusLoading {
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在读取 Git 状态")
+                    .foregroundStyle(.secondary)
+            } else {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundStyle(.red)
+                Text(state.activeGitStatusError ?? "Git 状态不可用")
+                    .foregroundStyle(.red)
+                    .help(state.activeGitStatusError ?? "Git 状态不可用")
+            }
+            Spacer(minLength: 0)
+        }
+        .lineLimit(2)
+        .padding(.horizontal, 18)
+        .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
     }
 
     @ViewBuilder
@@ -1734,24 +2184,54 @@ struct GitActionsView: View {
         }
     }
 
+    private func sectionTitle(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
+    }
+
+    private func gitDetailRow(_ title: String, value: String) -> some View {
+        HStack(spacing: 16) {
+            Text(title)
+                .foregroundStyle(.secondary)
+                .frame(width: 86, alignment: .leading)
+            Text(value)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 9)
+    }
+
     private var commitContent: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("提交更改")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("提交更改", systemImage: "checkmark.circle")
+
             TextField("提交信息（留空时由当前模型生成）", text: $commitMessage, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
+                .textFieldStyle(.plain)
                 .lineLimit(2...4)
+                .padding(10)
+                .background(
+                    Color.quickPiControlBackground,
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                }
                 .disabled(state.gitOperationRunning)
+
             Toggle("包含未暂存的更改", isOn: $includesUnstaged)
                 .toggleStyle(.checkbox)
                 .disabled(state.gitOperationRunning)
-            HStack(spacing: 10) {
+
+            HStack(spacing: 8) {
                 Button {
                     Task { await commit(pushAfterCommit: false) }
                 } label: {
                     Label("提交", systemImage: "checkmark.circle")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(GitButtonStyle(prominence: .primary))
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(!canCommit)
 
@@ -1760,65 +2240,88 @@ struct GitActionsView: View {
                 } label: {
                     Label("提交并推送", systemImage: "arrow.up.circle")
                 }
-                .buttonStyle(.bordered)
                 .disabled(!canCommit || state.activeGitStatus?.canPush != true)
             }
+
             if let status = state.activeGitStatus {
-                Text(status.hasStagedChanges ? "暂存区有待提交更改" : "暂存区没有待提交更改")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Label(
+                    status.hasStagedChanges ? "暂存区有待提交更改" : "暂存区没有待提交更改",
+                    systemImage: status.hasStagedChanges ? "tray.full" : "tray"
+                )
+                .foregroundStyle(.secondary)
             }
+
             Spacer(minLength: 0)
         }
-        .padding(16)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
     }
 
     private var pushContent: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("推送分支")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("推送分支", systemImage: "icloud.and.arrow.up")
+
             if let status = state.activeGitStatus {
-                LabeledContent("当前分支", value: status.branch ?? "detached HEAD")
-                LabeledContent("上游分支", value: status.upstream ?? "未设置")
+                VStack(spacing: 0) {
+                    gitDetailRow("当前分支", value: status.branch ?? "detached HEAD")
+                    Divider()
+                    gitDetailRow("上游分支", value: status.upstream ?? "未设置")
+                }
             }
+
             Button {
                 Task { await push() }
             } label: {
                 Label("推送", systemImage: "icloud.and.arrow.up")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(GitButtonStyle(prominence: .primary))
             .disabled(operationDisabled || state.activeGitStatus?.canPush != true)
+
             Spacer(minLength: 0)
         }
-        .padding(16)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
     }
 
     private var createBranchContent: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("新建分支")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("新建分支", systemImage: "plus")
+
             TextField("分支名称", text: $newBranchName)
-                .textFieldStyle(.roundedBorder)
+                .textFieldStyle(.plain)
+                .padding(.horizontal, 10)
+                .frame(minHeight: 36)
+                .background(
+                    Color.quickPiControlBackground,
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                }
                 .disabled(state.gitOperationRunning)
+
             Button {
                 Task { await createBranch() }
             } label: {
                 Label("创建并切换", systemImage: "arrow.triangle.branch")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(GitButtonStyle(prominence: .primary))
             .disabled(
                 operationDisabled
                     || newBranchName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             )
+
             Spacer(minLength: 0)
         }
-        .padding(16)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
     }
 
     private var switchBranchContent: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("切换本地分支")
-                .font(.headline)
+            sectionTitle("切换本地分支", systemImage: "arrow.left.arrow.right")
+
             if contentLoading {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1828,22 +2331,40 @@ struct GitActionsView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView(.vertical) {
-                    LazyVStack(spacing: 2) {
+                    LazyVStack(spacing: 0) {
                         ForEach(localBranches) { branch in
                             Button {
                                 Task { await switchBranch(to: branch) }
                             } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: branch.isCurrent ? "checkmark" : "arrow.triangle.branch")
-                                        .frame(width: 16)
+                                HStack(spacing: 10) {
+                                    Image(
+                                        systemName: branch.isCurrent
+                                            ? "checkmark.circle.fill"
+                                            : "arrow.triangle.branch"
+                                    )
+                                    .foregroundStyle(branch.isCurrent ? Color.accentColor : Color.secondary)
+                                    .frame(width: 18)
+
                                     Text(branch.name)
                                         .lineLimit(1)
                                         .truncationMode(.middle)
+
                                     Spacer(minLength: 8)
+
+                                    if branch.isCurrent {
+                                        Text("当前")
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
-                                .padding(.horizontal, 8)
-                                .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                                .padding(.horizontal, 10)
+                                .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
                                 .contentShape(Rectangle())
+                                .background(branch.isCurrent ? Color.accentColor.opacity(0.06) : Color.clear)
+                                .overlay(alignment: .bottom) {
+                                    Rectangle()
+                                        .fill(Color.primary.opacity(0.08))
+                                        .frame(height: 1)
+                                }
                             }
                             .buttonStyle(.plain)
                             .disabled(branch.isCurrent || operationDisabled)
@@ -1853,25 +2374,25 @@ struct GitActionsView: View {
                 .scrollIndicators(.visible)
             }
         }
-        .padding(16)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
     }
 
     private var diffContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("工作树 Diff")
-                    .font(.headline)
+                sectionTitle("工作树 Diff", systemImage: "doc.text.magnifyingglass")
                 Spacer()
                 Button {
                     copyDiff()
                 } label: {
                     Image(systemName: "doc.on.doc")
                 }
-                .buttonStyle(.plain)
-                .frame(width: 26, height: 26)
+                .buttonStyle(GitIconButtonStyle())
                 .disabled(diffSnapshot?.text.isEmpty != false)
                 .help("复制 Diff")
             }
+
             if contentLoading {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1879,54 +2400,66 @@ struct GitActionsView: View {
                 if diffSnapshot.text.isEmpty {
                     Text("没有已跟踪文件差异")
                         .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: diffSnapshot.untrackedFiles.isEmpty ? 275 : 160)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ScrollView([.horizontal, .vertical]) {
                         Text(diffSnapshot.text)
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.system(size: QuickPiTypography.settingsSize, design: .monospaced))
                             .textSelection(.enabled)
                             .fixedSize(horizontal: true, vertical: true)
-                            .padding(8)
+                            .padding(10)
                     }
                     .scrollIndicators(.visible)
-                    .frame(height: diffSnapshot.untrackedFiles.isEmpty ? 275 : 160)
-                    .background(.primary.opacity(0.035))
+                    .frame(
+                        maxWidth: .infinity,
+                        maxHeight: diffSnapshot.untrackedFiles.isEmpty ? .infinity : 180
+                    )
+                    .background(
+                        Color.primary.opacity(0.025),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(Color.primary.opacity(0.10), lineWidth: 1)
+                    }
                 }
+
                 if diffSnapshot.isTruncated {
                     Text("Diff 输出过大，仅显示前 200,000 个字符")
-                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
                 if !diffSnapshot.untrackedFiles.isEmpty {
                     Text("未跟踪文件（\(diffSnapshot.untrackedFileCount)）")
-                        .font(.caption.weight(.semibold))
+                        .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
+
                     ScrollView(.vertical) {
-                        LazyVStack(alignment: .leading, spacing: 3) {
+                        LazyVStack(alignment: .leading, spacing: 4) {
                             ForEach(diffSnapshot.untrackedFiles, id: \.self) { path in
                                 Text(path)
-                                    .font(.caption.monospaced())
+                                    .font(.system(size: QuickPiTypography.settingsSize, design: .monospaced))
                                     .textSelection(.enabled)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxHeight: 55)
+                    .frame(maxHeight: 70)
+
                     if diffSnapshot.untrackedFileCount > diffSnapshot.untrackedFiles.count {
                         Text("仅显示前 \(diffSnapshot.untrackedFiles.count) 个未跟踪文件")
-                            .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
             }
         }
-        .padding(16)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
     }
 
     private var logContent: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("最近提交")
-                .font(.headline)
+            sectionTitle("最近提交", systemImage: "clock.arrow.circlepath")
+
             if contentLoading {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1938,34 +2471,42 @@ struct GitActionsView: View {
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
                         ForEach(logEntries) { entry in
-                            HStack(alignment: .top, spacing: 10) {
+                            HStack(alignment: .top, spacing: 12) {
                                 Text(entry.shortCommitID)
-                                    .font(.caption.monospaced())
+                                    .font(.system(size: QuickPiTypography.settingsSize, design: .monospaced))
                                     .foregroundStyle(Color.accentColor)
                                     .textSelection(.enabled)
-                                    .frame(width: 72, alignment: .leading)
-                                VStack(alignment: .leading, spacing: 3) {
+                                    .frame(width: 84, alignment: .leading)
+
+                                VStack(alignment: .leading, spacing: 5) {
                                     Text(entry.subject)
                                         .lineLimit(2)
                                         .textSelection(.enabled)
-                                    Text(entry.author)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer(minLength: 8)
-                                Text(entry.date)
-                                    .font(.caption2.monospacedDigit())
+
+                                    HStack(spacing: 12) {
+                                        Text(entry.author)
+                                        Spacer(minLength: 8)
+                                        Text(entry.date)
+                                            .monospacedDigit()
+                                    }
                                     .foregroundStyle(.secondary)
+                                }
                             }
-                            .padding(.vertical, 8)
-                            Divider()
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 10)
+                            .overlay(alignment: .bottom) {
+                                Rectangle()
+                                    .fill(Color.primary.opacity(0.08))
+                                    .frame(height: 1)
+                            }
                         }
                     }
                 }
                 .scrollIndicators(.visible)
             }
         }
-        .padding(16)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
     }
 
     // Reloads repository status and exposes the exact Git error in the fixed footer.
@@ -2499,7 +3040,14 @@ private struct SystemStatusView: View {
             .monospacedDigit()
             .lineLimit(1)
             .padding(.horizontal, 8)
-            .frame(width: 190, height: 28, alignment: .leading)
+            .frame(
+                minWidth: 150,
+                idealWidth: 190,
+                maxWidth: 190,
+                minHeight: 28,
+                maxHeight: 28,
+                alignment: .leading
+            )
             .background(
                 .primary.opacity(0.055),
                 in: RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -2507,7 +3055,7 @@ private struct SystemStatusView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .frame(width: 190)
+        .frame(minWidth: 150, idealWidth: 190, maxWidth: 190)
         .help("查看系统状态详情")
         .popover(isPresented: $detailsPresented, arrowEdge: .top) {
             VStack(alignment: .leading, spacing: 12) {
@@ -2622,6 +3170,259 @@ private struct SystemStatusView: View {
     }
 }
 
+private struct QuestionnairePromptView: View {
+    @ObservedObject var state: AppState
+    let prompt: QuestionnairePrompt
+    @State private var questionIndex = 0
+    @State private var answers: [String: QuestionnaireAnswer] = [:]
+    @State private var customInput = ""
+    @State private var customQuestionID: String?
+    @FocusState private var customInputFocused: Bool
+
+    private var questions: [QuestionnaireDefinition.Question] {
+        prompt.definition.questions
+    }
+
+    private var question: QuestionnaireDefinition.Question {
+        questions[questionIndex]
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ScrollView {
+                VStack(spacing: 10) {
+                    ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
+                        PromptChoiceRow(
+                            number: index + 1,
+                            title: option.label,
+                            description: option.description,
+                            recommended: option.recommended == true,
+                            selected: answers[question.id]?.index == index + 1
+                        ) {
+                            select(option: option, index: index)
+                        }
+                    }
+                    if question.allowOther {
+                        customAnswerRow
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 18)
+            }
+            Divider()
+            HStack {
+                Spacer()
+                Button("跳过") {
+                    skipQuestion()
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 10)
+        }
+        .frame(width: 720, height: 460)
+        .background(Color.quickPiWindowBackground)
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 20) {
+            Text(question.prompt)
+                .font(.system(size: 17, weight: .semibold))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 8) {
+                questionnaireNavigationButton(
+                    systemName: "chevron.left",
+                    help: "上一题",
+                    disabled: questionIndex == 0
+                ) {
+                    move(to: questionIndex - 1)
+                }
+                Text("\(questionIndex + 1) of \(questions.count)")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .frame(minWidth: 44)
+                questionnaireNavigationButton(
+                    systemName: "chevron.right",
+                    help: "下一题",
+                    disabled: questionIndex == questions.count - 1
+                ) {
+                    move(to: questionIndex + 1)
+                }
+                questionnaireNavigationButton(
+                    systemName: "xmark",
+                    help: "取消问答",
+                    disabled: false
+                ) {
+                    state.cancelQuestionnaire()
+                }
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 20)
+    }
+
+    private var customAnswerRow: some View {
+        Group {
+            if customQuestionID == question.id {
+                HStack(spacing: 12) {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 34, height: 34)
+                        .background(Color.accentColor.opacity(0.1), in: Circle())
+                    TextField("输入其他回答", text: $customInput, axis: .vertical)
+                        .textFieldStyle(.plain)
+                        .lineLimit(1...4)
+                        .focused($customInputFocused)
+                        .onSubmit { submitCustomAnswer() }
+                    Button {
+                        submitCustomAnswer()
+                    } label: {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.circle)
+                    .disabled(customInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .help("提交回答")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Color.accentColor.opacity(0.04))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.accentColor.opacity(0.45), lineWidth: 1)
+                }
+            } else {
+                Button {
+                    beginCustomAnswer()
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 34, height: 34)
+                            .background(Color.primary.opacity(0.05), in: Circle())
+                        Text(customAnswerLabel)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(Color.primary.opacity(0.025))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var customAnswerLabel: String {
+        guard let answer = answers[question.id], answer.wasCustom else {
+            return "输入其他回答"
+        }
+        return answer.label
+    }
+
+    @ViewBuilder
+    private func questionnaireNavigationButton(
+        systemName: String,
+        help: String,
+        disabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 26, height: 26)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(disabled ? Color.secondary.opacity(0.35) : Color.secondary)
+        .disabled(disabled)
+        .help(help)
+    }
+
+    private func select(option: QuestionnaireDefinition.Question.Option, index: Int) {
+        answers[question.id] = QuestionnaireAnswer(
+            id: question.id,
+            value: option.value,
+            label: option.label,
+            wasCustom: false,
+            index: index + 1
+        )
+        advanceOrSubmit()
+    }
+
+    private func beginCustomAnswer() {
+        if let answer = answers[question.id], answer.wasCustom {
+            customInput = answer.label
+        } else {
+            customInput = ""
+        }
+        customQuestionID = question.id
+        customInputFocused = true
+    }
+
+    private func submitCustomAnswer() {
+        let value = customInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            return
+        }
+        answers[question.id] = QuestionnaireAnswer(
+            id: question.id,
+            value: value,
+            label: value,
+            wasCustom: true,
+            index: nil
+        )
+        customQuestionID = nil
+        customInputFocused = false
+        advanceOrSubmit()
+    }
+
+    private func skipQuestion() {
+        answers[question.id] = nil
+        advanceOrSubmit()
+    }
+
+    private func advanceOrSubmit() {
+        if questionIndex < questions.count - 1 {
+            move(to: questionIndex + 1)
+        } else {
+            let orderedAnswers = questions.compactMap { answers[$0.id] }
+            state.respondToQuestionnaire(answers: orderedAnswers)
+        }
+    }
+
+    private func move(to index: Int) {
+        guard questions.indices.contains(index) else {
+            return
+        }
+        questionIndex = index
+        customQuestionID = nil
+        customInput = ""
+        customInputFocused = false
+    }
+}
+
 private struct ExtensionPromptView: View {
     @ObservedObject var state: AppState
     let prompt: ExtensionPrompt
@@ -2634,6 +3435,22 @@ private struct ExtensionPromptView: View {
     }
 
     var body: some View {
+        Group {
+            if prompt.method == "select" || prompt.method == "confirm" {
+                PromptChoicePanel(
+                    title: prompt.title,
+                    subtitle: prompt.message,
+                    choices: extensionPromptChoiceItems(prompt),
+                    onSelect: selectChoice(at:),
+                    onCancel: state.cancelExtensionPrompt
+                )
+            } else {
+                inputPrompt
+            }
+        }
+    }
+
+    private var inputPrompt: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(prompt.title)
                 .font(.headline)
@@ -2643,34 +3460,7 @@ private struct ExtensionPromptView: View {
                     .foregroundStyle(.secondary)
             }
 
-            switch prompt.method {
-            case "select":
-                ForEach(prompt.options, id: \.self) { option in
-                    Button(option) {
-                        state.respondToExtensionPrompt(value: option)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                Spacer(minLength: 0)
-                HStack {
-                    Spacer()
-                    Button("取消") {
-                        state.cancelExtensionPrompt()
-                    }
-                }
-            case "confirm":
-                Spacer()
-                HStack {
-                    Spacer()
-                    Button("否") {
-                        state.respondToExtensionPrompt(confirmed: false)
-                    }
-                    Button("确认") {
-                        state.respondToExtensionPrompt(confirmed: true)
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-            case "editor":
+            if prompt.method == "editor" {
                 TextEditor(text: $value)
                     .font(.system(.body, design: .monospaced))
                     .padding(6)
@@ -2679,7 +3469,7 @@ private struct ExtensionPromptView: View {
                         in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                     )
                 submitRow
-            default:
+            } else {
                 TextField(prompt.placeholder ?? "", text: $value)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { submit() }
@@ -2689,8 +3479,7 @@ private struct ExtensionPromptView: View {
         }
         .padding(20)
         .frame(width: 420, height: prompt.method == "editor" ? 360 : 280)
-        .background(Color.white)
-        .preferredColorScheme(.light)
+        .background(Color.quickPiWindowBackground)
     }
 
     private var submitRow: some View {
@@ -2703,6 +3492,17 @@ private struct ExtensionPromptView: View {
                 submit()
             }
             .buttonStyle(.borderedProminent)
+        }
+    }
+
+    private func selectChoice(at index: Int) {
+        if prompt.method == "select" {
+            guard prompt.options.indices.contains(index) else {
+                return
+            }
+            state.respondToExtensionPrompt(value: prompt.options[index])
+        } else if prompt.method == "confirm" {
+            state.respondToExtensionPrompt(confirmed: index == 0)
         }
     }
 
@@ -2850,14 +3650,7 @@ private struct AnswerSectionView: View {
                 AnswerMarkdownView(source: notification.message, baseURL: baseURL)
             }
         case .thinking(let text):
-            DisclosureGroup {
-                AnswerMarkdownView(source: text, baseURL: baseURL)
-                    .padding(.top, 6)
-            } label: {
-                Label("思考过程", systemImage: "brain")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            ThinkingActivityView(text: text, baseURL: baseURL)
         case .tool(let tool):
             if let tools = toolsByCallID[tool.callId], tool.callId == tools.first?.callId {
                 ToolActivityGroupView(tools: tools)
@@ -2868,6 +3661,48 @@ private struct AnswerSectionView: View {
 
 private func toolActivityInlineSummary(_ text: String) -> String {
     text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+}
+
+private struct ThinkingActivityView: View {
+    let text: String
+    let baseURL: URL
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .frame(width: 10)
+                    Image(systemName: "brain")
+                    Text("思考过程")
+                        .font(.system(
+                            size: QuickPiTypography.supportingSize,
+                            weight: .medium,
+                            design: .monospaced
+                        ))
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "收起思考过程" : "展开思考过程")
+
+            if isExpanded {
+                AnswerMarkdownView(source: text, baseURL: baseURL)
+                    .padding(.top, 8)
+                    .transition(.opacity)
+            }
+        }
+    }
 }
 
 private struct ToolActivityGroupView: View {
@@ -2895,7 +3730,7 @@ private struct ToolActivityGroupView: View {
                             ? "xmark.circle"
                             : "checkmark.circle")
                         Text("已调用 \(tools.count) 个工具")
-                            .font(.system(size: 13, weight: .medium))
+                            .font(.system(size: QuickPiTypography.supportingSize, weight: .medium))
                             .fixedSize(horizontal: true, vertical: false)
                         Text(tools.map {
                             "\($0.name) \(toolActivityInlineSummary($0.input))"
@@ -2918,7 +3753,7 @@ private struct ToolActivityGroupView: View {
                         }
                     }
                     .padding(.top, 8)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(.opacity)
                 }
             }
         } else {
@@ -2957,7 +3792,11 @@ private struct ToolActivityView: View {
                         Image(systemName: "xmark.circle")
                     }
                     Text(tool.name)
-                        .font(.system(size: 13, weight: .medium, design: .monospaced))
+                        .font(.system(
+                            size: QuickPiTypography.supportingSize,
+                            weight: .medium,
+                            design: .monospaced
+                        ))
                         .fixedSize(horizontal: true, vertical: false)
                     Text(toolActivityInlineSummary(tool.input))
                         .font(.system(size: 12, design: .monospaced))
@@ -2986,7 +3825,7 @@ private struct ToolActivityView: View {
                     }
                 }
                 .padding(.top, 8)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(.opacity)
             }
         }
     }
@@ -3015,6 +3854,150 @@ private struct ToolActivityView: View {
             .help("复制内容")
         }
         .background(.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+private let planMarkdownTheme = Theme()
+    .text {
+        ForegroundColor(Color.primary.opacity(0.92))
+        FontSize(QuickPiTypography.supportingSize)
+    }
+    .code {
+        FontFamilyVariant(.monospaced)
+        FontSize(.em(0.92))
+        BackgroundColor(Color.primary.opacity(0.055))
+    }
+    .strong {
+        FontWeight(.semibold)
+    }
+    .link {
+        ForegroundColor(.accentColor)
+    }
+    .paragraph { configuration in
+        configuration.label
+            .fixedSize(horizontal: false, vertical: true)
+            .relativeLineSpacing(.em(0.12))
+            .markdownMargin(top: 0, bottom: 0)
+    }
+    .list { configuration in
+        configuration.label
+            .markdownMargin(top: 0, bottom: 0)
+    }
+    .listItem { configuration in
+        configuration.label
+            .markdownMargin(top: 0, bottom: 0)
+    }
+
+private struct PlanStatusTextView: View {
+    let status: ExtensionStatus
+
+    var body: some View {
+        if let richText = status.richText {
+            Text(richText.attributedString(fontSize: 12, baseWeight: .medium))
+        } else {
+            Text(status.text)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct PlanProgressLineView: View {
+    let source: String
+    let richText: ExtensionRichText?
+    let baseURL: URL
+
+    var body: some View {
+        if let richText {
+            Text(richText.attributedString(fontSize: QuickPiTypography.supportingSize))
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        } else {
+            Markdown(source, baseURL: baseURL)
+                .markdownTheme(planMarkdownTheme)
+                .markdownImageProvider(AssetImageProvider())
+                .markdownInlineImageProvider(AssetInlineImageProvider())
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .environment(\.openURL, OpenURLAction { url in
+                    guard url.isFileURL else {
+                        return .systemAction
+                    }
+                    return NSWorkspace.shared.open(url) ? .handled : .discarded
+                })
+        }
+    }
+}
+
+private extension ExtensionRichText {
+    func attributedString(
+        fontSize: CGFloat,
+        baseWeight: NSFont.Weight = .regular
+    ) -> AttributedString {
+        let value = NSMutableAttributedString(string: "")
+        for run in runs {
+            var font = NSFont.systemFont(
+                ofSize: fontSize,
+                weight: run.style.bold ? .semibold : baseWeight
+            )
+            if run.style.italic {
+                font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
+            }
+
+            var attributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: run.style.foreground.map {
+                    nativeColor($0, dimmed: run.style.dimmed)
+                } ?? (run.style.dimmed ? NSColor.secondaryLabelColor : NSColor.labelColor),
+            ]
+            if run.style.underlined {
+                attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            }
+            if run.style.strikethrough {
+                attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+            }
+            value.append(NSAttributedString(string: run.text, attributes: attributes))
+        }
+        return AttributedString(value)
+    }
+
+    func nativeColor(_ color: Color, dimmed: Bool) -> NSColor {
+        let resolved: NSColor
+        switch color {
+        case .indexed(let index):
+            resolved = indexedColor(index)
+        case let .rgb(red, green, blue):
+            resolved = NSColor(
+                srgbRed: CGFloat(min(max(red, 0), 255)) / 255,
+                green: CGFloat(min(max(green, 0), 255)) / 255,
+                blue: CGFloat(min(max(blue, 0), 255)) / 255,
+                alpha: 1
+            )
+        }
+        return dimmed ? resolved.withAlphaComponent(0.62) : resolved
+    }
+
+    func indexedColor(_ index: Int) -> NSColor {
+        let basic: [NSColor] = [
+            .black, .systemRed, .systemGreen, .systemYellow,
+            .systemBlue, .systemPurple, .systemCyan, .white,
+            .darkGray, .systemRed, .systemGreen, .systemYellow,
+            .systemBlue, .systemPurple, .systemCyan, .white,
+        ]
+        if basic.indices.contains(index) {
+            return basic[index]
+        }
+        if (16...231).contains(index) {
+            let cube = [0, 95, 135, 175, 215, 255]
+            let offset = index - 16
+            return NSColor(
+                srgbRed: CGFloat(cube[offset / 36]) / 255,
+                green: CGFloat(cube[(offset / 6) % 6]) / 255,
+                blue: CGFloat(cube[offset % 6]) / 255,
+                alpha: 1
+            )
+        }
+        let component = CGFloat(min(max(8 + (index - 232) * 10, 0), 255)) / 255
+        return NSColor(srgbRed: component, green: component, blue: component, alpha: 1)
     }
 }
 

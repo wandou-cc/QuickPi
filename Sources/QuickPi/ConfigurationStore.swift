@@ -56,15 +56,29 @@ final class ConfigurationStore {
         }
     }
 
+    static let defaultAgentInstructions = "The user selected the current working directory as the project workspace. Inspect the project before editing, keep file operations inside this workspace unless the user explicitly asks otherwise, and answer in the user's language."
+    static let globalAgentDirectory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".pi/agent", isDirectory: true)
+    static var globalAgentInstructionsURL: URL {
+        globalAgentDirectory.appendingPathComponent("AGENTS.md")
+    }
+
     private let settingsURL: URL
     private let piDirectory: URL
     private let worktreesURL: URL
+    private let agentDirectory: URL
+    private let agentInstructionsURL: URL
 
-    // Defines the app-owned settings, custom Provider catalog, and custom credentials.
-    init(applicationSupportDirectory: URL) {
+    // Defines the app-owned settings, custom Provider catalog, credentials, and Pi's global instructions.
+    init(
+        applicationSupportDirectory: URL,
+        agentDirectory: URL = ConfigurationStore.globalAgentDirectory
+    ) {
         settingsURL = applicationSupportDirectory.appendingPathComponent("settings.json")
         piDirectory = applicationSupportDirectory.appendingPathComponent("pi", isDirectory: true)
         worktreesURL = applicationSupportDirectory.appendingPathComponent("worktrees.json")
+        self.agentDirectory = agentDirectory
+        agentInstructionsURL = agentDirectory.appendingPathComponent("AGENTS.md")
     }
 
     // Reads the exact current settings schema; only a genuinely missing file means first launch.
@@ -82,6 +96,36 @@ final class ConfigurationStore {
         try data.write(to: settingsURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: settingsURL.path)
         return try load()
+    }
+
+    // Returns Pi's native global instructions or Quick Pi's effective default before the file exists.
+    func loadAgentInstructions() throws -> String {
+        guard FileManager.default.fileExists(atPath: agentInstructionsURL.path) else {
+            return Self.defaultAgentInstructions
+        }
+        return try String(contentsOf: agentInstructionsURL, encoding: .utf8)
+    }
+
+    // Atomically replaces Pi's native global AGENTS.md without normalizing user-authored Markdown.
+    func saveAgentInstructions(_ instructions: String) throws -> String {
+        guard instructions.utf8.count <= 200_000 else {
+            throw QuickPiError.message("AGENTS.md 不能超过 200 KB")
+        }
+        try FileManager.default.createDirectory(
+            at: agentDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: agentDirectory.path
+        )
+        try Data(instructions.utf8).write(to: agentInstructionsURL, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: agentInstructionsURL.path
+        )
+        return try loadAgentInstructions()
     }
 
     // Reads the exact persisted association between Pi sessions and app-managed Git worktrees.

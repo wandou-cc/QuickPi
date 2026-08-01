@@ -4,6 +4,7 @@ import PDFKit
 import UniformTypeIdentifiers
 
 enum AttachmentLoader {
+    private static let maximumAttachmentBytes = 10 * 1_024 * 1_024
     private static let textExtensions: Set<String> = [
         "txt", "md", "markdown", "json", "csv", "xml", "yaml", "yml",
         "js", "jsx", "ts", "tsx", "py", "java", "go", "rs", "c", "h",
@@ -16,7 +17,7 @@ enum AttachmentLoader {
         guard values.isRegularFile == true, let fileSize = values.fileSize else {
             throw QuickPiError.message("只能添加普通文件")
         }
-        guard fileSize <= 10 * 1_024 * 1_024 else {
+        guard fileSize <= maximumAttachmentBytes else {
             throw QuickPiError.message("附件 \(url.lastPathComponent) 超过 10 MB")
         }
 
@@ -58,18 +59,19 @@ enum AttachmentLoader {
         return PendingAttachment(id: UUID(), name: url.lastPathComponent, content: .text(text))
     }
 
-    // Loads clipboard image data into the same attachment format used by selected files.
+    // Clipboard TIFF/bitmap payloads can be large even when their normalized JPEG is small.
     static func loadImage(data: Data, name: String) throws -> PendingAttachment {
-        guard data.count <= 10 * 1_024 * 1_024 else {
-            throw QuickPiError.message("附件 \(name) 超过 10 MB")
-        }
         guard let source = NSImage(data: data), source.size.width > 0, source.size.height > 0 else {
             throw QuickPiError.message("无法读取图片：\(name)")
+        }
+        let jpeg = try normalizedJPEG(source: source, name: name)
+        guard jpeg.count <= maximumAttachmentBytes else {
+            throw QuickPiError.message("附件 \(name) 超过 10 MB")
         }
         return PendingAttachment(
             id: UUID(),
             name: name,
-            content: .image(data: try normalizedJPEG(source: source, name: name), mimeType: "image/jpeg")
+            content: .image(data: jpeg, mimeType: "image/jpeg")
         )
     }
 

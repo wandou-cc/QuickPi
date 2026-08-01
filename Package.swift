@@ -26,7 +26,10 @@ let package = Package(
                 .product(name: "MarkdownUI", package: "swift-markdown-ui"),
                 "Sparkle",
             ],
-            path: "Sources/QuickPi"
+            path: "Sources/QuickPi",
+            resources: [
+                .copy("Resources/ProviderIcons"),
+            ]
         ),
         .testTarget(
             name: "QuickPiTests",

@@ -5,6 +5,11 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class AppState: ObservableObject {
+    private struct ManagedQueuedDelivery: Equatable {
+        var message: QueuedUserMessage
+        let runtimeText: String
+    }
+
     private struct SessionExecution {
         var previousAnswers: [AnswerSession] = []
         var answer: AnswerSession?
@@ -17,11 +22,15 @@ final class AppState: ObservableObject {
         var promptSubmissionRunning = false
         var queuedSteeringMessages: [String] = []
         var queuedFollowUpMessages: [String] = []
+        var managedQueuedMessages: [QueuedUserMessage] = []
+        var managedQueuedAttachments: [String: [MessageAttachment]] = [:]
+        var managedQueuedDeliveries: [ManagedQueuedDelivery] = []
         var deliveringQueuedMessages: [String] = []
         var extensionStatuses: [ExtensionStatus] = []
         var extensionWidgets: [ExtensionWidget] = []
         var extensionTitle: String?
         var extensionPrompt: ExtensionPrompt?
+        var questionnairePrompt: QuestionnairePrompt?
         var answerGeneration = 0
         var unreadCompletion = false
         var conversationLoaded = false
@@ -180,6 +189,53 @@ final class AppState: ObservableObject {
         activeSessionID.flatMap { sessionExecutions[$0] }?.queuedFollowUpMessages ?? []
     }
 
+    var queuedMessages: [QueuedUserMessage] {
+        guard let execution = activeSessionID.flatMap({ sessionExecutions[$0] }) else {
+            return []
+        }
+        let managedMessages = execution.managedQueuedMessages.map { queuedMessage in
+            var message = queuedMessage
+            message.attachments = execution.managedQueuedAttachments[message.id] ?? message.attachments
+            return message
+        }
+        let deliveringMessages = execution.managedQueuedDeliveries.map { delivery in
+            var message = delivery.message
+            message.attachments = execution.managedQueuedAttachments[message.id] ?? message.attachments
+            return QueuedUserMessage(
+                id: message.id,
+                text: message.text,
+                delivery: message.delivery,
+                attachmentNames: message.attachmentNames,
+                editable: false,
+                attachments: message.attachments
+            )
+        }
+        let managedRuntimeTexts = Set(execution.managedQueuedDeliveries.map(\.runtimeText))
+        let nativeSteering: [QueuedUserMessage] = execution.queuedSteeringMessages.enumerated().compactMap { index, text in
+            guard !managedRuntimeTexts.contains(text) else {
+                return nil
+            }
+            return QueuedUserMessage(
+                id: "native-steer-\(index)-\(text.hashValue)",
+                text: text,
+                delivery: .steer,
+                editable: false
+            )
+        }
+        let nativeFollowUps: [QueuedUserMessage] = execution.queuedFollowUpMessages.enumerated().compactMap { index, text in
+            guard !managedRuntimeTexts.contains(text) else {
+                return nil
+            }
+            return QueuedUserMessage(
+                id: "native-follow-up-\(index)-\(text.hashValue)",
+                text: text,
+                delivery: .followUp,
+                editable: false
+            )
+        }
+        return managedMessages + deliveringMessages + nativeSteering + nativeFollowUps
+    }
+
     var previousAnswers: [AnswerSession] {
         activeSessionID.flatMap { sessionExecutions[$0] }?.previousAnswers ?? []
     }
@@ -236,6 +292,10 @@ final class AppState: ObservableObject {
         activeSessionID.flatMap { sessionExecutions[$0] }?.extensionPrompt
     }
 
+    var questionnairePrompt: QuestionnairePrompt? {
+        activeSessionID.flatMap { sessionExecutions[$0] }?.questionnairePrompt
+    }
+
     // Offers commands only while the command name is being entered, before arguments begin.
     var slashCommandSuggestions: [SlashCommand] {
         guard draft.first == "/" else {
@@ -268,6 +328,14 @@ final class AppState: ObservableObject {
 
     var hasRunningSessions: Bool {
         sessionExecutions.values.contains(where: \.isBusy)
+    }
+
+    var canSaveAgentInstructions: Bool {
+        !hasRunningSessions && !runtimeStarting && !sessionChanging && !gitOperationRunning
+    }
+
+    var defaultAgentInstructions: String {
+        ConfigurationStore.defaultAgentInstructions
     }
 
     var conversationAnswers: [AnswerSession] {
@@ -352,7 +420,7 @@ final class AppState: ObservableObject {
     var inputEditorBarHeight: CGFloat {
         var height = inputEditorHeight + 20
         if !attachments.isEmpty {
-            height += 38
+            height += 52
         }
         for widget in extensionWidgets where widget.key != ExtensionWidget.planModeKey {
             height += CGFloat(widget.lines.count * 16 + 12)
@@ -381,8 +449,7 @@ final class AppState: ObservableObject {
     var hasResultPanelContent: Bool {
         runtimeError != nil
             || !conversationAnswers.isEmpty
-            || !queuedSteeringMessages.isEmpty
-            || !queuedFollowUpMessages.isEmpty
+            || !queuedMessages.isEmpty
     }
 
     var showsResultPanel: Bool {
@@ -722,7 +789,7 @@ final class AppState: ObservableObject {
             let generation = beginAnswer(
                 sessionID: sessionID,
                 question: question,
-                attachmentNames: [],
+                attachments: [],
                 status: .running
             )
             updateSession(sessionID) { $0.extensionCommandRunning = true }
@@ -865,6 +932,7 @@ final class AppState: ObservableObject {
             ? question
             : "\(question)\n\n---\n\n\(documentSections.joined(separator: "\n\n---\n\n"))"
         let attachmentNames = submittedAttachments.map(\.name)
+        let messageAttachments = submittedAttachments.map(\.messageAttachment)
 
         if isBusy {
             guard isAnswering else {
@@ -874,13 +942,21 @@ final class AppState: ObservableObject {
             }
             let configurationGeneration = runtimeGeneration
             let attachmentIDs = submittedAttachments.map(\.id)
-            updateSession(sessionID) { $0.promptSubmissionRunning = true }
+            let queuedMessageID = UUID().uuidString
+            updateSession(sessionID) { execution in
+                execution.promptSubmissionRunning = true
+                execution.managedQueuedAttachments[queuedMessageID] = messageAttachments
+            }
             notifyPanel()
             do {
-                try await runtime.prompt(
-                    message: prompt,
+                try await runtime.queueMessage(
+                    id: queuedMessageID,
+                    text: question,
+                    delivery: steering ? .steer : .followUp,
                     images: images,
-                    streamingBehavior: steering ? .steer : .followUp
+                    documentSections: documentSections,
+                    attachmentNames: attachmentNames,
+                    attachments: messageAttachments
                 )
                 guard configurationGeneration == runtimeGeneration,
                       runtimes[sessionID] === runtime else {
@@ -902,6 +978,7 @@ final class AppState: ObservableObject {
                 }
                 updateSession(sessionID) { execution in
                     execution.promptSubmissionRunning = false
+                    execution.managedQueuedAttachments[queuedMessageID] = nil
                     execution.runtimeError = error.localizedDescription
                     execution.resultPresented = true
                 }
@@ -915,7 +992,7 @@ final class AppState: ObservableObject {
             let answerGeneration = beginAnswer(
                 sessionID: sessionID,
                 question: question,
-                attachmentNames: attachmentNames,
+                attachments: messageAttachments,
                 status: .running
             )
             updateSession(sessionID) { $0.extensionCommandRunning = true }
@@ -963,10 +1040,39 @@ final class AppState: ObservableObject {
             return
         }
 
+        if !messageAttachments.isEmpty {
+            let configurationGeneration = runtimeGeneration
+            updateSession(sessionID) { $0.promptSubmissionRunning = true }
+            notifyPanel()
+            do {
+                try await runtime.recordMessageAttachments(
+                    question: question,
+                    attachments: messageAttachments
+                )
+                guard configurationGeneration == runtimeGeneration,
+                      runtimes[sessionID] === runtime else {
+                    return
+                }
+                updateSession(sessionID) { $0.promptSubmissionRunning = false }
+            } catch {
+                guard configurationGeneration == runtimeGeneration,
+                      runtimes[sessionID] === runtime else {
+                    return
+                }
+                updateSession(sessionID) { execution in
+                    execution.promptSubmissionRunning = false
+                    execution.runtimeError = error.localizedDescription
+                    execution.resultPresented = true
+                }
+                notifyPanel()
+                return
+            }
+        }
+
         let generation = beginAnswer(
             sessionID: sessionID,
             question: question,
-            attachmentNames: attachmentNames,
+            attachments: messageAttachments,
             status: .waiting
         )
         notifyPanel()
@@ -990,6 +1096,79 @@ final class AppState: ObservableObject {
         }
     }
 
+    // Replaces one extension-managed queued message before Pi begins delivering it.
+    func editQueuedMessage(id: String, replacement: String) async -> Bool {
+        let text = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            runtimeError = "编辑后的队列消息不能为空"
+            notifyPanel()
+            return false
+        }
+        guard let sessionID = activeSessionID,
+              let runtime = runtimes[sessionID],
+              sessionExecutions[sessionID]?.managedQueuedMessages.contains(where: { $0.id == id }) == true,
+              !promptSubmissionRunning else {
+            return false
+        }
+        updateSession(sessionID) { $0.promptSubmissionRunning = true }
+        notifyPanel()
+        do {
+            try await runtime.editQueuedMessage(id: id, text: text)
+            guard runtimes[sessionID] === runtime else {
+                return false
+            }
+            updateSession(sessionID) { execution in
+                execution.promptSubmissionRunning = false
+                execution.runtimeError = nil
+            }
+            notifyPanel()
+            return true
+        } catch {
+            guard runtimes[sessionID] === runtime else {
+                return false
+            }
+            updateSession(sessionID) { execution in
+                execution.promptSubmissionRunning = false
+                execution.runtimeError = error.localizedDescription
+                execution.resultPresented = true
+            }
+            notifyPanel()
+            return false
+        }
+    }
+
+    // Cancels one extension-managed message without interrupting the active model turn.
+    func cancelQueuedMessage(id: String) async {
+        guard let sessionID = activeSessionID,
+              let runtime = runtimes[sessionID],
+              sessionExecutions[sessionID]?.managedQueuedMessages.contains(where: { $0.id == id }) == true,
+              !promptSubmissionRunning else {
+            return
+        }
+        updateSession(sessionID) { $0.promptSubmissionRunning = true }
+        notifyPanel()
+        do {
+            try await runtime.cancelQueuedMessage(id: id)
+            guard runtimes[sessionID] === runtime else {
+                return
+            }
+            updateSession(sessionID) { execution in
+                execution.promptSubmissionRunning = false
+                execution.runtimeError = nil
+            }
+        } catch {
+            guard runtimes[sessionID] === runtime else {
+                return
+            }
+            updateSession(sessionID) { execution in
+                execution.promptSubmissionRunning = false
+                execution.runtimeError = error.localizedDescription
+                execution.resultPresented = true
+            }
+        }
+        notifyPanel()
+    }
+
     // Stops the current answer and leaves completed content available for copying.
     func abort() async {
         guard let sessionID = activeSessionID, let runtime = runtimes[sessionID] else {
@@ -1001,6 +1180,10 @@ final class AppState: ObservableObject {
             if let prompt = extensionPrompt {
                 try runtime.respondToExtensionPrompt(requestId: prompt.requestId, cancelled: true)
                 updateSession(sessionID) { $0.extensionPrompt = nil }
+            }
+            if let prompt = questionnairePrompt {
+                try runtime.respondToExtensionPrompt(requestId: prompt.requestId, cancelled: true)
+                updateSession(sessionID) { $0.questionnairePrompt = nil }
             }
             try await runtime.abort()
             guard generation == sessionExecutions[sessionID]?.answerGeneration else {
@@ -1202,6 +1385,96 @@ final class AppState: ObservableObject {
         notifyPanel()
     }
 
+    // Replaces one persisted user turn by branching before it and submitting edited text on the new path.
+    func editMessage(entryId: String, replacement: String) async -> Bool {
+        let question = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else {
+            runtimeError = "编辑后的问题不能为空"
+            notifyPanel()
+            return false
+        }
+        guard runtimeReady, !isBusy, !sessionChanging, !gitOperationRunning else {
+            return false
+        }
+        guard let sessionID = activeSessionID,
+              let session = activeSession,
+              let runtime = runtimes[sessionID],
+              conversationAnswers.contains(where: { $0.cloneEntryId == entryId }) else {
+            runtimeError = "要编辑的消息不属于当前会话"
+            notifyPanel()
+            return false
+        }
+        let commandName = question.hasPrefix("/")
+            ? question.dropFirst().split(maxSplits: 1, whereSeparator: { $0.isWhitespace }).first.map(String.init)
+            : nil
+        let isExtensionCommand = slashCommands.contains {
+            $0.source == .extension && $0.name == commandName
+        }
+        guard isExtensionCommand || selectedModel != nil else {
+            presentSettings()
+            runtimeError = "请先配置 Provider 并选择模型"
+            notifyPanel()
+            return false
+        }
+
+        let preservedDraft = draft
+        let preservedAttachments = attachments
+        sessionChanging = true
+        setRuntimeError(nil, sessionID: sessionID)
+        notifyPanel()
+
+        do {
+            let snapshot = try await runtime.rewindToUserMessage(entryId: entryId)
+            try validateSessionSnapshot(snapshot)
+            guard snapshot.activeSessionId == sessionID,
+                  snapshot.activeSessionPath == session.path else {
+                throw QuickPiError.message("Pi 编辑消息时切换了会话")
+            }
+            try applySessionSnapshot(
+                snapshot,
+                preservingInput: true,
+                replacingLoadedConversation: true
+            )
+        } catch {
+            setRuntimeError(error.localizedDescription, sessionID: sessionID)
+            sessionChanging = false
+            notifyPanel()
+            return false
+        }
+
+        let generation = beginAnswer(
+            sessionID: sessionID,
+            question: question,
+            attachments: [],
+            status: .waiting
+        )
+        updateSession(sessionID) { execution in
+            execution.draft = preservedDraft
+            execution.attachments = preservedAttachments
+        }
+        sessionChanging = false
+        notifyPanel()
+
+        do {
+            try await runtime.prompt(message: question, images: [])
+            guard runtimes[sessionID] === runtime,
+                  sessionExecutions[sessionID]?.answerGeneration == generation else {
+                return false
+            }
+        } catch {
+            guard sessionExecutions[sessionID]?.answerGeneration == generation else {
+                return false
+            }
+            updateSession(sessionID) { execution in
+                execution.answer?.status = .failed
+                execution.answer?.error = error.localizedDescription
+            }
+            finishSessionExecution(sessionID)
+            notifyPanel()
+        }
+        return true
+    }
+
     // Clones one completed turn into a new session and switches the current window to it.
     func cloneSession(from entryId: String) async {
         guard runtimeReady, !isBusy, !sessionChanging, !gitOperationRunning else {
@@ -1373,10 +1646,30 @@ final class AppState: ObservableObject {
         notifyPanel()
     }
 
-    // Saves the desktop shortcut and login-item settings immediately.
+    // Loads the native global Pi instructions shown by the personalization editor.
+    func loadAgentInstructions() throws -> String {
+        try store.loadAgentInstructions()
+    }
+
+    // Persists global Pi instructions and restarts every idle runtime so the next turn uses them.
+    func saveAgentInstructions(_ instructions: String) throws -> String {
+        guard canSaveAgentInstructions else {
+            throw QuickPiError.message("仍有会话或后台操作正在执行，不能修改 AGENTS.md")
+        }
+        let current = try store.loadAgentInstructions()
+        guard current != instructions else {
+            return current
+        }
+        let saved = try store.saveAgentInstructions(instructions)
+        scheduleRuntimeRestart()
+        return saved
+    }
+
+    // Saves the desktop shortcut, clipboard-fill behavior, and login-item settings immediately.
     func saveDesktopSettings(
         shortcut: String,
-        launchAtLogin: Bool
+        launchAtLogin: Bool,
+        fillInputFromClipboardOnShortcut: Bool
     ) async throws {
         if shortcut != settings.shortcut {
             try applyShortcut?(shortcut)
@@ -1393,6 +1686,7 @@ final class AppState: ObservableObject {
         var next = settings
         next.shortcut = shortcut
         next.launchAtLogin = launchAtLogin
+        next.fillInputFromClipboardOnShortcut = fillInputFromClipboardOnShortcut
         settings = try store.save(next)
     }
 
@@ -1610,6 +1904,56 @@ final class AppState: ObservableObject {
             }
         }
         notifyPanel()
+    }
+
+    // Returns the accumulated Plan Mode clarification answers to the questionnaire tool.
+    func respondToQuestionnaire(answers: [QuestionnaireAnswer]) {
+        guard let sessionID = activeSessionID,
+              let prompt = sessionExecutions[sessionID]?.questionnairePrompt,
+              let runtime = runtimes[sessionID] else {
+            return
+        }
+        do {
+            let data = try JSONEncoder().encode(QuestionnaireResponse(
+                cancelled: false,
+                answers: answers
+            ))
+            try runtime.respondToExtensionPrompt(
+                requestId: prompt.requestId,
+                value: String(decoding: data, as: UTF8.self)
+            )
+            updateSession(sessionID) { $0.questionnairePrompt = nil }
+        } catch {
+            handleExtensionInteractionError(error, sessionID: sessionID)
+        }
+        notifyPanel()
+    }
+
+    // Cancels the full questionnaire; skipping individual questions still submits the rest.
+    func cancelQuestionnaire() {
+        guard let sessionID = activeSessionID,
+              let prompt = sessionExecutions[sessionID]?.questionnairePrompt,
+              let runtime = runtimes[sessionID] else {
+            return
+        }
+        do {
+            try runtime.respondToExtensionPrompt(requestId: prompt.requestId, cancelled: true)
+            updateSession(sessionID) { $0.questionnairePrompt = nil }
+        } catch {
+            handleExtensionInteractionError(error, sessionID: sessionID)
+        }
+        notifyPanel()
+    }
+
+    private func handleExtensionInteractionError(_ error: Error, sessionID: String) {
+        if sessionExecutions[sessionID]?.isAnswering == true {
+            updateSession(sessionID) { execution in
+                execution.answer?.status = .failed
+                execution.answer?.error = error.localizedDescription
+            }
+        } else {
+            setRuntimeError(error.localizedDescription, sessionID: sessionID)
+        }
     }
 
     // Cancels authentication by replacing the process that owns the pending prompt.
@@ -2011,7 +2355,11 @@ final class AppState: ObservableObject {
     }
 
     // Restores one process-bound session without discarding transient plugin output already shown by the app.
-    func applySessionSnapshot(_ snapshot: SessionSnapshot, preservingInput: Bool = false) throws {
+    func applySessionSnapshot(
+        _ snapshot: SessionSnapshot,
+        preservingInput: Bool = false,
+        replacingLoadedConversation: Bool = false
+    ) throws {
         try validateSessionSnapshot(snapshot)
         let answers = try restoredAnswers(from: snapshot.messages, workspacePath: snapshot.cwd)
         let wasWaitingForInitialSession = activeSessionID == nil
@@ -2019,7 +2367,9 @@ final class AppState: ObservableObject {
         var execution = sessionExecutions[snapshot.activeSessionId] ?? SessionExecution()
         let draft = execution.draft
         let attachments = execution.attachments
-        let preservesLoadedConversation = preservingInput && execution.conversationLoaded
+        let preservesLoadedConversation = preservingInput
+            && execution.conversationLoaded
+            && !replacingLoadedConversation
         if !preservesLoadedConversation {
             execution.previousAnswers = answers
             execution.answer = nil
@@ -2031,6 +2381,9 @@ final class AppState: ObservableObject {
         execution.promptSubmissionRunning = false
         execution.queuedSteeringMessages = []
         execution.queuedFollowUpMessages = []
+        execution.managedQueuedMessages = []
+        execution.managedQueuedAttachments = [:]
+        execution.managedQueuedDeliveries = []
         execution.deliveringQueuedMessages = []
         execution.unreadCompletion = false
         execution.conversationLoaded = true
@@ -2142,7 +2495,7 @@ final class AppState: ObservableObject {
                 current = AnswerSession(
                     question: SubmittedQuestion(
                         text: text,
-                        attachmentNames: [],
+                        attachments: message.attachments ?? [],
                         workspacePath: workspacePath
                     ),
                     startedAt: Date(timeIntervalSince1970: message.timestamp / 1_000),
@@ -2325,7 +2678,7 @@ final class AppState: ObservableObject {
     private func beginAnswer(
         sessionID: String,
         question: String,
-        attachmentNames: [String],
+        attachments: [MessageAttachment],
         status: AnswerStatus
     ) -> Int {
         let workspacePath = sessions.first(where: { $0.id == sessionID })?.cwd
@@ -2337,7 +2690,7 @@ final class AppState: ObservableObject {
             execution.answer = AnswerSession(
                 question: SubmittedQuestion(
                     text: question,
-                    attachmentNames: attachmentNames,
+                    attachments: attachments,
                     workspacePath: workspacePath
                 ),
                 startedAt: Date(),
@@ -2567,21 +2920,45 @@ final class AppState: ObservableObject {
             }
         case .userMessage(let message):
             var startsQueuedTurn = false
+            var managedDelivery: QueuedUserMessage?
             updateSession(sessionID) { execution in
-                if let index = execution.deliveringQueuedMessages.firstIndex(of: message) {
-                    execution.deliveringQueuedMessages.remove(at: index)
-                    if execution.answer?.status == .waiting || execution.answer?.status == .running {
-                        execution.answer?.status = .completed
-                        execution.answer?.retryMessage = nil
+                if let index = execution.managedQueuedDeliveries.firstIndex(where: { delivery in
+                    message == delivery.runtimeText
+                        || message.hasPrefix(delivery.runtimeText + "\n[图片：")
+                }) {
+                    let queuedDelivery = execution.managedQueuedDeliveries.remove(at: index)
+                    var delivery = queuedDelivery.message
+                    delivery.attachments = execution.managedQueuedAttachments[delivery.id] ?? delivery.attachments
+                    execution.managedQueuedAttachments[delivery.id] = nil
+                    managedDelivery = delivery
+                    if let nativeIndex = execution.deliveringQueuedMessages.firstIndex(where: {
+                        $0 == message || $0 == queuedDelivery.runtimeText
+                    }) {
+                        execution.deliveringQueuedMessages.remove(at: nativeIndex)
                     }
                     startsQueuedTurn = true
+                } else if let index = execution.deliveringQueuedMessages.firstIndex(of: message) {
+                    execution.deliveringQueuedMessages.remove(at: index)
+                    startsQueuedTurn = true
+                }
+                if startsQueuedTurn,
+                   execution.answer?.status == .waiting || execution.answer?.status == .running {
+                    execution.answer?.status = .completed
+                    execution.answer?.retryMessage = nil
                 }
             }
-            if startsQueuedTurn || sessionExecutions[sessionID]?.isAnswering == false {
+            if let managedDelivery {
+                _ = beginAnswer(
+                    sessionID: sessionID,
+                    question: managedDelivery.text,
+                    attachments: managedDelivery.attachments,
+                    status: .running
+                )
+            } else if startsQueuedTurn || sessionExecutions[sessionID]?.isAnswering == false {
                 _ = beginAnswer(
                     sessionID: sessionID,
                     question: message,
-                    attachmentNames: [],
+                    attachments: [],
                     status: startsQueuedTurn ? .running : .waiting
                 )
             }
@@ -2637,6 +3014,34 @@ final class AppState: ObservableObject {
                 if !steering.isEmpty || !followUp.isEmpty {
                     execution.resultPresented = true
                 }
+            }
+        case let .managedQueueChanged(messages):
+            updateSession(sessionID) { execution in
+                let retainedIDs = Set(messages.map(\.id))
+                    .union(execution.managedQueuedDeliveries.map { $0.message.id })
+                execution.managedQueuedAttachments = execution.managedQueuedAttachments.filter {
+                    retainedIDs.contains($0.key)
+                }
+                execution.managedQueuedMessages = messages
+                if !messages.isEmpty {
+                    execution.resultPresented = true
+                }
+            }
+        case let .managedQueueDispatching(message, runtimeText):
+            updateSession(sessionID) { execution in
+                guard !execution.managedQueuedDeliveries.contains(where: {
+                    $0.message.id == message.id
+                }) else {
+                    return
+                }
+                var queuedMessage = message
+                queuedMessage.attachments = execution.managedQueuedAttachments[message.id]
+                    ?? message.attachments
+                execution.managedQueuedDeliveries.append(ManagedQueuedDelivery(
+                    message: queuedMessage,
+                    runtimeText: runtimeText
+                ))
+                execution.resultPresented = true
             }
         case .textDelta(let delta):
             appendText(delta, sessionID: sessionID)
@@ -2763,29 +3168,36 @@ final class AppState: ObservableObject {
                 }
             }
             finishSessionExecution(sessionID)
-        case let .extensionStatus(key, text):
+        case let .extensionStatus(key, text, richText):
             updateSession(sessionID) { execution in
                 if let text {
                     if let index = execution.extensionStatuses.firstIndex(where: { $0.key == key }) {
                         execution.extensionStatuses[index].text = text
+                        execution.extensionStatuses[index].richText = richText
                     } else {
-                        execution.extensionStatuses.append(ExtensionStatus(key: key, text: text))
+                        execution.extensionStatuses.append(ExtensionStatus(
+                            key: key,
+                            text: text,
+                            richText: richText
+                        ))
                     }
                 } else {
                     execution.extensionStatuses.removeAll { $0.key == key }
                 }
             }
-        case let .extensionWidget(key, lines, placement):
+        case let .extensionWidget(key, lines, richLines, placement):
             updateSession(sessionID) { execution in
                 if let lines {
                     if let index = execution.extensionWidgets.firstIndex(where: { $0.key == key }) {
                         execution.extensionWidgets[index].lines = lines
                         execution.extensionWidgets[index].placement = placement
+                        execution.extensionWidgets[index].richLines = richLines
                     } else {
                         execution.extensionWidgets.append(ExtensionWidget(
                             key: key,
                             lines: lines,
-                            placement: placement
+                            placement: placement,
+                            richLines: richLines
                         ))
                     }
                 } else {
@@ -2798,6 +3210,8 @@ final class AppState: ObservableObject {
             updateSession(sessionID) { $0.draft = text }
         case .extensionPrompt(let prompt):
             updateSession(sessionID) { $0.extensionPrompt = prompt }
+        case .questionnairePrompt(let prompt):
+            updateSession(sessionID) { $0.questionnairePrompt = prompt }
         case .operationFailed(let message):
             if authSession != nil {
                 authSession?.error = message
@@ -2819,11 +3233,15 @@ final class AppState: ObservableObject {
                 execution.promptSubmissionRunning = false
                 execution.queuedSteeringMessages = []
                 execution.queuedFollowUpMessages = []
+                execution.managedQueuedMessages = []
+                execution.managedQueuedAttachments = [:]
+                execution.managedQueuedDeliveries = []
                 execution.deliveringQueuedMessages = []
                 execution.extensionStatuses = []
                 execution.extensionWidgets = []
                 execution.extensionTitle = nil
                 execution.extensionPrompt = nil
+                execution.questionnairePrompt = nil
                 if execution.isAnswering {
                     execution.answer?.status = .failed
                     execution.answer?.error = message
@@ -2845,7 +3263,7 @@ final class AppState: ObservableObject {
             execution.answer = AnswerSession(
                 question: SubmittedQuestion(
                     text: question,
-                    attachmentNames: [],
+                    attachments: [],
                     workspacePath: workspacePath
                 ),
                 startedAt: Date(),

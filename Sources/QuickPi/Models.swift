@@ -83,6 +83,46 @@ struct AppSettings: Codable, Equatable {
     var workspacePath: String?
     var selectedModel: ModelSelection?
     var providers: [ProviderConfiguration]
+    var fillInputFromClipboardOnShortcut: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case shortcut
+        case launchAtLogin
+        case workspacePath
+        case selectedModel
+        case providers
+        case fillInputFromClipboardOnShortcut
+    }
+
+    init(
+        shortcut: String,
+        launchAtLogin: Bool,
+        workspacePath: String?,
+        selectedModel: ModelSelection?,
+        providers: [ProviderConfiguration],
+        fillInputFromClipboardOnShortcut: Bool = false
+    ) {
+        self.shortcut = shortcut
+        self.launchAtLogin = launchAtLogin
+        self.workspacePath = workspacePath
+        self.selectedModel = selectedModel
+        self.providers = providers
+        self.fillInputFromClipboardOnShortcut = fillInputFromClipboardOnShortcut
+    }
+
+    // Keeps settings written before this option existed readable with the new behavior disabled.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        shortcut = try container.decode(String.self, forKey: .shortcut)
+        launchAtLogin = try container.decode(Bool.self, forKey: .launchAtLogin)
+        workspacePath = try container.decodeIfPresent(String.self, forKey: .workspacePath)
+        selectedModel = try container.decodeIfPresent(ModelSelection.self, forKey: .selectedModel)
+        providers = try container.decode([ProviderConfiguration].self, forKey: .providers)
+        fillInputFromClipboardOnShortcut = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .fillInputFromClipboardOnShortcut
+        ) ?? false
+    }
 
     // Converts the persisted project root into the directory URL used by the native picker and Pi.
     var workspaceURL: URL? {
@@ -97,7 +137,8 @@ struct AppSettings: Codable, Equatable {
         launchAtLogin: false,
         workspacePath: nil,
         selectedModel: nil,
-        providers: []
+        providers: [],
+        fillInputFromClipboardOnShortcut: false
     )
 }
 
@@ -401,6 +442,7 @@ struct SavedSessionMessage: Codable, Equatable {
     let role: Role
     let timestamp: Double
     let text: String?
+    let attachments: [MessageAttachment]?
     let content: [SavedAssistantContent]?
     let provider: String?
     let model: String?
@@ -434,6 +476,86 @@ struct ImagePayload: Encodable, Equatable {
     let mimeType: String
 }
 
+struct MessageAttachment: Codable, Equatable, Identifiable {
+    enum Kind: String, Codable {
+        case image
+        case document
+    }
+
+    let id: String
+    let name: String
+    let kind: Kind
+    let data: Data?
+    let mimeType: String?
+
+    init(
+        id: String,
+        name: String,
+        kind: Kind,
+        data: Data? = nil,
+        mimeType: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.data = data
+        self.mimeType = mimeType
+    }
+}
+
+struct QueuedUserMessage: Codable, Equatable, Identifiable {
+    enum Delivery: String, Codable {
+        case steer
+        case followUp
+    }
+
+    let id: String
+    var text: String
+    let delivery: Delivery
+    let attachmentNames: [String]
+    let editable: Bool
+    var attachments: [MessageAttachment]
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case text
+        case delivery
+        case attachmentNames
+        case editable
+        case attachments
+    }
+
+    init(
+        id: String,
+        text: String,
+        delivery: Delivery,
+        attachmentNames: [String] = [],
+        editable: Bool = true,
+        attachments: [MessageAttachment] = []
+    ) {
+        self.id = id
+        self.text = text
+        self.delivery = delivery
+        self.attachmentNames = attachmentNames
+        self.editable = editable
+        self.attachments = attachments
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        text = try container.decode(String.self, forKey: .text)
+        delivery = try container.decode(Delivery.self, forKey: .delivery)
+        attachmentNames = try container.decodeIfPresent([String].self, forKey: .attachmentNames) ?? []
+        editable = try container.decodeIfPresent(Bool.self, forKey: .editable) ?? true
+        attachments = try container.decodeIfPresent([MessageAttachment].self, forKey: .attachments) ?? []
+    }
+
+    var isSteering: Bool {
+        delivery == .steer
+    }
+}
+
 struct PendingAttachment: Identifiable, Equatable {
     enum Content: Equatable {
         case text(String)
@@ -443,12 +565,55 @@ struct PendingAttachment: Identifiable, Equatable {
     let id: UUID
     let name: String
     let content: Content
+
+    var messageAttachment: MessageAttachment {
+        switch content {
+        case .text:
+            MessageAttachment(
+                id: id.uuidString,
+                name: name,
+                kind: .document
+            )
+        case let .image(data, mimeType):
+            MessageAttachment(
+                id: id.uuidString,
+                name: name,
+                kind: .image,
+                data: data,
+                mimeType: mimeType
+            )
+        }
+    }
 }
 
 struct SubmittedQuestion: Equatable {
     let text: String
-    let attachmentNames: [String]
+    let attachments: [MessageAttachment]
     let workspacePath: String?
+
+    init(text: String, attachments: [MessageAttachment], workspacePath: String?) {
+        self.text = text
+        self.attachments = attachments
+        self.workspacePath = workspacePath
+    }
+
+    init(text: String, attachmentNames: [String], workspacePath: String?) {
+        self.init(
+            text: text,
+            attachments: attachmentNames.enumerated().map { index, name in
+                MessageAttachment(
+                    id: "legacy-\(index)-\(name)",
+                    name: name,
+                    kind: .document
+                )
+            },
+            workspacePath: workspacePath
+        )
+    }
+
+    var attachmentNames: [String] {
+        attachments.map(\.name)
+    }
 }
 
 enum AnswerStatus: Equatable {
@@ -622,8 +787,129 @@ struct ExtensionStatus: Identifiable, Equatable {
 
     let key: String
     var text: String
+    var richText: ExtensionRichText? = nil
 
     var id: String { key }
+}
+
+struct ExtensionRichText: Equatable {
+    enum Color: Equatable {
+        case indexed(Int)
+        case rgb(red: Int, green: Int, blue: Int)
+    }
+
+    struct Style: Equatable {
+        var foreground: Color?
+        var bold = false
+        var dimmed = false
+        var italic = false
+        var underlined = false
+        var strikethrough = false
+    }
+
+    struct Run: Equatable {
+        let text: String
+        let style: Style
+    }
+
+    let runs: [Run]
+
+    var plainText: String {
+        runs.map(\.text).joined()
+    }
+
+    var hasFormatting: Bool {
+        runs.contains { $0.style != Style() }
+    }
+
+    // Converts terminal SGR runs emitted by Pi extensions into platform-neutral styles.
+    init(ansi source: String) {
+        guard let expression = try? NSRegularExpression(pattern: "\u{001B}\\[([0-9;]*)m") else {
+            runs = source.isEmpty ? [] : [Run(text: source, style: Style())]
+            return
+        }
+        let sourceRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        var parsedRuns: [Run] = []
+        var style = Style()
+        var cursor = source.startIndex
+
+        func append(_ text: Substring) {
+            guard !text.isEmpty else {
+                return
+            }
+            let value = String(text)
+            if let last = parsedRuns.last, last.style == style {
+                parsedRuns[parsedRuns.count - 1] = Run(text: last.text + value, style: style)
+            } else {
+                parsedRuns.append(Run(text: value, style: style))
+            }
+        }
+
+        for match in expression.matches(in: source, range: sourceRange) {
+            guard let matchRange = Range(match.range, in: source) else {
+                continue
+            }
+            append(source[cursor..<matchRange.lowerBound])
+
+            let parameterText = Range(match.range(at: 1), in: source).map { String(source[$0]) } ?? ""
+            let parameters = parameterText.isEmpty
+                ? [0]
+                : parameterText.split(separator: ";", omittingEmptySubsequences: false).map {
+                    Int($0) ?? 0
+                }
+            var index = 0
+            while index < parameters.count {
+                let parameter = parameters[index]
+                switch parameter {
+                case 0:
+                    style = Style()
+                case 1:
+                    style.bold = true
+                case 2:
+                    style.dimmed = true
+                case 3:
+                    style.italic = true
+                case 4:
+                    style.underlined = true
+                case 9:
+                    style.strikethrough = true
+                case 22:
+                    style.bold = false
+                    style.dimmed = false
+                case 23:
+                    style.italic = false
+                case 24:
+                    style.underlined = false
+                case 29:
+                    style.strikethrough = false
+                case 30...37:
+                    style.foreground = .indexed(parameter - 30)
+                case 38:
+                    if index + 2 < parameters.count, parameters[index + 1] == 5 {
+                        style.foreground = .indexed(parameters[index + 2])
+                        index += 2
+                    } else if index + 4 < parameters.count, parameters[index + 1] == 2 {
+                        style.foreground = .rgb(
+                            red: parameters[index + 2],
+                            green: parameters[index + 3],
+                            blue: parameters[index + 4]
+                        )
+                        index += 4
+                    }
+                case 39:
+                    style.foreground = nil
+                case 90...97:
+                    style.foreground = .indexed(parameter - 90 + 8)
+                default:
+                    break
+                }
+                index += 1
+            }
+            cursor = matchRange.upperBound
+        }
+        append(source[cursor...])
+        runs = parsedRuns
+    }
 }
 
 struct ExtensionWidget: Identifiable, Equatable {
@@ -638,6 +924,7 @@ struct ExtensionWidget: Identifiable, Equatable {
     let key: String
     var lines: [String]
     var placement: Placement
+    var richLines: [ExtensionRichText]? = nil
 
     var id: String { key }
 }
@@ -650,6 +937,45 @@ struct ExtensionPrompt: Equatable {
     let placeholder: String?
     let options: [String]
     let prefill: String?
+}
+
+struct QuestionnaireDefinition: Codable, Equatable {
+    struct Question: Codable, Equatable, Identifiable {
+        struct Option: Codable, Equatable {
+            let value: String
+            let label: String
+            let description: String?
+            let recommended: Bool?
+        }
+
+        let id: String
+        let label: String
+        let prompt: String
+        let options: [Option]
+        let allowOther: Bool
+    }
+
+    let questions: [Question]
+}
+
+struct QuestionnairePrompt: Equatable, Identifiable {
+    let requestId: String
+    let definition: QuestionnaireDefinition
+
+    var id: String { requestId }
+}
+
+struct QuestionnaireAnswer: Codable, Equatable {
+    let id: String
+    let value: String
+    let label: String
+    let wasCustom: Bool
+    let index: Int?
+}
+
+struct QuestionnaireResponse: Encodable {
+    let cancelled: Bool
+    let answers: [QuestionnaireAnswer]
 }
 
 struct ModelCatalogResponse: Decodable {
