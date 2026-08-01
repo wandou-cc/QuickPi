@@ -4,7 +4,42 @@ import Sparkle
 import SwiftUI
 
 private let panelMinimumWidth: CGFloat = 720
+let panelMinimumResultContentHeight: CGFloat = 241
 private let panelDefaultResultContentHeight: CGFloat = 520
+
+struct PanelHeightConstraints {
+    let minimum: CGFloat
+    let target: CGFloat
+}
+
+// Produces one height policy shared by native resize limits and programmatic panel updates.
+func panelHeightConstraints(
+    inputHeight: CGFloat,
+    slashCommandMenuHeight: CGFloat,
+    showsResultPanel: Bool,
+    resultContentHeight: CGFloat,
+    maximumHeight: CGFloat
+) -> PanelHeightConstraints {
+    let requestedHeight: CGFloat
+    let requestedMinimumHeight: CGFloat
+    if slashCommandMenuHeight > 0 {
+        requestedMinimumHeight = inputHeight + slashCommandMenuHeight
+        requestedHeight = requestedMinimumHeight
+    } else if showsResultPanel {
+        requestedMinimumHeight = inputHeight + panelMinimumResultContentHeight
+        requestedHeight = inputHeight + resultContentHeight
+    } else {
+        requestedMinimumHeight = inputHeight
+        requestedHeight = inputHeight
+    }
+
+    let availableMaximumHeight = max(inputHeight, maximumHeight)
+    let minimumHeight = min(requestedMinimumHeight, availableMaximumHeight)
+    return PanelHeightConstraints(
+        minimum: minimumHeight,
+        target: min(max(requestedHeight, minimumHeight), availableMaximumHeight)
+    )
+}
 
 private let hotKeyHandler: EventHandlerUPP = { _, _, userData in
     guard let userData else {
@@ -194,17 +229,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return frameSize
         }
         return NSSize(
-            width: max(frameSize.width, panelMinimumWidth),
+            width: max(frameSize.width, sender.minSize.width),
             height: max(frameSize.height, sender.minSize.height)
         )
     }
 
-    // Preserves only user-driven result height changes while streamed events continue updating the panel.
+    // Corrects resize paths that bypass windowWillResize before persisting a user-selected result height.
     func windowDidResize(_ notification: Notification) {
         guard let panel,
-              let state,
               let resizedWindow = notification.object as? NSWindow,
-              resizedWindow === panel,
+              resizedWindow === panel else {
+            return
+        }
+        if enforcePanelMinimumFrame(panel) {
+            return
+        }
+        guard let state,
               panel.inLiveResize,
               panelFrameBeforeZoom == nil,
               state.slashCommandMenuHeight == 0,
@@ -212,7 +252,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let inputHeight = state.inputBarHeight
-        resultContentHeight = panel.contentLayoutRect.height - inputHeight
+        resultContentHeight = max(
+            panel.contentLayoutRect.height - inputHeight,
+            panelMinimumResultContentHeight
+        )
+    }
+
+    // Keeps the panel valid when borderless AppKit resize paths ignore minSize.
+    private func enforcePanelMinimumFrame(_ panel: QuickPanel) -> Bool {
+        let frame = panel.frame
+        let minimumSize = panel.minSize
+        guard frame.width < minimumSize.width || frame.height < minimumSize.height else {
+            return false
+        }
+
+        var constrainedFrame = frame
+        let top = frame.maxY
+        constrainedFrame.size.width = max(frame.width, minimumSize.width)
+        constrainedFrame.size.height = max(frame.height, minimumSize.height)
+        constrainedFrame.origin.y = top - constrainedFrame.height
+        panel.setFrame(constrainedFrame, display: true)
+        return true
     }
 
     // Installs standard text actions so every native text field supports normal shortcuts.
@@ -403,43 +463,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         panel.title = state.extensionTitle ?? "Quick Pi"
         let inputHeight = state.inputBarHeight
-        let requestedHeight: CGFloat
-        if state.slashCommandMenuHeight > 0 {
-            requestedHeight = inputHeight + state.slashCommandMenuHeight
-        } else if state.showsResultPanel {
-            requestedHeight = inputHeight + resultContentHeight
-        } else {
-            requestedHeight = inputHeight
-        }
         // Keep the existing 96-point top offset and a 24-point bottom margin on every screen.
-        let maximumHeight = max(inputHeight, screen.visibleFrame.height - 120)
-        let targetHeight = min(max(requestedHeight, inputHeight), maximumHeight)
+        let heights = panelHeightConstraints(
+            inputHeight: inputHeight,
+            slashCommandMenuHeight: state.slashCommandMenuHeight,
+            showsResultPanel: state.showsResultPanel,
+            resultContentHeight: resultContentHeight,
+            maximumHeight: screen.visibleFrame.height - 120
+        )
         let minimumSize = NSSize(
             width: panelMinimumWidth,
-            height: inputHeight
+            height: heights.minimum
         )
         panel.contentMinSize = minimumSize
         panel.minSize = minimumSize
         if var restoredFrame = panelFrameBeforeZoom {
             let top = restoredFrame.maxY
-            restoredFrame.size.height = targetHeight
-            restoredFrame.origin.y = max(screen.visibleFrame.minY + 24, top - targetHeight)
-            panelFrameBeforeZoom = restoredFrame
+            restoredFrame.size.height = heights.target
+            restoredFrame.origin.y = max(screen.visibleFrame.minY + 24, top - heights.target)
+            if state.showsResultPanel, state.slashCommandMenuHeight == 0 {
+                panelFrameBeforeZoom = restoredFrame
+            } else {
+                panelFrameBeforeZoom = nil
+                panel.setFrame(restoredFrame, display: true, animate: true)
+            }
             return
         }
-        guard panel.frame.height != targetHeight else {
+        guard panel.frame.height != heights.target else {
             return
         }
         var frame = panel.frame
         let top = frame.maxY
-        frame.size.height = targetHeight
-        frame.origin.y = max(screen.visibleFrame.minY + 24, top - targetHeight)
+        frame.size.height = heights.target
+        frame.origin.y = max(screen.visibleFrame.minY + 24, top - heights.target)
         panel.setFrame(frame, display: true, animate: true)
     }
 
     // Enlarges the panel without creating a second window-size state inside NSWindow.
     private func togglePanelZoom() {
-        guard let panel, let screen = panel.screen else {
+        guard let panel,
+              let state,
+              state.showsResultPanel,
+              state.slashCommandMenuHeight == 0,
+              let screen = panel.screen else {
             return
         }
         if let restoredFrame = panelFrameBeforeZoom {

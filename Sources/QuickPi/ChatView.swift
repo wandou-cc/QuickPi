@@ -634,8 +634,7 @@ struct ChatView: View {
                     )
             }
             .padding(.horizontal, 14)
-            .padding(.top, state.showsResultPanel ? 0 : 10)
-            .padding(.bottom, state.showsResultPanel ? 20 : 10)
+            .padding(.vertical, 10)
             .frame(maxWidth: state.showsResultPanel ? 680 : .infinity)
             .frame(maxWidth: .infinity, alignment: .center)
 
@@ -1120,7 +1119,12 @@ struct ChatView: View {
             Spacer(minLength: 0)
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
-                .onTapGesture(count: 2, perform: togglePanelZoom)
+                .onTapGesture(count: 2) {
+                    guard state.showsResultPanel, state.slashCommandMenuHeight == 0 else {
+                        return
+                    }
+                    togglePanelZoom()
+                }
 
             if state.hasResultPanelContent {
                 Button {

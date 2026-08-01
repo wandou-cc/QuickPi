@@ -43,6 +43,21 @@ struct SettingsView: View {
         state.settings.providers.contains { $0.id == provider.id }
     }
 
+    private var currentAppVersion: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        switch (version, build) {
+        case let (.some(version), .some(build)):
+            return "\(version) (\(build))"
+        case let (.some(version), .none):
+            return version
+        case let (.none, .some(build)):
+            return build
+        case (.none, .none):
+            return "未知"
+        }
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 6) {
@@ -218,6 +233,12 @@ struct SettingsView: View {
             }
 
             Section("软件更新") {
+                LabeledContent("当前版本") {
+                    Text(currentAppVersion)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
                 Button {
                     state.checkForUpdates()
                 } label: {
