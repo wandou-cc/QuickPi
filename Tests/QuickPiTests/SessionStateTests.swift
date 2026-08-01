@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import UniformTypeIdentifiers
 import XCTest
 @testable import QuickPi
 
@@ -20,11 +19,41 @@ final class SessionStateTests: XCTestCase {
             ["new", "worktree", "settings", "copy", "name", "session", "compact", "clone", "branch", "export"]
         )
         XCTAssertTrue(state.slashCommandSuggestions.allSatisfy { $0.source == .app })
-        XCTAssertEqual(state.inputBarHeight, 102)
+        XCTAssertEqual(state.inputBarHeight, 154)
         XCTAssertEqual(state.slashCommandMenuHeight, 185)
 
         state.draft = "/settings"
         XCTAssertTrue(state.draftMatchesSlashCommand)
+    }
+
+    @MainActor
+    func testInputEditorHeightGrowsWithinEightLineBounds() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+
+        XCTAssertEqual(state.inputBarHeight, 154)
+        XCTAssertEqual(state.inputEditorBarHeight, 116)
+
+        let editor = PromptTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 96))
+        editor.string = "第一行\n第二行\n第三行\n第四行\n第五行"
+        let measuredHeight = editor.contentHeight
+        XCTAssertGreaterThan(measuredHeight, 96)
+
+        state.setInputEditorHeight(measuredHeight)
+        XCTAssertEqual(state.inputEditorHeight, measuredHeight)
+        XCTAssertEqual(state.inputBarHeight, 58 + measuredHeight)
+        XCTAssertEqual(state.inputEditorBarHeight, 20 + measuredHeight)
+
+        state.setInputEditorHeight(1_000)
+        XCTAssertEqual(state.inputBarHeight, 228)
+        XCTAssertEqual(state.inputEditorBarHeight, 190)
+
+        state.setInputEditorHeight(1)
+        XCTAssertEqual(state.inputBarHeight, 154)
+        XCTAssertEqual(state.inputEditorBarHeight, 116)
     }
 
     // Verifies that an image paste enters the existing attachment pipeline and becomes normalized JPEG data.
@@ -47,28 +76,27 @@ final class SessionStateTests: XCTestCase {
             bytesPerRow: 0,
             bitsPerPixel: 0
         ))
-        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
-        let provider = NSItemProvider()
-        provider.suggestedName = "clipboard.png"
-        provider.registerDataRepresentation(
-            forTypeIdentifier: UTType.png.identifier,
-            visibility: .all
-        ) { completion in
-            completion(png, nil)
-            return nil
-        }
+        let image = NSImage(size: NSSize(width: 4, height: 2))
+        image.addRepresentation(bitmap)
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("QuickPiTests-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        defer { pasteboard.clearContents() }
+        XCTAssertTrue(pasteboard.writeObjects([image]))
 
-        await state.addPastedImages(providers: [provider])
+        let providers = PromptTextView.imageProviders(from: pasteboard)
+        XCTAssertEqual(providers.count, 1)
+
+        await state.addPastedImages(providers: providers)
 
         let attachment = try XCTUnwrap(state.attachments.first)
         XCTAssertEqual(state.attachments.count, 1)
-        XCTAssertEqual(attachment.name, "clipboard.png")
+        XCTAssertEqual(attachment.name, "粘贴图片")
         guard case let .image(data, mimeType) = attachment.content else {
             return XCTFail("粘贴图片未生成图片附件")
         }
         XCTAssertEqual(mimeType, "image/jpeg")
         XCTAssertNotNil(NSImage(data: data))
-        XCTAssertEqual(state.inputBarHeight, 140)
+        XCTAssertEqual(state.inputBarHeight, 192)
         XCTAssertNil(state.runtimeError)
     }
 
@@ -216,6 +244,7 @@ final class SessionStateTests: XCTestCase {
                     timestamp: 2_000,
                     content: [
                         content(type: .text, text: "开始检查。"),
+                        content(type: .thinking, thinking: " \n"),
                         content(
                             type: .toolCall,
                             toolCallId: "call-1",
@@ -270,6 +299,12 @@ final class SessionStateTests: XCTestCase {
         XCTAssertEqual(answer.cloneEntryId, "user-1")
         XCTAssertEqual(answer.status, .completed)
         XCTAssertEqual(answer.answerText, "开始检查。\n\n检查完成。")
+        XCTAssertFalse(answer.sections.contains { section in
+            if case .thinking = section.content {
+                return true
+            }
+            return false
+        })
         XCTAssertEqual(answer.usage.totalTokens, 45)
         guard case .tool(let tool) = answer.sections[1].content else {
             return XCTFail("第二个回答区块应为工具调用")
@@ -367,6 +402,73 @@ final class SessionStateTests: XCTestCase {
         XCTAssertTrue(state.showsResultPanel)
     }
 
+    // Keeps active native-editor input intact while model events continuously refresh the answer view.
+    @MainActor
+    func testStreamingOutputPreservesEditedDraft() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        _ = try applyEmptySession(to: state, id: "session-streaming-draft")
+
+        state.consume(.userMessage("正在回答的问题"))
+        state.consume(.agentStarted)
+        state.draft = "输出期间输入的新问题"
+        state.consume(.thinkingDelta("继续思考"))
+        state.consume(.textDelta("第一段输出"))
+        state.consume(.textDelta("第二段输出"))
+
+        XCTAssertEqual(state.draft, "输出期间输入的新问题")
+        XCTAssertEqual(state.answer?.answerText, "第一段输出第二段输出")
+    }
+
+    // Splits queued steering and follow-up deliveries into the exact user turns emitted by Pi.
+    @MainActor
+    func testQueuedMessagesBecomeSeparateConversationTurns() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        _ = try applyEmptySession(to: state, id: "session-queue")
+
+        state.consume(.userMessage("正在处理"))
+        state.consume(.agentStarted)
+        state.consume(.textDelta("第一轮回答"))
+        state.consume(.queueChanged(steering: ["优先处理"], followUp: ["稍后处理"]))
+
+        XCTAssertEqual(state.queuedSteeringMessages, ["优先处理"])
+        XCTAssertEqual(state.queuedFollowUpMessages, ["稍后处理"])
+        XCTAssertTrue(state.showsResultPanel)
+
+        state.consume(.queueChanged(steering: [], followUp: ["稍后处理"]))
+        state.consume(.userMessage("优先处理"))
+        state.consume(.textDelta("插队回答"))
+
+        XCTAssertEqual(
+            state.conversationAnswers.map { $0.question?.text },
+            ["正在处理", "优先处理"]
+        )
+        XCTAssertEqual(state.conversationAnswers[0].status, .completed)
+        XCTAssertEqual(state.answer?.status, .running)
+
+        state.consume(.queueChanged(steering: [], followUp: []))
+        state.consume(.userMessage("稍后处理"))
+        state.consume(.textDelta("排队回答"))
+        state.consume(.settled)
+
+        XCTAssertEqual(
+            state.conversationAnswers.map { $0.question?.text },
+            ["正在处理", "优先处理", "稍后处理"]
+        )
+        XCTAssertEqual(state.conversationAnswers[1].status, .completed)
+        XCTAssertEqual(state.answer?.status, .completed)
+        XCTAssertEqual(state.answer?.answerText, "排队回答")
+        XCTAssertTrue(state.queuedSteeringMessages.isEmpty)
+        XCTAssertTrue(state.queuedFollowUpMessages.isEmpty)
+    }
+
     // Keeps a plugin command and its fire-and-forget notification in the same visible conversation turn.
     @MainActor
     func testExtensionNotificationAppearsUnderVisiblePluginCommand() throws {
@@ -393,7 +495,7 @@ final class SessionStateTests: XCTestCase {
         }
         XCTAssertEqual(notification.kind, .info)
         XCTAssertTrue(state.showsResultPanel)
-        XCTAssertEqual(state.inputBarHeight, 102)
+        XCTAssertEqual(state.inputBarHeight, 154)
     }
 
     // Keeps fire-and-forget plugin output when an idle session later receives a fresh Pi process.
@@ -500,7 +602,7 @@ final class SessionStateTests: XCTestCase {
         )
         XCTAssertEqual(state.extensionTitle, "Plugin workspace")
         XCTAssertEqual(state.draft, "prefilled")
-        XCTAssertEqual(state.inputBarHeight, 146)
+        XCTAssertEqual(state.inputBarHeight, 198)
 
         try runtime.consumeExtensionRequest(Data(
             #"{"type":"extension_ui_request","id":"6","method":"setStatus","statusKey":"sync","statusText":"Done"}"#.utf8
@@ -544,7 +646,7 @@ final class SessionStateTests: XCTestCase {
                 placement: .aboveEditor
             )]
         )
-        XCTAssertEqual(state.inputBarHeight, 102)
+        XCTAssertEqual(state.inputBarHeight, 154)
 
         try runtime.consumeExtensionRequest(Data(
             #"{"type":"extension_ui_request","id":"clear-plan-status","method":"setStatus","statusKey":"plan-mode"}"#.utf8
@@ -640,6 +742,55 @@ final class SessionStateTests: XCTestCase {
         XCTAssertEqual(state.activeSessionID, background.id)
         XCTAssertFalse(state.hasUnreadCompletion(id: background.id))
         XCTAssertEqual(state.conversationAnswers.first?.answerText, "后台回答")
+    }
+
+    // Keeps a running session visible when a newly created process scans disk before that session is listed.
+    @MainActor
+    func testNewSessionSnapshotRetainsConcurrentRunningSession() throws {
+        let state = try AppState(
+            applicationSupportDirectory: try temporaryDirectory(),
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        let cwd = FileManager.default.homeDirectoryForCurrentUser
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        let first = conversationSession(id: "first", cwd: cwd, firstMessage: "第一个会话")
+        let running = conversationSession(id: "running", cwd: cwd, firstMessage: "")
+        let created = conversationSession(id: "created", cwd: cwd, firstMessage: "")
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: first.path,
+            activeSessionId: first.id,
+            sessions: [first, running],
+            messages: []
+        ))
+
+        state.consume(.userMessage("后台任务"), sessionID: running.id)
+        state.consume(.agentStarted, sessionID: running.id)
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: created.path,
+            activeSessionId: created.id,
+            sessions: [created, first],
+            messages: []
+        ))
+
+        XCTAssertEqual(state.activeSessionID, created.id)
+        XCTAssertEqual(Set(state.sessions.map(\.id)), Set([first.id, running.id, created.id]))
+        XCTAssertTrue(state.isSessionRunning(id: running.id))
+
+        state.consume(.settled, sessionID: running.id)
+        try state.applySessionSnapshot(SessionSnapshot(
+            cwd: cwd,
+            activeSessionPath: created.path,
+            activeSessionId: created.id,
+            sessions: [created, first],
+            messages: []
+        ), preservingInput: true)
+
+        XCTAssertEqual(state.sessions.map(\.id), [created.id, first.id])
     }
 
     // Restores displayable custom messages from the active Pi branch after a runtime restart.

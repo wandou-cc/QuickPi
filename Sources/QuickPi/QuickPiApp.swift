@@ -3,7 +3,8 @@ import Carbon
 import Sparkle
 import SwiftUI
 
-private let panelMinimumWidth: CGFloat = 600
+private let panelMinimumWidth: CGFloat = 720
+private let panelDefaultResultContentHeight: CGFloat = 520
 
 private let hotKeyHandler: EventHandlerUPP = { _, _, userData in
     guard let userData else {
@@ -109,13 +110,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         userDriverDelegate: nil
     )
     private var panel: QuickPanel?
-    private var settingsWindow: NSWindow?
-    private var gitWindow: NSWindow?
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
     private var shortcut: GlobalShortcut?
     private var state: AppState?
-    private var resultContentHeight: CGFloat = 520
+    private var resultContentHeight = panelDefaultResultContentHeight
     private var panelFrameBeforeZoom: NSRect?
     private var pasteboardChangeCount = 0
 
@@ -145,8 +144,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             )
             state = appState
             createPanel(state: appState)
-            createSettingsWindow(state: appState)
-            createGitWindow(state: appState)
             createStatusItem()
             shortcut = try GlobalShortcut { [weak self] in
                 self?.handleGlobalShortcut()
@@ -191,6 +188,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return false
     }
 
+    // Enforces the panel bounds even when a borderless window bypasses contentMinSize during live resize.
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        guard sender === panel else {
+            return frameSize
+        }
+        return NSSize(
+            width: max(frameSize.width, panelMinimumWidth),
+            height: max(frameSize.height, sender.minSize.height)
+        )
+    }
+
     // Preserves only user-driven result height changes while streamed events continue updating the panel.
     func windowDidResize(_ notification: Notification) {
         guard let panel,
@@ -229,7 +237,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Hosts the compact SwiftUI launcher in a borderless AppKit panel.
     private func createPanel(state: AppState) {
         let panel = QuickPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 840, height: 102),
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: 840,
+                height: state.inputBarHeight
+            ),
             styleMask: [.borderless, .resizable],
             backing: .buffered,
             defer: false
@@ -250,57 +263,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             },
             presentGitActions: { [unowned self] in
                 self.showGitActions()
+            },
+            setPanelHidesOnDeactivate: { [unowned self] hidesOnDeactivate in
+                self.panel?.hidesOnDeactivate = hidesOnDeactivate
             }
         )
         .dynamicTypeSize(.medium))
         // AppKit owns panel sizing; SwiftUI must not rewrite it after the backing screen changes.
         hostingView.sizingOptions = []
         panel.contentView = hostingView
-        panel.contentMinSize = NSSize(width: panelMinimumWidth, height: 102)
+        let initialMinimumSize = NSSize(
+            width: panelMinimumWidth,
+            height: state.inputBarHeight
+        )
+        panel.contentMinSize = initialMinimumSize
+        panel.minSize = initialMinimumSize
         self.panel = panel
-    }
-
-    // Hosts settings in a titled standalone window so it remains draggable and non-modal.
-    private func createSettingsWindow(state: AppState) {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 780, height: 660),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "设置"
-        window.isReleasedWhenClosed = false
-        window.level = .normal
-        window.tabbingMode = .disallowed
-        window.delegate = self
-        window.contentView = NSHostingView(rootView: SettingsView(
-            state: state,
-            setPanelHidesOnDeactivate: { [unowned self] hidesOnDeactivate in
-                self.panel?.hidesOnDeactivate = hidesOnDeactivate
-            }
-        )
-        .dynamicTypeSize(.medium))
-        window.center()
-        settingsWindow = window
-    }
-
-    // Hosts Git operations in a persistent native window opened from the existing branch button.
-    private func createGitWindow(state: AppState) {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 486),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Git"
-        window.isReleasedWhenClosed = false
-        window.level = .normal
-        window.tabbingMode = .disallowed
-        window.delegate = self
-        window.contentView = NSHostingView(rootView: GitActionsView(state: state)
-            .dynamicTypeSize(.medium))
-        window.center()
-        gitWindow = window
     }
 
     // Creates a left-click launcher and a right-click application menu.
@@ -406,29 +384,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NotificationCenter.default.post(name: .quickPiFocusInput, object: nil)
     }
 
-    // Opens the independent settings window above the main panel.
+    // Presents settings as a modal sheet attached to the main panel.
     private func showSettings() {
-        guard let settingsWindow else {
-            preconditionFailure("设置窗口必须在打开前创建")
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        settingsWindow.makeKeyAndOrderFront(nil)
+        showPanel()
+        NotificationCenter.default.post(name: .quickPiPresentSettings, object: nil)
     }
 
-    // Opens the Git window without changing the branch entry in the main panel.
+    // Presents Git actions as a modal sheet attached to the main panel.
     private func showGitActions() {
-        guard let gitWindow, let state else {
-            preconditionFailure("Git 窗口必须在打开前创建")
-        }
-        if !gitWindow.isVisible {
-            gitWindow.contentView = NSHostingView(rootView: GitActionsView(state: state)
-                .dynamicTypeSize(.medium))
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        gitWindow.makeKeyAndOrderFront(nil)
+        showPanel()
+        NotificationCenter.default.post(name: .quickPiPresentGitActions, object: nil)
     }
 
-    // Expands results downward while keeping the input bar's top edge stationary.
+    // Resizes body and editor content while keeping the panel's top edge stable.
     private func updatePanelSize() {
         guard let panel, let state, let screen = panel.screen else {
             return
@@ -436,24 +404,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.title = state.extensionTitle ?? "Quick Pi"
         let inputHeight = state.inputBarHeight
         let requestedHeight: CGFloat
-        let minimumHeight: CGFloat
         if state.slashCommandMenuHeight > 0 {
-            minimumHeight = inputHeight + state.slashCommandMenuHeight
-            requestedHeight = minimumHeight
+            requestedHeight = inputHeight + state.slashCommandMenuHeight
         } else if state.showsResultPanel {
-            minimumHeight = inputHeight + 241
             requestedHeight = inputHeight + resultContentHeight
         } else {
-            minimumHeight = inputHeight
             requestedHeight = inputHeight
         }
         // Keep the existing 96-point top offset and a 24-point bottom margin on every screen.
         let maximumHeight = max(inputHeight, screen.visibleFrame.height - 120)
-        let targetHeight = min(requestedHeight, maximumHeight)
-        panel.contentMinSize = NSSize(
+        let targetHeight = min(max(requestedHeight, inputHeight), maximumHeight)
+        let minimumSize = NSSize(
             width: panelMinimumWidth,
-            height: min(minimumHeight, maximumHeight)
+            height: inputHeight
         )
+        panel.contentMinSize = minimumSize
+        panel.minSize = minimumSize
         if var restoredFrame = panelFrameBeforeZoom {
             let top = restoredFrame.maxY
             restoredFrame.size.height = targetHeight

@@ -31,16 +31,247 @@ private final class ResultScrollTracker {
     var followsPendingAnswerChange = false
 }
 
+final class PromptTextView: NSTextView {
+    var onPasteImages: (([NSItemProvider]) -> Void)?
+    var onSubmit: (() -> Void)?
+    var onMoveSuggestion: ((Int) -> Bool)?
+    var onWidthChange: (() -> Void)?
+
+    // Creates the standard AppKit text system required by the designated text-view initializer.
+    override convenience init(frame frameRect: NSRect) {
+        let textStorage = NSTextStorage()
+        let layoutManager = NSLayoutManager()
+        textStorage.addLayoutManager(layoutManager)
+        let textContainer = NSTextContainer(size: NSSize(
+            width: frameRect.width,
+            height: CGFloat.greatestFiniteMagnitude
+        ))
+        layoutManager.addTextContainer(textContainer)
+        self.init(frame: frameRect, textContainer: textContainer)
+    }
+
+    // Configures the plain multiline editor used inside the SwiftUI input bar.
+    override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
+        super.init(frame: frameRect, textContainer: container)
+        drawsBackground = false
+        isRichText = false
+        importsGraphics = false
+        allowsUndo = true
+        font = .systemFont(ofSize: chatMessageFontSize)
+        textColor = .labelColor
+        textContainerInset = NSSize(width: 6, height: 10)
+        textContainer?.lineFragmentPadding = 0
+        textContainer?.widthTracksTextView = true
+        isHorizontallyResizable = false
+        isVerticallyResizable = true
+        autoresizingMask = [.width]
+        minSize = NSSize(width: 0, height: 96)
+        maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+    }
+
+    // This editor is created in code and is never restored from an AppKit archive.
+    required init?(coder: NSCoder) {
+        fatalError("PromptTextView does not support NSCoder")
+    }
+
+    // Returns the laid-out text height, including the editor's vertical insets.
+    var contentHeight: CGFloat {
+        guard let layoutManager, let textContainer else {
+            preconditionFailure("PromptTextView requires its AppKit text system")
+        }
+        layoutManager.ensureLayout(for: textContainer)
+        let glyphRange = layoutManager.glyphRange(for: textContainer)
+        let textBounds = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        let textBottom = max(textBounds.maxY, layoutManager.extraLineFragmentRect.maxY)
+        return ceil(textBottom + textContainerInset.height * 2)
+    }
+
+    // Converts native image objects from the pasteboard into the existing attachment input contract.
+    static func imageProviders(from pasteboard: NSPasteboard) -> [NSItemProvider] {
+        let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage] ?? []
+        return images.map { NSItemProvider(object: $0) }
+    }
+
+    // Sends image paste commands to the attachment pipeline while preserving native text paste.
+    override func paste(_ sender: Any?) {
+        let providers = Self.imageProviders(from: .general)
+        guard !providers.isEmpty else {
+            super.paste(sender)
+            return
+        }
+        guard let onPasteImages else {
+            preconditionFailure("PromptTextView image paste handler is not configured")
+        }
+        onPasteImages(providers)
+    }
+
+    // Preserves submit and slash-command navigation before passing ordinary editing keys to AppKit.
+    override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers.isEmpty && !hasMarkedText() {
+            if event.keyCode == 36 || event.keyCode == 76 {
+                guard let onSubmit else {
+                    preconditionFailure("PromptTextView submit handler is not configured")
+                }
+                onSubmit()
+                return
+            }
+            if event.keyCode == 126 || event.keyCode == 125 {
+                guard let onMoveSuggestion else {
+                    preconditionFailure("PromptTextView suggestion handler is not configured")
+                }
+                let offset = event.keyCode == 126 ? -1 : 1
+                if onMoveSuggestion(offset) {
+                    return
+                }
+            }
+        }
+        super.keyDown(with: event)
+    }
+
+    // Recalculates wrapped text when the available editor width changes.
+    override func setFrameSize(_ newSize: NSSize) {
+        let widthChanged = abs(frame.width - newSize.width) >= 1
+        super.setFrameSize(newSize)
+        if widthChanged {
+            onWidthChange?()
+        }
+    }
+}
+
+private struct PromptEditor: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    let onHeightChange: (CGFloat) -> Void
+    let onPasteImages: ([NSItemProvider]) -> Void
+    let onSubmit: () -> Void
+    let onMoveSuggestion: (Int) -> Bool
+
+    // Creates the coordinator that keeps AppKit editing state synchronized with SwiftUI.
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    // Builds one vertically resizable native text view inside a transparent scroll container.
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasHorizontalScroller = false
+        scrollView.hasVerticalScroller = false
+
+        let textView = PromptTextView(frame: NSRect(origin: .zero, size: scrollView.contentSize))
+        textView.string = text
+        textView.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+        textView.delegate = context.coordinator
+        textView.onPasteImages = { context.coordinator.parent.onPasteImages($0) }
+        textView.onSubmit = { context.coordinator.parent.onSubmit() }
+        textView.onMoveSuggestion = { context.coordinator.parent.onMoveSuggestion($0) }
+        textView.onWidthChange = { context.coordinator.scheduleHeightUpdate() }
+        scrollView.documentView = textView
+        context.coordinator.textView = textView
+        context.coordinator.scheduleHeightUpdate()
+        return scrollView
+    }
+
+    // Applies external draft and focus changes without replacing user-driven selections.
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        guard let textView = context.coordinator.textView else {
+            preconditionFailure("PromptEditor requires its native text view")
+        }
+        let bindingTextChanged = text != context.coordinator.representedText
+        context.coordinator.representedText = text
+        if bindingTextChanged && textView.string != text {
+            textView.string = text
+            let end = (text as NSString).length
+            textView.setSelectedRange(NSRange(location: end, length: 0))
+            textView.scrollRangeToVisible(NSRange(location: end, length: 0))
+            context.coordinator.scheduleHeightUpdate()
+        }
+        if isFocused && textView.window?.firstResponder !== textView {
+            DispatchQueue.main.async {
+                guard context.coordinator.parent.isFocused,
+                      let window = textView.window else {
+                    return
+                }
+                window.makeFirstResponder(textView)
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: PromptEditor
+        var representedText: String
+        weak var textView: PromptTextView?
+        private var heightUpdateScheduled = false
+
+        // Stores the current SwiftUI bindings and action closures for native callbacks.
+        init(parent: PromptEditor) {
+            self.parent = parent
+            representedText = parent.text
+        }
+
+        // Propagates native text edits and their new intrinsic height.
+        func textDidChange(_ notification: Notification) {
+            guard let textView else {
+                preconditionFailure("PromptEditor text callback requires its native text view")
+            }
+            parent.text = textView.string
+            representedText = textView.string
+            parent.onHeightChange(textView.contentHeight)
+        }
+
+        // Keeps the SwiftUI focus border in sync when editing begins.
+        func textDidBeginEditing(_ notification: Notification) {
+            parent.isFocused = true
+        }
+
+        // Keeps the SwiftUI focus border in sync when editing ends.
+        func textDidEndEditing(_ notification: Notification) {
+            parent.isFocused = false
+        }
+
+        // Defers layout-driven measurements until AppKit has updated line wrapping.
+        func scheduleHeightUpdate() {
+            guard !heightUpdateScheduled else {
+                return
+            }
+            heightUpdateScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let textView else {
+                    return
+                }
+                heightUpdateScheduled = false
+                parent.onHeightChange(textView.contentHeight)
+            }
+        }
+    }
+}
+
 extension Notification.Name {
     static let quickPiFocusInput = Notification.Name("quickPiFocusInput")
+    static let quickPiPresentSettings = Notification.Name("quickPiPresentSettings")
+    static let quickPiPresentGitActions = Notification.Name("quickPiPresentGitActions")
+}
+
+private enum AppModal: String, Identifiable {
+    case settings
+    case git
+
+    var id: String { rawValue }
 }
 
 struct ChatView: View {
     @ObservedObject var state: AppState
     let togglePanelZoom: () -> Void
     let presentGitActions: () -> Void
+    let setPanelHidesOnDeactivate: (Bool) -> Void
     @AppStorage("showSystemStatus") private var showSystemStatus = true
-    @FocusState private var promptFocused: Bool
+    @State private var promptFocused = false
     @State private var confirmsDeletingSessions = false
     @State private var sessionPendingDeletion: ConversationSession?
     @State private var sessionsPresented = false
@@ -49,24 +280,37 @@ struct ChatView: View {
     @State private var slashCommandScrollRequest: SlashCommandScrollRequest?
     @State private var modelMenuPresented = false
     @State private var resultScrollTracker = ResultScrollTracker()
+    @State private var activeModal: AppModal?
 
     var body: some View {
         VStack(spacing: 0) {
-            inputBar
+            contextBar
             if !state.slashCommandSuggestions.isEmpty {
                 slashCommandMenu
             } else if state.showsResultPanel {
-                Divider()
-                    .opacity(0.65)
                 resultPanel
             }
+            inputBar
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.white)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(.primary.opacity(0.12))
+        }
+        .sheet(item: $activeModal) { modal in
+            switch modal {
+            case .settings:
+                SettingsView(
+                    state: state,
+                    setPanelHidesOnDeactivate: setPanelHidesOnDeactivate
+                )
+                .dynamicTypeSize(.medium)
+            case .git:
+                GitActionsView(state: state)
+                    .dynamicTypeSize(.medium)
+            }
         }
         .sheet(isPresented: Binding(
             get: { state.extensionPrompt != nil },
@@ -121,6 +365,12 @@ struct ChatView: View {
         .onReceive(NotificationCenter.default.publisher(for: .quickPiFocusInput)) { _ in
             promptFocused = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: .quickPiPresentSettings)) { _ in
+            activeModal = .settings
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .quickPiPresentGitActions)) { _ in
+            activeModal = .git
+        }
         .onChange(of: state.draft) { _, _ in
             selectedSlashCommandIndex = 0
             if !state.slashCommandSuggestions.isEmpty {
@@ -136,8 +386,6 @@ struct ChatView: View {
 
     private var inputBar: some View {
         VStack(spacing: 0) {
-            contextBar
-
             ForEach(state.extensionWidgets.filter {
                 $0.key != ExtensionWidget.planModeKey && $0.placement == .aboveEditor
             }) { widget in
@@ -202,54 +450,57 @@ struct ChatView: View {
                 .foregroundStyle(.secondary)
                 .help("添加附件")
 
-                TextField(
-                    "问点什么",
-                    text: Binding(
-                        get: { state.draft },
-                        set: { state.draft = $0 }
-                    )
-                )
-                    .textFieldStyle(.plain)
-                    .font(.system(size: chatMessageFontSize))
-                    .frame(minWidth: 120)
-                    .focused($promptFocused)
-                    .onPasteCommand(of: [.image]) { providers in
-                        Task { await state.addPastedImages(providers: providers) }
-                    }
-                    .onSubmit {
-                        let suggestions = state.slashCommandSuggestions
-                        if suggestions.isEmpty {
-                            Task { await state.send() }
-                        } else if state.draftMatchesSlashCommand {
-                            Task { await state.send() }
-                        } else {
-                            selectSlashCommand(
-                                suggestions[min(selectedSlashCommandIndex, suggestions.count - 1)]
-                            )
-                        }
-                    }
-                    .onKeyPress(keys: [.upArrow, .downArrow]) { keyPress in
-                        guard keyPress.modifiers.isEmpty else {
-                            return .ignored
-                        }
-                        let suggestions = state.slashCommandSuggestions
-                        guard !suggestions.isEmpty else {
-                            return .ignored
-                        }
-                        let nextIndex: Int
-                        if keyPress.key == .upArrow {
-                            nextIndex = (
-                                selectedSlashCommandIndex + suggestions.count - 1
+                ZStack(alignment: .topLeading) {
+                    PromptEditor(
+                        text: Binding(
+                            get: { state.draft },
+                            set: { state.draft = $0 }
+                        ),
+                        isFocused: $promptFocused,
+                        onHeightChange: state.setInputEditorHeight,
+                        onPasteImages: { providers in
+                            Task { await state.addPastedImages(providers: providers) }
+                        },
+                        onSubmit: {
+                            let suggestions = state.slashCommandSuggestions
+                            if suggestions.isEmpty {
+                                Task { await state.send() }
+                            } else if state.draftMatchesSlashCommand {
+                                Task { await state.send() }
+                            } else {
+                                selectSlashCommand(
+                                    suggestions[min(selectedSlashCommandIndex, suggestions.count - 1)]
+                                )
+                            }
+                        },
+                        onMoveSuggestion: { offset in
+                            let suggestions = state.slashCommandSuggestions
+                            guard !suggestions.isEmpty else {
+                                return false
+                            }
+                            let nextIndex = (
+                                selectedSlashCommandIndex + suggestions.count + offset
                             ) % suggestions.count
-                        } else {
-                            nextIndex = (selectedSlashCommandIndex + 1) % suggestions.count
+                            selectedSlashCommandIndex = nextIndex
+                            slashCommandScrollRequest = SlashCommandScrollRequest(
+                                commandName: suggestions[nextIndex].name
+                            )
+                            return true
                         }
-                        selectedSlashCommandIndex = nextIndex
-                        slashCommandScrollRequest = SlashCommandScrollRequest(
-                            commandName: suggestions[nextIndex].name
-                        )
-                        return .handled
+                    )
+
+                    if state.draft.isEmpty {
+                        Text("问点什么")
+                            .font(.system(size: chatMessageFontSize))
+                            .foregroundStyle(.tertiary)
+                            .padding(.leading, 6)
+                            .padding(.top, 10)
+                            .allowsHitTesting(false)
                     }
+                }
+                .frame(minWidth: 120)
+                .frame(height: state.inputEditorHeight)
+                .layoutPriority(1)
 
                 Divider()
                     .frame(height: 18)
@@ -269,16 +520,19 @@ struct ChatView: View {
                         } ?? "选择模型")
                             .lineLimit(1)
                             .truncationMode(.middle)
-                            .frame(maxWidth: 140)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .layoutPriority(1)
                         Image(systemName: "chevron.down")
                             .font(.system(size: 9, weight: .semibold))
+                            .fixedSize()
                     }
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .frame(height: 30)
+                    .padding(.horizontal, 8)
+                    .frame(width: 140, height: 30)
                 }
                 .buttonStyle(.plain)
+                .frame(width: 140)
                 .disabled(
                     !state.runtimeReady
                         || state.hasRunningSessions
@@ -301,66 +555,89 @@ struct ChatView: View {
                     modelMenu
                 }
 
-                Button {
-                    Task { await state.send() }
-                } label: {
-                    if state.extensionCommandRunning {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 20))
-                    }
-                }
-                .buttonStyle(.plain)
-                .frame(width: 30, height: 30)
-                .foregroundStyle(Color.accentColor)
-                .disabled(
-                    state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || !state.runtimeReady
-                        || state.isBusy
-                        || state.sessionChanging
-                        || state.gitOperationRunning
-                )
-                .help("发送")
+                if state.isAnswering
+                    && !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    HStack(spacing: 6) {
+                        Button {
+                            Task { await state.send(steering: true) }
+                        } label: {
+                            Label("插队", systemImage: "arrowshape.turn.up.right.fill")
+                                .font(.caption.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.plain)
+                        .frame(width: 60, height: 30)
+                        .foregroundStyle(.orange)
+                        .disabled(state.promptSubmissionRunning)
+                        .help("在当前工具调用结束后优先发送")
 
-                if !state.showsResultPanel && state.hasResultPanelContent {
+                        Button {
+                            Task { await state.send() }
+                        } label: {
+                            Label("排队", systemImage: "clock")
+                                .font(.caption.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.plain)
+                        .frame(width: 60, height: 30)
+                        .foregroundStyle(Color.accentColor)
+                        .disabled(state.promptSubmissionRunning)
+                        .help("当前回答完成后发送")
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                } else {
                     Button {
-                        state.toggleResultPanel()
+                        if state.isAnswering {
+                            Task { await state.abort() }
+                        } else {
+                            Task { await state.send() }
+                        }
                     } label: {
-                        Image(systemName: "chevron.down")
+                        if state.promptSubmissionRunning || state.extensionCommandRunning {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else if state.isAnswering {
+                            Image(systemName: "stop.circle.fill")
+                                .font(.system(size: 20))
+                        } else {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: 20))
+                        }
                     }
                     .buttonStyle(.plain)
                     .frame(width: 30, height: 30)
-                    .foregroundStyle(.secondary)
-                    .help("展开结果")
+                    .foregroundStyle(state.isAnswering ? Color.red : Color.accentColor)
+                    .disabled(
+                        !state.runtimeReady
+                            || state.promptSubmissionRunning
+                            || state.sessionChanging
+                            || state.gitOperationRunning
+                            || (!state.isAnswering
+                                && (state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                    || state.isBusy))
+                    )
+                    .help(state.isAnswering ? "停止回答" : "发送")
                 }
 
-                Button {
-                    state.presentSettings()
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .buttonStyle(.plain)
-                .frame(width: 30, height: 30)
-                .foregroundStyle(.secondary)
-                .help("设置")
             }
             .padding(.horizontal, 8)
-            .frame(height: 44)
+            .frame(minHeight: 44)
             .background(
-                Color(nsColor: .textBackgroundColor),
-                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                Color.white,
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
             )
             .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .stroke(
                         promptFocused ? Color.accentColor.opacity(0.5) : Color.primary.opacity(0.12),
                         lineWidth: promptFocused ? 1.5 : 1
                     )
             }
             .padding(.horizontal, 14)
-            .frame(height: 64)
+            .padding(.top, state.showsResultPanel ? 0 : 10)
+            .padding(.bottom, state.showsResultPanel ? 20 : 10)
+            .frame(maxWidth: state.showsResultPanel ? 680 : .infinity)
+            .frame(maxWidth: .infinity, alignment: .center)
 
             ForEach(state.extensionWidgets.filter {
                 $0.key != ExtensionWidget.planModeKey && $0.placement == .belowEditor
@@ -381,7 +658,7 @@ struct ChatView: View {
                 .background(.primary.opacity(0.025))
             }
         }
-        .frame(height: state.inputBarHeight)
+        .frame(height: state.inputEditorBarHeight)
     }
 
     private var slashCommandMenu: some View {
@@ -845,6 +1122,18 @@ struct ChatView: View {
                 .contentShape(Rectangle())
                 .onTapGesture(count: 2, perform: togglePanelZoom)
 
+            if state.hasResultPanelContent {
+                Button {
+                    state.toggleResultPanel()
+                } label: {
+                    Image(systemName: state.showsResultPanel ? "chevron.up" : "chevron.down")
+                }
+                .buttonStyle(.plain)
+                .frame(width: 30, height: 28)
+                .foregroundStyle(.secondary)
+                .help(state.showsResultPanel ? "收起结果" : "展开结果")
+            }
+
             Button {
                 Task { await state.createSession(usesIndependentWorktree: false) }
             } label: {
@@ -860,6 +1149,16 @@ struct ChatView: View {
                     || state.gitOperationRunning
             )
             .help("在当前目录新建会话")
+
+            Button {
+                state.presentSettings()
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.plain)
+            .frame(width: 30, height: 28)
+            .foregroundStyle(.secondary)
+            .help("设置")
         }
         .padding(.horizontal, 18)
         .frame(height: 38)
@@ -876,12 +1175,7 @@ struct ChatView: View {
                                     Array(state.conversationAnswers.enumerated()),
                                     id: \.element.id
                                 ) { index, answer in
-                                    let tools = answer.sections.compactMap { section in
-                                        if case .tool(let tool) = section.content {
-                                            return tool
-                                        }
-                                        return nil
-                                    }
+                                    let toolGroups = toolActivityGroupsByCallID(in: answer.sections)
 
                                     VStack(alignment: .leading, spacing: 16) {
                                         if let question = answer.question {
@@ -892,7 +1186,7 @@ struct ChatView: View {
                                             ForEach(answer.sections) { section in
                                                 AnswerSectionView(
                                                     section: section,
-                                                    tools: tools,
+                                                    toolsByCallID: toolGroups,
                                                     baseURL: state.activeWorkingDirectoryURL,
                                                     openFile: state.openLocalFile
                                                 )
@@ -1005,6 +1299,43 @@ struct ChatView: View {
                                     }
                                 }
 
+                                let queuedMessages = state.queuedSteeringMessages.map {
+                                    (text: $0, steering: true)
+                                } + state.queuedFollowUpMessages.map {
+                                    (text: $0, steering: false)
+                                }
+                                ForEach(Array(queuedMessages.enumerated()), id: \.offset) { _, message in
+                                    HStack(alignment: .top) {
+                                        Spacer(minLength: 120)
+
+                                        VStack(alignment: .trailing, spacing: 6) {
+                                            Text(message.text)
+                                                .font(.system(size: chatMessageFontSize))
+                                                .lineSpacing(3)
+                                                .lineLimit(3)
+                                                .truncationMode(.tail)
+                                                .textSelection(.enabled)
+                                                .padding(.horizontal, 13)
+                                                .padding(.vertical, 10)
+                                                .background(
+                                                    Color.secondary.opacity(0.08),
+                                                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                )
+                                                .help(message.text)
+
+                                            Label(
+                                                message.steering ? "将插队" : "已排队",
+                                                systemImage: message.steering
+                                                    ? "arrowshape.turn.up.right.fill"
+                                                    : "clock"
+                                            )
+                                            .font(.caption)
+                                            .foregroundStyle(message.steering ? Color.orange : Color.secondary)
+                                        }
+                                    }
+                                    .padding(.top, 14)
+                                }
+
                                 if let runtimeError = state.runtimeError {
                                     Label(runtimeError, systemImage: "exclamationmark.triangle")
                                         .font(.caption)
@@ -1048,44 +1379,22 @@ struct ChatView: View {
                             proxy.scrollTo("result-bottom", anchor: .bottom)
                         }
                     }
-                }
-            }
-
-            Divider()
-                .opacity(0.65)
-
-            HStack(spacing: 14) {
-                if state.isAnswering {
-                    Button {
-                        Task { await state.abort() }
-                    } label: {
-                        Image(systemName: "stop.fill")
+                    .onChange(of: state.queuedSteeringMessages + state.queuedFollowUpMessages) { _, _ in
+                        let shouldFollow = resultScrollTracker.followsPendingAnswerChange
+                        resultScrollTracker.followsPendingAnswerChange = false
+                        guard shouldFollow else {
+                            return
+                        }
+                        Task { @MainActor in
+                            await Task.yield()
+                            proxy.scrollTo("result-bottom", anchor: .bottom)
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .frame(width: 28, height: 28)
-                    .foregroundStyle(.red)
-                    .background(.red.opacity(0.08), in: Circle())
-                    .help("停止回答")
                 }
-
-                Spacer()
-
-                Button {
-                    state.toggleResultPanel()
-                } label: {
-                    Image(systemName: "chevron.up")
-                }
-                .buttonStyle(.plain)
-                .frame(width: 28, height: 28)
-                .foregroundStyle(.secondary)
-                .help("收起结果")
             }
-            .font(.caption)
-            .padding(.horizontal, 16)
-            .frame(height: 38)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.primary.opacity(0.018))
+        .background(Color.white)
     }
 
     // Renders the submitted question and attachment names without session-directory metadata.
@@ -1130,23 +1439,33 @@ struct ChatView: View {
         }
     }
 
-    // Shows model, token, cost, and non-normal stop metadata after assistant turns arrive.
+    // Shows model, detailed token usage, cost, and non-normal stop metadata after assistant turns arrive.
     @ViewBuilder
     private func answerMetadata(_ answer: AnswerSession) -> some View {
         if answer.model != nil || answer.usage.totalTokens > 0 || answer.stopReason == "length" {
-            HStack(spacing: 10) {
-                if let model = answer.model {
-                    Text(model)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 10) {
+                    if let model = answer.model {
+                        Text(model)
+                    }
+                    if answer.usage.cost > 0 {
+                        Text(answer.usage.cost, format: .currency(code: "USD"))
+                    }
+                    if answer.stopReason == "length" {
+                        Label("达到输出上限", systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.orange)
+                    }
                 }
+
                 if answer.usage.totalTokens > 0 {
-                    Text("\(answer.usage.totalTokens.formatted()) tokens")
-                }
-                if answer.usage.cost > 0 {
-                    Text(answer.usage.cost, format: .currency(code: "USD"))
-                }
-                if answer.stopReason == "length" {
-                    Label("达到输出上限", systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
+                    Text(
+                        "Token：总计 \(answer.usage.totalTokens.formatted())"
+                            + " · 输入 \(answer.usage.input.formatted())"
+                            + " · 输出 \(answer.usage.output.formatted())"
+                            + " · 缓存读取 \(answer.usage.cacheRead.formatted())"
+                            + " · 缓存写入 \(answer.usage.cacheWrite.formatted())"
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .font(.caption2)
@@ -1225,6 +1544,7 @@ private enum GitAction: String, CaseIterable, Identifiable {
 
 struct GitActionsView: View {
     @ObservedObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
     @State private var selectedAction = GitAction.commit
     @State private var commitMessage = ""
     @State private var includesUnstaged = true
@@ -1322,7 +1642,10 @@ struct GitActionsView: View {
             .padding(.horizontal, 12)
             .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
         }
-        .frame(minWidth: 640, maxWidth: .infinity)
+        .frame(width: 680, height: 486)
+        .background(Color.white)
+        .preferredColorScheme(.light)
+        .interactiveDismissDisabled(state.gitOperationRunning)
         .task(id: "\(state.activeSessionID ?? "")\0\(state.scopePath)") {
             feedback = nil
             selectedAction = .commit
@@ -1373,6 +1696,16 @@ struct GitActionsView: View {
             .frame(width: 26, height: 26)
             .disabled(state.activeGitStatusLoading || state.gitOperationRunning)
             .help("刷新 Git 状态")
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .frame(width: 26, height: 26)
+            .foregroundStyle(.secondary)
+            .disabled(state.gitOperationRunning)
+            .help("关闭 Git")
         }
         .font(.caption.monospacedDigit())
         .padding(.horizontal, 12)
@@ -2375,9 +2708,38 @@ private struct ExtensionPromptView: View {
     }
 }
 
+// Groups adjacent tool activity until visible model text starts the next response segment.
+func toolActivityGroupsByCallID(in sections: [AnswerSection]) -> [String: [ToolActivity]] {
+    var groups: [[ToolActivity]] = []
+    var current: [ToolActivity] = []
+
+    for section in sections {
+        switch section.content {
+        case .markdown(let text):
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !current.isEmpty {
+                groups.append(current)
+                current.removeAll(keepingCapacity: true)
+            }
+        case .tool(let tool):
+            current.append(tool)
+        default:
+            break
+        }
+    }
+    if !current.isEmpty {
+        groups.append(current)
+    }
+
+    return groups.reduce(into: [:]) { result, group in
+        for tool in group {
+            result[tool.callId] = group
+        }
+    }
+}
+
 private struct AnswerSectionView: View {
     let section: AnswerSection
-    let tools: [ToolActivity]
+    let toolsByCallID: [String: [ToolActivity]]
     let baseURL: URL
     let openFile: (URL) -> Void
 
@@ -2493,65 +2855,134 @@ private struct AnswerSectionView: View {
                     .foregroundStyle(.secondary)
             }
         case .tool(let tool):
-            if tool.callId == tools.first?.callId {
+            if let tools = toolsByCallID[tool.callId], tool.callId == tools.first?.callId {
                 ToolActivityGroupView(tools: tools)
             }
         }
     }
 }
 
+private func toolActivityInlineSummary(_ text: String) -> String {
+    text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+}
+
 private struct ToolActivityGroupView: View {
     let tools: [ToolActivity]
+    @State private var isExpanded = false
+
+    private var isFinished: Bool {
+        !tools.contains { $0.status == .running }
+    }
 
     var body: some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: 16) {
-                ForEach(tools, id: \.callId) { tool in
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 7) {
-                            switch tool.status {
-                            case .running:
-                                ProgressView()
-                                    .controlSize(.mini)
-                            case .completed:
-                                Image(systemName: "checkmark.circle")
-                                    .foregroundStyle(.green)
-                            case .failed:
-                                Image(systemName: "xmark.circle")
-                                    .foregroundStyle(.red)
-                            }
-                            Text(tool.name)
-                                .font(.caption.weight(.medium))
-                        }
+        if tools.count > 1, isFinished {
+            VStack(alignment: .leading, spacing: 0) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                            .frame(width: 10)
+                        Image(systemName: tools.contains { $0.status == .failed }
+                            ? "xmark.circle"
+                            : "checkmark.circle")
+                        Text("已调用 \(tools.count) 个工具")
+                            .font(.system(size: 13, weight: .medium))
+                            .fixedSize(horizontal: true, vertical: false)
+                        Text(tools.map {
+                            "\($0.name) \(toolActivityInlineSummary($0.input))"
+                        }.joined(separator: " · "))
+                            .font(.system(size: 12, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isExpanded ? "收起工具调用" : "展开工具调用")
 
-                        Text("输入")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        monospaced(tool.input)
-                        if !tool.output.isEmpty {
-                            Text("输出")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            monospaced(tool.output)
+                if isExpanded {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(tools, id: \.callId) { tool in
+                            ToolActivityView(tool: tool)
                         }
                     }
+                    .padding(.top, 8)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
-            .padding(.top, 8)
-        } label: {
-            HStack(spacing: 7) {
-                if tools.contains(where: { $0.status == .running }) {
-                    ProgressView()
-                        .controlSize(.mini)
-                } else if tools.contains(where: { $0.status == .failed }) {
-                    Image(systemName: "xmark.circle")
-                        .foregroundStyle(.red)
-                } else {
-                    Image(systemName: "checkmark.circle")
-                        .foregroundStyle(.green)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(tools, id: \.callId) { tool in
+                    ToolActivityView(tool: tool)
                 }
-                Text("工具调用（\(tools.count)）")
-                    .font(.caption.weight(.medium))
+            }
+        }
+    }
+}
+
+private struct ToolActivityView: View {
+    let tool: ToolActivity
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .frame(width: 10)
+                    switch tool.status {
+                    case .running:
+                        ProgressView()
+                            .controlSize(.mini)
+                    case .completed:
+                        Image(systemName: "checkmark.circle")
+                    case .failed:
+                        Image(systemName: "xmark.circle")
+                    }
+                    Text(tool.name)
+                        .font(.system(size: 13, weight: .medium, design: .monospaced))
+                        .fixedSize(horizontal: true, vertical: false)
+                    Text(toolActivityInlineSummary(tool.input))
+                        .font(.system(size: 12, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "收起 \(tool.name)" : "展开 \(tool.name)")
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("输入")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    monospaced(tool.input)
+                    if !tool.output.isEmpty {
+                        Text("输出")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        monospaced(tool.output)
+                    }
+                }
+                .padding(.top, 8)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
     }

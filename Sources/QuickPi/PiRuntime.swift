@@ -6,10 +6,16 @@ enum PiSessionLaunch {
     case new(id: String)
 }
 
+enum PiStreamingBehavior: String, Encodable {
+    case steer
+    case followUp
+}
+
 enum PiRuntimeEvent {
     case agentStarted
     case userMessage(String)
     case userMessagePersisted
+    case queueChanged(steering: [String], followUp: [String])
     case textDelta(String)
     case thinkingDelta(String)
     case toolStarted(id: String, name: String, input: String)
@@ -46,6 +52,7 @@ final class PiRuntime {
         let type: String
         let message: String?
         let images: [ImagePayload]?
+        let streamingBehavior: PiStreamingBehavior?
         let provider: String?
         let modelId: String?
         let level: ThinkingLevel?
@@ -59,6 +66,7 @@ final class PiRuntime {
             type: String,
             message: String? = nil,
             images: [ImagePayload]? = nil,
+            streamingBehavior: PiStreamingBehavior? = nil,
             provider: String? = nil,
             modelId: String? = nil,
             level: ThinkingLevel? = nil,
@@ -70,6 +78,7 @@ final class PiRuntime {
             self.type = type
             self.message = message
             self.images = images
+            self.streamingBehavior = streamingBehavior
             self.provider = provider
             self.modelId = modelId
             self.level = level
@@ -156,6 +165,11 @@ final class PiRuntime {
         }
 
         let message: Message
+    }
+
+    private struct QueueUpdateEnvelope: Decodable {
+        let steering: [String]
+        let followUp: [String]
     }
 
     private struct MessageStartEnvelope: Decodable {
@@ -534,12 +548,17 @@ final class PiRuntime {
         ))
     }
 
-    // Sends registered slash commands unchanged while keeping normal questions outside that namespace.
-    func prompt(message: String, images: [ImagePayload]) async throws {
+    // Sends a prompt immediately or queues it with Pi's documented streaming behavior.
+    func prompt(
+        message: String,
+        images: [ImagePayload],
+        streamingBehavior: PiStreamingBehavior? = nil
+    ) async throws {
         try await sendCommand(
             type: "prompt",
             message: message,
-            images: images
+            images: images,
+            streamingBehavior: streamingBehavior
         )
     }
 
@@ -700,6 +719,7 @@ final class PiRuntime {
         type: String,
         message: String? = nil,
         images: [ImagePayload]? = nil,
+        streamingBehavior: PiStreamingBehavior? = nil,
         provider: String? = nil,
         modelId: String? = nil,
         level: ThinkingLevel? = nil,
@@ -723,6 +743,7 @@ final class PiRuntime {
                     type: type,
                     message: message,
                     images: images,
+                    streamingBehavior: streamingBehavior,
                     provider: provider,
                     modelId: modelId,
                     level: level,
@@ -866,6 +887,9 @@ final class PiRuntime {
                 onEvent?(.agentStarted)
             case "message_start":
                 try consumeMessageStart(record)
+            case "queue_update":
+                let queue = try JSONDecoder().decode(QueueUpdateEnvelope.self, from: record)
+                onEvent?(.queueChanged(steering: queue.steering, followUp: queue.followUp))
             case "agent_settled":
                 onEvent?(.settled)
             case "message_update":

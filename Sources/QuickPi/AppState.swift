@@ -14,6 +14,10 @@ final class AppState: ObservableObject {
         var runtimeError: String?
         var extensionCommandRunning = false
         var agentRunning = false
+        var promptSubmissionRunning = false
+        var queuedSteeringMessages: [String] = []
+        var queuedFollowUpMessages: [String] = []
+        var deliveringQueuedMessages: [String] = []
         var extensionStatuses: [ExtensionStatus] = []
         var extensionWidgets: [ExtensionWidget] = []
         var extensionTitle: String?
@@ -29,7 +33,7 @@ final class AppState: ObservableObject {
         }
 
         var isBusy: Bool {
-            isAnswering || extensionCommandRunning || agentRunning
+            isAnswering || extensionCommandRunning || agentRunning || promptSubmissionRunning
         }
 
         var conversationAnswers: [AnswerSession] {
@@ -77,6 +81,7 @@ final class AppState: ObservableObject {
     @Published private var pendingAttachments: [PendingAttachment] = []
     @Published private var startupRuntimeError: String?
     @Published private var startupResultPresented = false
+    @Published private(set) var inputEditorHeight: CGFloat = 96
 
     private let store: ConfigurationStore
     private let applicationSupportDirectory: URL
@@ -161,6 +166,18 @@ final class AppState: ObservableObject {
 
     var extensionCommandRunning: Bool {
         activeSessionID.flatMap { sessionExecutions[$0] }?.extensionCommandRunning ?? false
+    }
+
+    var promptSubmissionRunning: Bool {
+        activeSessionID.flatMap { sessionExecutions[$0] }?.promptSubmissionRunning ?? false
+    }
+
+    var queuedSteeringMessages: [String] {
+        activeSessionID.flatMap { sessionExecutions[$0] }?.queuedSteeringMessages ?? []
+    }
+
+    var queuedFollowUpMessages: [String] {
+        activeSessionID.flatMap { sessionExecutions[$0] }?.queuedFollowUpMessages ?? []
     }
 
     var previousAnswers: [AnswerSession] {
@@ -327,13 +344,30 @@ final class AppState: ObservableObject {
         sessionExecutions[id]?.unreadCompletion ?? false
     }
 
-    // Matches the fixed SwiftUI bands used by the input bar so AppKit can resize without clipping plugin UI.
+    // Matches the SwiftUI bands used by the input bar so AppKit can resize without clipping content.
     var inputBarHeight: CGFloat {
-        var height: CGFloat = attachments.isEmpty ? 102 : 140
+        inputEditorBarHeight + 38
+    }
+
+    var inputEditorBarHeight: CGFloat {
+        var height = inputEditorHeight + 20
+        if !attachments.isEmpty {
+            height += 38
+        }
         for widget in extensionWidgets where widget.key != ExtensionWidget.planModeKey {
             height += CGFloat(widget.lines.count * 16 + 12)
         }
         return height
+    }
+
+    // Tracks the intrinsic one-to-eight-line editor height without allowing layout feedback loops.
+    func setInputEditorHeight(_ height: CGFloat) {
+        let normalized = min(max(ceil(height), 96), 170)
+        guard abs(inputEditorHeight - normalized) >= 1 else {
+            return
+        }
+        inputEditorHeight = normalized
+        notifyPanel()
     }
 
     // Sizes the command list as body content independently from the editor band.
@@ -345,7 +379,10 @@ final class AppState: ObservableObject {
     }
 
     var hasResultPanelContent: Bool {
-        runtimeError != nil || !conversationAnswers.isEmpty
+        runtimeError != nil
+            || !conversationAnswers.isEmpty
+            || !queuedSteeringMessages.isEmpty
+            || !queuedFollowUpMessages.isEmpty
     }
 
     var showsResultPanel: Bool {
@@ -561,9 +598,10 @@ final class AppState: ObservableObject {
         }
     }
 
-    // Submits one command or model prompt to the runtime permanently bound to the visible session.
-    func send() async {
-        let question = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    // Submits immediately when idle, or uses Pi's follow-up/steering queue while answering.
+    func send(steering: Bool = false) async {
+        let submittedDraft = draft
+        let question = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty else {
             runtimeError = "请输入问题"
             notifyPanel()
@@ -584,7 +622,7 @@ final class AppState: ObservableObject {
             notifyPanel()
             return
         }
-        guard !isBusy else {
+        guard !promptSubmissionRunning else {
             return
         }
         guard let sessionID = activeSessionID, let runtime = runtimes[sessionID] else {
@@ -599,8 +637,15 @@ final class AppState: ObservableObject {
         let commandArguments = commandParts.count == 2
             ? String(commandParts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
             : ""
-        if let commandName,
-           Self.nativeSlashCommands.contains(where: { $0.name == commandName }) {
+        let isNativeCommand = commandName.map { name in
+            Self.nativeSlashCommands.contains(where: { $0.name == name })
+        } ?? false
+        if isBusy && isNativeCommand {
+            runtimeError = "回答过程中不能执行应用命令"
+            notifyPanel()
+            return
+        }
+        if !isBusy, let commandName, isNativeCommand {
             guard attachments.isEmpty else {
                 runtimeError = "应用命令不接受附件"
                 notifyPanel()
@@ -820,6 +865,50 @@ final class AppState: ObservableObject {
             ? question
             : "\(question)\n\n---\n\n\(documentSections.joined(separator: "\n\n---\n\n"))"
         let attachmentNames = submittedAttachments.map(\.name)
+
+        if isBusy {
+            guard isAnswering else {
+                runtimeError = "当前操作尚未完成"
+                notifyPanel()
+                return
+            }
+            let configurationGeneration = runtimeGeneration
+            let attachmentIDs = submittedAttachments.map(\.id)
+            updateSession(sessionID) { $0.promptSubmissionRunning = true }
+            notifyPanel()
+            do {
+                try await runtime.prompt(
+                    message: prompt,
+                    images: images,
+                    streamingBehavior: steering ? .steer : .followUp
+                )
+                guard configurationGeneration == runtimeGeneration,
+                      runtimes[sessionID] === runtime else {
+                    return
+                }
+                updateSession(sessionID) { execution in
+                    execution.promptSubmissionRunning = false
+                    if execution.draft == submittedDraft,
+                       execution.attachments.map(\.id) == attachmentIDs {
+                        execution.draft = ""
+                        execution.attachments = []
+                    }
+                    execution.runtimeError = nil
+                }
+            } catch {
+                guard configurationGeneration == runtimeGeneration,
+                      runtimes[sessionID] === runtime else {
+                    return
+                }
+                updateSession(sessionID) { execution in
+                    execution.promptSubmissionRunning = false
+                    execution.runtimeError = error.localizedDescription
+                    execution.resultPresented = true
+                }
+            }
+            notifyPanel()
+            return
+        }
 
         if isExtensionCommand {
             let runtimeGeneration = self.runtimeGeneration
@@ -1939,6 +2028,10 @@ final class AppState: ObservableObject {
         execution.runtimeError = nil
         execution.extensionCommandRunning = false
         execution.agentRunning = false
+        execution.promptSubmissionRunning = false
+        execution.queuedSteeringMessages = []
+        execution.queuedFollowUpMessages = []
+        execution.deliveringQueuedMessages = []
         execution.unreadCompletion = false
         execution.conversationLoaded = true
         if preservingInput {
@@ -1988,10 +2081,18 @@ final class AppState: ObservableObject {
         return paths
     }
 
-    // Replaces disk-backed metadata with sessions belonging to the selected project environment.
+    // Replaces disk-backed metadata while retaining concurrent sessions that have not become visible on disk yet.
     private func applySessionList(_ values: [ConversationSession]) {
         let paths = sessionScopePaths()
-        sessions = values.filter { paths.contains($0.cwd) }
+        let diskSessions = values.filter { paths.contains($0.cwd) }
+        let diskSessionIDs = Set(diskSessions.map(\.id))
+        let activeMissingSessions = sessions.filter { session in
+            paths.contains(session.cwd)
+                && !diskSessionIDs.contains(session.id)
+                && (startingSessionIDs.contains(session.id)
+                    || sessionExecutions[session.id]?.isBusy == true)
+        }
+        sessions = diskSessions + activeMissingSessions
         for session in sessions where sessionExecutions[session.id] == nil {
             sessionExecutions[session.id] = SessionExecution()
         }
@@ -2068,6 +2169,9 @@ final class AppState: ObservableObject {
                     case .thinking:
                         guard let thinking = block.thinking else {
                             throw QuickPiError.message("Pi 助手历史思考缺少内容")
+                        }
+                        guard !thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                            continue
                         }
                         appendRestoredSection(.thinking(thinking), to: &answer)
                     case .toolCall:
@@ -2462,12 +2566,23 @@ final class AppState: ObservableObject {
                 }
             }
         case .userMessage(let message):
-            if sessionExecutions[sessionID]?.isAnswering == false {
+            var startsQueuedTurn = false
+            updateSession(sessionID) { execution in
+                if let index = execution.deliveringQueuedMessages.firstIndex(of: message) {
+                    execution.deliveringQueuedMessages.remove(at: index)
+                    if execution.answer?.status == .waiting || execution.answer?.status == .running {
+                        execution.answer?.status = .completed
+                        execution.answer?.retryMessage = nil
+                    }
+                    startsQueuedTurn = true
+                }
+            }
+            if startsQueuedTurn || sessionExecutions[sessionID]?.isAnswering == false {
                 _ = beginAnswer(
                     sessionID: sessionID,
                     question: message,
                     attachmentNames: [],
-                    status: .waiting
+                    status: startsQueuedTurn ? .running : .waiting
                 )
             }
         case .userMessagePersisted:
@@ -2497,6 +2612,30 @@ final class AppState: ObservableObject {
                     }
                     setRuntimeError(error.localizedDescription, sessionID: sessionID)
                     notifyPanel()
+                }
+            }
+        case let .queueChanged(steering, followUp):
+            updateSession(sessionID) { execution in
+                var remainingSteering = steering
+                for message in execution.queuedSteeringMessages {
+                    if let index = remainingSteering.firstIndex(of: message) {
+                        remainingSteering.remove(at: index)
+                    } else {
+                        execution.deliveringQueuedMessages.append(message)
+                    }
+                }
+                var remainingFollowUps = followUp
+                for message in execution.queuedFollowUpMessages {
+                    if let index = remainingFollowUps.firstIndex(of: message) {
+                        remainingFollowUps.remove(at: index)
+                    } else {
+                        execution.deliveringQueuedMessages.append(message)
+                    }
+                }
+                execution.queuedSteeringMessages = steering
+                execution.queuedFollowUpMessages = followUp
+                if !steering.isEmpty || !followUp.isEmpty {
+                    execution.resultPresented = true
                 }
             }
         case .textDelta(let delta):
@@ -2677,6 +2816,10 @@ final class AppState: ObservableObject {
                 execution.resultPresented = true
                 execution.extensionCommandRunning = false
                 execution.agentRunning = false
+                execution.promptSubmissionRunning = false
+                execution.queuedSteeringMessages = []
+                execution.queuedFollowUpMessages = []
+                execution.deliveringQueuedMessages = []
                 execution.extensionStatuses = []
                 execution.extensionWidgets = []
                 execution.extensionTitle = nil
@@ -2748,6 +2891,9 @@ final class AppState: ObservableObject {
                case .thinking(let text) = execution.answer?.sections[index].content {
                 execution.answer?.sections[index].content = .thinking(text + delta)
             } else {
+                guard !delta.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return
+                }
                 execution.answer?.sections.append(AnswerSection(id: UUID(), content: .thinking(delta)))
             }
         }

@@ -7,6 +7,7 @@ private enum SettingsPane {
 
 struct SettingsView: View {
     @ObservedObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
     @AppStorage("showSystemStatus") private var showSystemStatus = true
     @AppStorage("hidePanelWhenInactive") private var hidePanelWhenInactive = false
     @State private var selectedPane: SettingsPane = .general
@@ -140,6 +141,17 @@ struct SettingsView: View {
                         }
                         .disabled(syncingModels || savingProvider)
                     }
+
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .frame(width: 28, height: 28)
+                    .foregroundStyle(.secondary)
+                    .disabled(savingGeneral || syncingModels || savingProvider)
+                    .help("关闭设置")
                 }
                 .padding(.horizontal, 24)
                 .frame(height: 64)
