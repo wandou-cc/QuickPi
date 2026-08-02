@@ -55,6 +55,12 @@ final class AppState: ObservableObject {
         let thinkingState: PiThinkingState?
     }
 
+    private enum PendingRuntimeUpdate {
+        case text(String)
+        case thinking(String)
+        case tool(id: String, output: String)
+    }
+
     private static let nativeSlashCommands = [
         SlashCommand(name: "new", description: "在当前目录新建会话", source: .app),
         SlashCommand(name: "worktree", description: "在新 Worktree 中新建会话", source: .app),
@@ -103,6 +109,8 @@ final class AppState: ObservableObject {
     private var pendingRuntimeEvents: [ObjectIdentifier: [PiRuntimeEvent]] = [:]
     private var runtimeGeneration = 0
     private var gitStatusGeneration = 0
+    private var pendingRuntimeUpdates: [String: [PendingRuntimeUpdate]] = [:]
+    private var pendingRuntimeUpdateTasks: [String: Task<Void, Never>] = [:]
 
     var applyShortcut: ((String) throws -> Void)?
     var panelContentChanged: (() -> Void)?
@@ -547,37 +555,35 @@ final class AppState: ObservableObject {
 
     // Reads explicitly selected files and appends them in the same order.
     func addAttachments(urls: [URL]) async {
+        let targetSessionID = activeSessionID
         guard attachments.count + urls.count <= 5 else {
             runtimeError = "一次最多添加 5 个附件"
             notifyPanel()
             return
         }
         do {
-            var loaded = attachments
-            for url in urls {
-                loaded.append(try AttachmentLoader.load(url: url))
+            let loadedAttachments = try await Task.detached(priority: .userInitiated) {
+                try urls.map { try AttachmentLoader.load(url: $0) }
+            }.value
+            guard try appendLoadedAttachments(loadedAttachments, to: targetSessionID) else {
+                return
             }
-            if let sessionID = activeSessionID {
-                updateSession(sessionID) { $0.attachments = loaded }
-            } else {
-                pendingAttachments = loaded
-            }
-            runtimeError = nil
         } catch {
-            runtimeError = error.localizedDescription
+            setAttachmentLoadError(error.localizedDescription, targetSessionID: targetSessionID)
         }
         notifyPanel()
     }
 
     // Reads pasted image representations in clipboard order and appends them atomically.
     func addPastedImages(providers: [NSItemProvider]) async {
+        let targetSessionID = activeSessionID
         guard attachments.count + providers.count <= 5 else {
             runtimeError = "一次最多添加 5 个附件"
             notifyPanel()
             return
         }
         do {
-            var loaded = attachments
+            var loaded: [PendingAttachment] = []
             for (index, provider) in providers.enumerated() {
                 guard let contentType = provider.registeredContentTypes(conformingTo: .image).first else {
                     throw QuickPiError.message("剪贴板中没有可读取的图片")
@@ -597,18 +603,68 @@ final class AppState: ObservableObject {
                 }
                 let name = provider.suggestedName
                     ?? (providers.count == 1 ? "粘贴图片" : "粘贴图片 \(index + 1)")
-                loaded.append(try AttachmentLoader.loadImage(data: data, name: name))
+                let attachment = try await Task.detached(priority: .userInitiated) {
+                    try AttachmentLoader.loadImage(data: data, name: name)
+                }.value
+                loaded.append(attachment)
             }
-            if let sessionID = activeSessionID {
-                updateSession(sessionID) { $0.attachments = loaded }
-            } else {
-                pendingAttachments = loaded
+            guard try appendLoadedAttachments(loaded, to: targetSessionID) else {
+                return
             }
-            runtimeError = nil
         } catch {
-            runtimeError = error.localizedDescription
+            setAttachmentLoadError(error.localizedDescription, targetSessionID: targetSessionID)
         }
         notifyPanel()
+    }
+
+    // Commits background-loaded attachments to their original session without replacing newer additions.
+    private func appendLoadedAttachments(
+        _ loaded: [PendingAttachment],
+        to targetSessionID: String?
+    ) throws -> Bool {
+        let destinationSessionID: String?
+        if let targetSessionID {
+            guard sessionExecutions[targetSessionID] != nil else {
+                return false
+            }
+            destinationSessionID = targetSessionID
+        } else {
+            destinationSessionID = activeSessionID
+        }
+
+        if let destinationSessionID {
+            var exceedsLimit = false
+            updateSession(destinationSessionID) { execution in
+                guard execution.attachments.count + loaded.count <= 5 else {
+                    exceedsLimit = true
+                    return
+                }
+                execution.attachments.append(contentsOf: loaded)
+                execution.runtimeError = nil
+            }
+            if exceedsLimit {
+                throw QuickPiError.message("一次最多添加 5 个附件")
+            }
+        } else {
+            guard pendingAttachments.count + loaded.count <= 5 else {
+                throw QuickPiError.message("一次最多添加 5 个附件")
+            }
+            pendingAttachments.append(contentsOf: loaded)
+            startupRuntimeError = nil
+        }
+        return true
+    }
+
+    // Reports loading failures to the session that initiated the asynchronous work when it still exists.
+    private func setAttachmentLoadError(_ message: String, targetSessionID: String?) {
+        if let targetSessionID {
+            guard sessionExecutions[targetSessionID] != nil else {
+                return
+            }
+            setRuntimeError(message, sessionID: targetSessionID)
+        } else {
+            setRuntimeError(message, sessionID: activeSessionID)
+        }
     }
 
     // Removes one attachment before the question is submitted.
@@ -1690,6 +1746,60 @@ final class AppState: ObservableObject {
         settings = try store.save(next)
     }
 
+    // Saves editable operation-approval rules and restarts idle runtimes with the new policy.
+    func saveOperationApprovalSettings(_ configuration: OperationApprovalConfiguration) throws {
+        guard !hasRunningSessions && !runtimeStarting && !sessionChanging && !gitOperationRunning else {
+            throw QuickPiError.message("仍有会话或后台操作正在执行，不能修改操作审批")
+        }
+
+        var normalizedToolNames: [String] = []
+        var knownToolNames: Set<String> = []
+        for rawName in configuration.toolNames {
+            let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard name.count <= 100,
+                  name.range(of: #"^[A-Za-z0-9._:-]+$"#, options: .regularExpression) != nil else {
+                throw QuickPiError.message("审批工具名无效：\(name.isEmpty ? "空值" : name)")
+            }
+            if knownToolNames.insert(name.lowercased()).inserted {
+                normalizedToolNames.append(name)
+            }
+        }
+        guard normalizedToolNames.count <= 50 else {
+            throw QuickPiError.message("审批工具不能超过 50 个")
+        }
+
+        var normalizedKeywords: [String] = []
+        var knownKeywords: Set<String> = []
+        for rawKeyword in configuration.shellCommandKeywords {
+            let keyword = rawKeyword.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard keyword.count <= 500 else {
+                throw QuickPiError.message("危险命令关键字不能超过 500 个字符")
+            }
+            guard !keyword.isEmpty else {
+                continue
+            }
+            if knownKeywords.insert(keyword.lowercased()).inserted {
+                normalizedKeywords.append(keyword)
+            }
+        }
+        guard normalizedKeywords.count <= 100 else {
+            throw QuickPiError.message("危险命令关键字不能超过 100 个")
+        }
+
+        var next = settings
+        next.operationApproval = OperationApprovalConfiguration(
+            enabled: configuration.enabled,
+            toolNames: normalizedToolNames,
+            approveAllShellCommands: configuration.approveAllShellCommands,
+            shellCommandKeywords: normalizedKeywords
+        )
+        guard next != settings else {
+            return
+        }
+        settings = try store.save(next)
+        scheduleRuntimeRestart()
+    }
+
     // Fetches a model catalog directly from the configured OpenAI or Anthropic-compatible endpoint.
     func syncModels(
         kind: ProviderKind,
@@ -1854,6 +1964,40 @@ final class AppState: ObservableObject {
         } catch {
             authSession?.error = error.localizedDescription
         }
+    }
+
+    // Returns one inline approval decision to the exact Pi request that is awaiting it.
+    func respondToOperationApproval(requestId: String, approved: Bool) {
+        guard let sessionID = activeSessionID,
+              let runtime = runtimes[sessionID],
+              let sectionIndex = sessionExecutions[sessionID]?.answer?.sections.firstIndex(where: { section in
+                  if case .operationApproval(let approval) = section.content {
+                      return approval.requestId == requestId && approval.decision == .pending
+                  }
+                  return false
+              }) else {
+            return
+        }
+        do {
+            try runtime.respondToExtensionPrompt(requestId: requestId, confirmed: approved)
+            updateSession(sessionID) { execution in
+                guard case .operationApproval(var approval) = execution.answer?.sections[sectionIndex].content else {
+                    return
+                }
+                approval.decision = approved ? .approved : .rejected
+                execution.answer?.sections[sectionIndex].content = .operationApproval(approval)
+            }
+        } catch {
+            updateSession(sessionID) { execution in
+                guard case .operationApproval(var approval) = execution.answer?.sections[sectionIndex].content else {
+                    return
+                }
+                approval.decision = .rejected
+                execution.answer?.sections[sectionIndex].content = .operationApproval(approval)
+                execution.answer?.error = error.localizedDescription
+            }
+        }
+        notifyPanel()
     }
 
     // Returns a value or confirmation to the extension request shown by the native UI.
@@ -2222,6 +2366,7 @@ final class AppState: ObservableObject {
     // Stops the app-owned Pi process during normal application termination.
     func stop() {
         runtimeGeneration += 1
+        discardPendingRuntimeUpdates()
         for runtime in runtimes.values {
             runtime.stop()
         }
@@ -2247,6 +2392,7 @@ final class AppState: ObservableObject {
         slashCommands = Self.nativeSlashCommands
         sessions = []
         activeSessionID = nil
+        discardPendingRuntimeUpdates()
         sessionExecutions = [:]
         readySessionIDs = []
         startingSessionIDs = []
@@ -2314,6 +2460,7 @@ final class AppState: ObservableObject {
         initialRuntimeStarting = true
         sessions = []
         activeSessionID = nil
+        discardPendingRuntimeUpdates()
         sessionExecutions = [:]
         readySessionIDs = []
         startingSessionIDs = []
@@ -2808,6 +2955,7 @@ final class AppState: ObservableObject {
         precondition(runtimeSessionIDs[identifier] == oldSessionID)
         precondition(runtimes[oldSessionID] === runtime)
         precondition(runtimes[newSessionID] == nil)
+        flushPendingRuntimeUpdates(sessionID: oldSessionID)
         let wasReady = readySessionIDs.remove(oldSessionID) != nil
         let wasStarting = startingSessionIDs.remove(oldSessionID) != nil
         runtimes.removeValue(forKey: oldSessionID)
@@ -2832,6 +2980,7 @@ final class AppState: ObservableObject {
 
     // Removes one known process and all readiness bookkeeping for its session.
     private func removeRuntime(sessionID: String, stopping: Bool) {
+        flushPendingRuntimeUpdates(sessionID: sessionID)
         guard let runtime = runtimes.removeValue(forKey: sessionID) else {
             readySessionIDs.remove(sessionID)
             startingSessionIDs.remove(sessionID)
@@ -2870,6 +3019,81 @@ final class AppState: ObservableObject {
         removeRuntime(sessionID: sessionID, stopping: true)
     }
 
+    // Coalesces high-frequency display updates so Markdown and the conversation tree render at most 30 FPS.
+    private func enqueueRuntimeUpdate(_ event: PiRuntimeEvent, sessionID: String) {
+        var updates = pendingRuntimeUpdates.removeValue(forKey: sessionID) ?? []
+        switch event {
+        case .textDelta(let delta):
+            if case .text(let existing)? = updates.last {
+                updates[updates.count - 1] = .text(existing + delta)
+            } else {
+                updates.append(.text(delta))
+            }
+        case .thinkingDelta(let delta):
+            if case .thinking(let existing)? = updates.last {
+                updates[updates.count - 1] = .thinking(existing + delta)
+            } else {
+                updates.append(.thinking(delta))
+            }
+        case let .toolUpdated(id, output):
+            if case .tool(let existingID, _)? = updates.last, existingID == id {
+                updates[updates.count - 1] = .tool(id: id, output: output)
+            } else {
+                updates.append(.tool(id: id, output: output))
+            }
+        default:
+            preconditionFailure("不支持合并此 Pi 事件")
+        }
+        pendingRuntimeUpdates[sessionID] = updates
+
+        guard pendingRuntimeUpdateTasks[sessionID] == nil else {
+            return
+        }
+        pendingRuntimeUpdateTasks[sessionID] = Task { @MainActor [weak self] in
+            do {
+                try await ContinuousClock().sleep(for: .milliseconds(33))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else {
+                return
+            }
+            pendingRuntimeUpdateTasks[sessionID] = nil
+            flushPendingRuntimeUpdates(sessionID: sessionID)
+        }
+    }
+
+    // Applies one frame of accumulated stream changes with a single ObservableObject publication.
+    private func flushPendingRuntimeUpdates(sessionID: String) {
+        pendingRuntimeUpdateTasks.removeValue(forKey: sessionID)?.cancel()
+        guard let updates = pendingRuntimeUpdates.removeValue(forKey: sessionID),
+              !updates.isEmpty else {
+            return
+        }
+        updateSession(sessionID) { execution in
+            for update in updates {
+                switch update {
+                case .text(let delta):
+                    Self.appendText(delta, to: &execution)
+                case .thinking(let delta):
+                    Self.appendThinking(delta, to: &execution)
+                case let .tool(id, output):
+                    Self.updateTool(id: id, output: output, status: .running, in: &execution)
+                }
+            }
+        }
+        notifyPanel()
+    }
+
+    // Cancels delayed display work before a lifecycle reset removes its owning sessions.
+    private func discardPendingRuntimeUpdates() {
+        for task in pendingRuntimeUpdateTasks.values {
+            task.cancel()
+        }
+        pendingRuntimeUpdateTasks.removeAll(keepingCapacity: true)
+        pendingRuntimeUpdates.removeAll(keepingCapacity: true)
+    }
+
     // Queues startup events until the process is bound, then routes all live events by process identity.
     private func consume(_ event: PiRuntimeEvent, from runtime: PiRuntime) {
         let identifier = ObjectIdentifier(runtime)
@@ -2879,6 +3103,13 @@ final class AppState: ObservableObject {
         }
         guard runtimes[sessionID] === runtime else {
             return
+        }
+        switch event {
+        case .textDelta, .thinkingDelta, .toolUpdated:
+            enqueueRuntimeUpdate(event, sessionID: sessionID)
+            return
+        default:
+            flushPendingRuntimeUpdates(sessionID: sessionID)
         }
         if case .runtimeExited = event {
             removeRuntime(runtime, stopping: false)
@@ -3085,6 +3316,7 @@ final class AppState: ObservableObject {
         case .settled:
             updateSession(sessionID) { execution in
                 execution.agentRunning = false
+                Self.rejectPendingOperationApprovals(in: &execution)
                 let failed = execution.answer?.error != nil
                 if execution.answer?.status == .waiting || execution.answer?.status == .running {
                     execution.answer?.status = failed ? .failed : .completed
@@ -3104,6 +3336,7 @@ final class AppState: ObservableObject {
                 execution.answer?.error = aborted ? nil : message
                 execution.answer?.retryMessage = nil
                 if aborted {
+                    Self.rejectPendingOperationApprovals(in: &execution)
                     execution.agentRunning = false
                 }
             }
@@ -3210,6 +3443,32 @@ final class AppState: ObservableObject {
             updateSession(sessionID) { $0.draft = text }
         case .extensionPrompt(let prompt):
             updateSession(sessionID) { $0.extensionPrompt = prompt }
+        case .operationApproval(let approval):
+            guard sessionExecutions[sessionID]?.answer != nil else {
+                setRuntimeError("收到操作审批请求时没有活动回答", sessionID: sessionID)
+                if let runtime = runtimes[sessionID] {
+                    try? runtime.respondToExtensionPrompt(
+                        requestId: approval.requestId,
+                        confirmed: false
+                    )
+                }
+                break
+            }
+            updateSession(sessionID) { execution in
+                guard execution.answer?.sections.contains(where: { section in
+                    if case .operationApproval(let existing) = section.content {
+                        return existing.requestId == approval.requestId
+                    }
+                    return false
+                }) == false else {
+                    return
+                }
+                execution.answer?.sections.append(AnswerSection(
+                    id: UUID(),
+                    content: .operationApproval(approval)
+                ))
+                execution.resultPresented = true
+            }
         case .questionnairePrompt(let prompt):
             updateSession(sessionID) { $0.questionnairePrompt = prompt }
         case .operationFailed(let message):
@@ -3242,6 +3501,7 @@ final class AppState: ObservableObject {
                 execution.extensionTitle = nil
                 execution.extensionPrompt = nil
                 execution.questionnairePrompt = nil
+                Self.rejectPendingOperationApprovals(in: &execution)
                 if execution.isAnswering {
                     execution.answer?.status = .failed
                     execution.answer?.error = message
@@ -3283,57 +3543,90 @@ final class AppState: ObservableObject {
     // Appends streamed Markdown to the answer owned by one runtime.
     private func appendText(_ delta: String, sessionID: String) {
         updateSession(sessionID) { execution in
-            guard execution.answer != nil else {
-                execution.runtimeError = "收到回答时没有活动问题"
-                execution.resultPresented = true
-                return
-            }
-            if let index = execution.answer?.sections.indices.last,
-               case .markdown(let text) = execution.answer?.sections[index].content {
-                execution.answer?.sections[index].content = .markdown(text + delta)
-            } else {
-                execution.answer?.sections.append(AnswerSection(id: UUID(), content: .markdown(delta)))
-            }
+            Self.appendText(delta, to: &execution)
+        }
+    }
+
+    private static func appendText(_ delta: String, to execution: inout SessionExecution) {
+        guard execution.answer != nil else {
+            execution.runtimeError = "收到回答时没有活动问题"
+            execution.resultPresented = true
+            return
+        }
+        if let index = execution.answer?.sections.indices.last,
+           case .markdown(let text) = execution.answer?.sections[index].content {
+            execution.answer?.sections[index].content = .markdown(text + delta)
+        } else {
+            execution.answer?.sections.append(AnswerSection(id: UUID(), content: .markdown(delta)))
         }
     }
 
     // Appends private reasoning to the answer owned by one runtime.
     private func appendThinking(_ delta: String, sessionID: String) {
         updateSession(sessionID) { execution in
-            guard execution.answer != nil else {
-                execution.runtimeError = "收到思考内容时没有活动问题"
-                execution.resultPresented = true
+            Self.appendThinking(delta, to: &execution)
+        }
+    }
+
+    private static func appendThinking(_ delta: String, to execution: inout SessionExecution) {
+        guard execution.answer != nil else {
+            execution.runtimeError = "收到思考内容时没有活动问题"
+            execution.resultPresented = true
+            return
+        }
+        if let index = execution.answer?.sections.indices.last,
+           case .thinking(let text) = execution.answer?.sections[index].content {
+            execution.answer?.sections[index].content = .thinking(text + delta)
+        } else {
+            guard !delta.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return
             }
-            if let index = execution.answer?.sections.indices.last,
-               case .thinking(let text) = execution.answer?.sections[index].content {
-                execution.answer?.sections[index].content = .thinking(text + delta)
-            } else {
-                guard !delta.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    return
-                }
-                execution.answer?.sections.append(AnswerSection(id: UUID(), content: .thinking(delta)))
-            }
+            execution.answer?.sections.append(AnswerSection(id: UUID(), content: .thinking(delta)))
         }
+    }
+
+    // Resolves abandoned approvals when their turn or runtime can no longer accept a decision.
+    private static func rejectPendingOperationApprovals(in execution: inout SessionExecution) {
+        guard var sections = execution.answer?.sections else {
+            return
+        }
+        for index in sections.indices {
+            guard case .operationApproval(var approval) = sections[index].content,
+                  approval.decision == .pending else {
+                continue
+            }
+            approval.decision = .rejected
+            sections[index].content = .operationApproval(approval)
+        }
+        execution.answer?.sections = sections
     }
 
     // Replaces the tool block matching Pi's call id inside its owning session.
     private func updateTool(id: String, output: String, status: ToolStatus, sessionID: String) {
         updateSession(sessionID) { execution in
-            guard let index = execution.answer?.sections.firstIndex(where: { section in
-                if case .tool(let tool) = section.content {
-                    return tool.callId == id
-                }
-                return false
-            }), case .tool(var tool) = execution.answer?.sections[index].content else {
-                execution.answer?.status = .failed
-                execution.answer?.error = "收到未知工具调用的执行结果"
-                return
-            }
-            tool.output = output
-            tool.status = status
-            execution.answer?.sections[index].content = .tool(tool)
+            Self.updateTool(id: id, output: output, status: status, in: &execution)
         }
+    }
+
+    private static func updateTool(
+        id: String,
+        output: String,
+        status: ToolStatus,
+        in execution: inout SessionExecution
+    ) {
+        guard let index = execution.answer?.sections.firstIndex(where: { section in
+            if case .tool(let tool) = section.content {
+                return tool.callId == id
+            }
+            return false
+        }), case .tool(var tool) = execution.answer?.sections[index].content else {
+            execution.answer?.status = .failed
+            execution.answer?.error = "收到未知工具调用的执行结果"
+            return
+        }
+        tool.output = output
+        tool.status = status
+        execution.answer?.sections[index].content = .tool(tool)
     }
 
     // Notifies AppKit when answer visibility or dynamic result content changes.

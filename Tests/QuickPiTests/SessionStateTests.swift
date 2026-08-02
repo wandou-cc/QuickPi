@@ -1116,6 +1116,45 @@ final class SessionStateTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    func testOperationApprovalConfirmAppearsInsideTheActiveAnswer() throws {
+        let directory = try temporaryDirectory()
+        let state = try AppState(
+            applicationSupportDirectory: directory,
+            checkForUpdates: {},
+            presentSettings: {}
+        )
+        _ = try applyEmptySession(to: state, id: "session-approval")
+        state.consume(.userMessage("清理构建目录"))
+        state.consume(.agentStarted)
+        state.consume(.toolStarted(id: "tool-1", name: "bash", input: #"{"command":"rm -rf .build"}"#))
+
+        let runtime = PiRuntime(applicationSupportDirectory: directory)
+        runtime.onEvent = { state.consume($0) }
+        try runtime.consumeExtensionRequest(Data(
+            #"{"type":"extension_ui_request","id":"approval-1","method":"confirm","title":"quickpi:{\"kind\":\"operationApproval\",\"operationApproval\":{\"toolCallId\":\"tool-1\",\"toolName\":\"bash\",\"kind\":\"shell\",\"detail\":\"rm -rf .build\",\"workingDirectory\":\"/tmp/project\"}}","message":"rm -rf .build"}"#.utf8
+        ))
+
+        XCTAssertNil(state.extensionPrompt)
+        XCTAssertEqual(state.answer?.sections.count, 2)
+        guard case .operationApproval(let approval) = state.answer?.sections.last?.content else {
+            return XCTFail("操作审批应显示在当前回答正文中")
+        }
+        XCTAssertEqual(approval.requestId, "approval-1")
+        XCTAssertEqual(approval.toolCallId, "tool-1")
+        XCTAssertEqual(approval.toolName, "bash")
+        XCTAssertEqual(approval.kind, .shell)
+        XCTAssertEqual(approval.detail, "rm -rf .build")
+        XCTAssertEqual(approval.workingDirectory, "/tmp/project")
+        XCTAssertEqual(approval.decision, .pending)
+
+        state.consume(.turnFailed(message: "已停止回答", aborted: true))
+        guard case .operationApproval(let stoppedApproval) = state.answer?.sections.last?.content else {
+            return XCTFail("停止后审批消息应保留在正文中")
+        }
+        XCTAssertEqual(stoppedApproval.decision, .rejected)
+    }
+
     // Keeps concurrent event streams isolated and marks only unseen background completion.
     @MainActor
     func testParallelSessionsExposeRunningAndUnreadCompletionStates() throws {

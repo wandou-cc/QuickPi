@@ -1,5 +1,6 @@
-import AppKit
+import CoreGraphics
 import Foundation
+import ImageIO
 import PDFKit
 import UniformTypeIdentifiers
 
@@ -23,7 +24,7 @@ enum AttachmentLoader {
 
         let fileExtension = url.pathExtension.lowercased()
         if UTType(filenameExtension: fileExtension)?.conforms(to: .image) == true {
-            guard let source = NSImage(contentsOf: url), source.size.width > 0, source.size.height > 0 else {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
                 throw QuickPiError.message("无法读取图片：\(url.lastPathComponent)")
             }
             return PendingAttachment(
@@ -61,7 +62,7 @@ enum AttachmentLoader {
 
     // Clipboard TIFF/bitmap payloads can be large even when their normalized JPEG is small.
     static func loadImage(data: Data, name: String) throws -> PendingAttachment {
-        guard let source = NSImage(data: data), source.size.width > 0, source.size.height > 0 else {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
             throw QuickPiError.message("无法读取图片：\(name)")
         }
         let jpeg = try normalizedJPEG(source: source, name: name)
@@ -75,30 +76,56 @@ enum AttachmentLoader {
         )
     }
 
-    // Converts a decoded image to a bounded JPEG accepted by image-capable Provider APIs.
-    private static func normalizedJPEG(source: NSImage, name: String) throws -> Data {
-        let scale = min(1, 2_048 / max(source.size.width, source.size.height))
-        let size = NSSize(
-            width: max(1, floor(source.size.width * scale)),
-            height: max(1, floor(source.size.height * scale))
-        )
-        let image = NSImage(size: size)
-        image.lockFocus()
-        NSColor.white.setFill()
-        NSRect(origin: .zero, size: size).fill()
-        source.draw(
-            in: NSRect(origin: .zero, size: size),
-            from: NSRect(origin: .zero, size: source.size),
-            operation: .sourceOver,
-            fraction: 1
-        )
-        image.unlockFocus()
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.86]) else {
+    // Downsamples while decoding, then flattens alpha before writing the Provider-ready JPEG.
+    private static func normalizedJPEG(source: CGImageSource, name: String) throws -> Data {
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 2_048,
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary),
+              thumbnail.width > 0,
+              thumbnail.height > 0 else {
+            throw QuickPiError.message("无法读取图片：\(name)")
+        }
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: thumbnail.width,
+            height: thumbnail.height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
             throw QuickPiError.message("无法转换图片：\(name)")
         }
-        return jpeg
+        let bounds = CGRect(x: 0, y: 0, width: thumbnail.width, height: thumbnail.height)
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(bounds)
+        context.interpolationQuality = .high
+        context.draw(thumbnail, in: bounds)
+        guard let flattened = context.makeImage() else {
+            throw QuickPiError.message("无法转换图片：\(name)")
+        }
+
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw QuickPiError.message("无法转换图片：\(name)")
+        }
+        let properties = [kCGImageDestinationLossyCompressionQuality: 0.86] as CFDictionary
+        CGImageDestinationAddImage(destination, flattened, properties)
+        guard CGImageDestinationFinalize(destination) else {
+            throw QuickPiError.message("无法转换图片：\(name)")
+        }
+        return output as Data
     }
 
     // Extracts visible WordprocessingML text from a DOCX using the system archive utility.

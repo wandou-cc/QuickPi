@@ -77,6 +77,29 @@ struct ProviderConfiguration: Codable, Equatable, Identifiable {
     }
 }
 
+struct OperationApprovalConfiguration: Codable, Equatable {
+    var enabled: Bool
+    var toolNames: [String]
+    var approveAllShellCommands: Bool
+    var shellCommandKeywords: [String]
+
+    static let defaults = OperationApprovalConfiguration(
+        enabled: true,
+        toolNames: ["write", "edit"],
+        approveAllShellCommands: false,
+        shellCommandKeywords: [
+            "rm -r",
+            "sudo",
+            "chmod 777",
+            "chown 777",
+            "git reset --hard",
+            "git clean -f",
+            "| sh",
+            "| bash",
+        ]
+    )
+}
+
 struct AppSettings: Codable, Equatable {
     var shortcut: String
     var launchAtLogin: Bool
@@ -84,6 +107,7 @@ struct AppSettings: Codable, Equatable {
     var selectedModel: ModelSelection?
     var providers: [ProviderConfiguration]
     var fillInputFromClipboardOnShortcut: Bool
+    var operationApproval: OperationApprovalConfiguration
 
     enum CodingKeys: String, CodingKey {
         case shortcut
@@ -92,6 +116,7 @@ struct AppSettings: Codable, Equatable {
         case selectedModel
         case providers
         case fillInputFromClipboardOnShortcut
+        case operationApproval
     }
 
     init(
@@ -100,7 +125,8 @@ struct AppSettings: Codable, Equatable {
         workspacePath: String?,
         selectedModel: ModelSelection?,
         providers: [ProviderConfiguration],
-        fillInputFromClipboardOnShortcut: Bool = false
+        fillInputFromClipboardOnShortcut: Bool = false,
+        operationApproval: OperationApprovalConfiguration = .defaults
     ) {
         self.shortcut = shortcut
         self.launchAtLogin = launchAtLogin
@@ -108,9 +134,10 @@ struct AppSettings: Codable, Equatable {
         self.selectedModel = selectedModel
         self.providers = providers
         self.fillInputFromClipboardOnShortcut = fillInputFromClipboardOnShortcut
+        self.operationApproval = operationApproval
     }
 
-    // Keeps settings written before this option existed readable with the new behavior disabled.
+    // Keeps settings written before these options existed readable with their current defaults.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         shortcut = try container.decode(String.self, forKey: .shortcut)
@@ -122,6 +149,10 @@ struct AppSettings: Codable, Equatable {
             Bool.self,
             forKey: .fillInputFromClipboardOnShortcut
         ) ?? false
+        operationApproval = try container.decodeIfPresent(
+            OperationApprovalConfiguration.self,
+            forKey: .operationApproval
+        ) ?? .defaults
     }
 
     // Converts the persisted project root into the directory URL used by the native picker and Pi.
@@ -556,8 +587,8 @@ struct QueuedUserMessage: Codable, Equatable, Identifiable {
     }
 }
 
-struct PendingAttachment: Identifiable, Equatable {
-    enum Content: Equatable {
+struct PendingAttachment: Identifiable, Equatable, Sendable {
+    enum Content: Equatable, Sendable {
         case text(String)
         case image(data: Data, mimeType: String)
     }
@@ -630,6 +661,29 @@ enum ToolStatus: Equatable {
     case failed
 }
 
+enum OperationApprovalKind: String, Codable, Equatable {
+    case shell
+    case write
+    case edit
+    case tool
+}
+
+enum OperationApprovalDecision: Equatable {
+    case pending
+    case approved
+    case rejected
+}
+
+struct OperationApproval: Equatable {
+    let requestId: String
+    let toolCallId: String
+    let toolName: String
+    let kind: OperationApprovalKind
+    let detail: String
+    let workingDirectory: String
+    var decision: OperationApprovalDecision = .pending
+}
+
 struct ToolActivity: Equatable {
     let callId: String
     let name: String
@@ -644,6 +698,7 @@ enum AnswerSectionContent: Equatable {
     case fileLink(URL)
     case customMessage(PiCustomMessage)
     case extensionNotification(ExtensionNotification)
+    case operationApproval(OperationApproval)
     case thinking(String)
     case tool(ToolActivity)
 }
@@ -709,7 +764,7 @@ struct AnswerSession: Identifiable, Equatable {
                 return text
             case .extensionNotification(let notification):
                 return notification.message
-            case .thinking, .tool:
+            case .operationApproval, .thinking, .tool:
                 return nil
             }
         }.joined(separator: "\n\n")

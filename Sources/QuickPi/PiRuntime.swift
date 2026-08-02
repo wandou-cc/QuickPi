@@ -43,6 +43,7 @@ enum PiRuntimeEvent {
     case extensionTitle(String)
     case extensionEditorText(String)
     case extensionPrompt(ExtensionPrompt)
+    case operationApproval(OperationApproval)
     case questionnairePrompt(QuestionnairePrompt)
     case operationFailed(String)
     case runtimeExited(String)
@@ -323,11 +324,20 @@ final class PiRuntime {
             let options: [Option]?
         }
 
+        struct WireOperationApproval: Decodable {
+            let toolCallId: String
+            let toolName: String
+            let kind: String
+            let detail: String
+            let workingDirectory: String
+        }
+
         let kind: String
         let snapshot: RuntimeSnapshot?
         let sessionSnapshot: SessionSnapshot?
         let event: WireAuthEvent?
         let prompt: WirePrompt?
+        let operationApproval: WireOperationApproval?
         let questionnaire: QuestionnaireDefinition?
         let providerId: String?
         let requestId: String?
@@ -419,6 +429,10 @@ final class PiRuntime {
         environment["PI_CODING_AGENT_SESSION_DIR"] = quickPiDirectory
             .appendingPathComponent("sessions", isDirectory: true).path
         environment["QUICK_PI_DATA_DIR"] = quickPiDirectory.path
+        environment["QUICK_PI_APPROVAL_CONFIG"] = String(
+            decoding: try JSONEncoder().encode(settings.operationApproval),
+            as: UTF8.self
+        )
         environment["PI_OFFLINE"] = "1"
         nextProcess.environment = environment
         nextProcess.terminationHandler = { [weak self] terminatedProcess in
@@ -1291,42 +1305,72 @@ final class PiRuntime {
             onEvent?(.extensionEditorText(text))
             return
         }
-        if envelope.method == "input" || envelope.method == "select" {
-            if let requestId = envelope.id,
-               let title = envelope.title,
-               title.hasPrefix("quickpi:") {
-                let payload = try decodeExtensionPayload(String(title.dropFirst("quickpi:".count)))
-                if payload.kind == "questionnaire", let questionnaire = payload.questionnaire {
-                    try validateQuestionnaire(questionnaire)
-                    onEvent?(.questionnairePrompt(QuestionnairePrompt(
-                        requestId: requestId,
-                        definition: questionnaire
-                    )))
-                    return
+        if ["input", "select", "confirm"].contains(envelope.method),
+           let requestId = envelope.id,
+           let title = envelope.title,
+           title.hasPrefix("quickpi:") {
+            let payload = try decodeExtensionPayload(String(title.dropFirst("quickpi:".count)))
+            if payload.kind == "operationApproval" {
+                guard envelope.method == "confirm",
+                      let request = payload.operationApproval,
+                      let kind = OperationApprovalKind(rawValue: request.kind),
+                      !requestId.isEmpty,
+                      requestId.count <= 200,
+                      !request.toolCallId.isEmpty,
+                      request.toolCallId.count <= 200,
+                      !request.toolName.isEmpty,
+                      request.toolName.count <= 200,
+                      !request.detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      request.detail.count <= 50_000,
+                      !request.workingDirectory.isEmpty,
+                      request.workingDirectory.count <= 4_096 else {
+                    throw QuickPiError.message("Pi 操作审批请求无效")
                 }
-                guard payload.kind == "authPrompt", let prompt = payload.prompt else {
-                    throw QuickPiError.message("Pi 登录提示无效")
-                }
-                let options: [AuthPrompt.Option]
-                if prompt.type == "select" {
-                    guard let promptOptions = prompt.options else {
-                        throw QuickPiError.message("Pi 登录选择提示缺少选项")
-                    }
-                    options = promptOptions.map {
-                        AuthPrompt.Option(id: $0.id, label: $0.label, description: $0.description)
-                    }
-                } else {
-                    options = []
-                }
-                onEvent?(.authPrompt(AuthPrompt(
+                onEvent?(.operationApproval(OperationApproval(
                     requestId: requestId,
-                    type: prompt.type,
-                    message: prompt.message,
-                    placeholder: prompt.placeholder,
-                    options: options
+                    toolCallId: request.toolCallId,
+                    toolName: request.toolName,
+                    kind: kind,
+                    detail: request.detail,
+                    workingDirectory: request.workingDirectory
                 )))
                 return
             }
+            if payload.kind == "questionnaire", let questionnaire = payload.questionnaire {
+                guard envelope.method == "input" else {
+                    throw QuickPiError.message("Pi 问卷提示类型无效")
+                }
+                try validateQuestionnaire(questionnaire)
+                onEvent?(.questionnairePrompt(QuestionnairePrompt(
+                    requestId: requestId,
+                    definition: questionnaire
+                )))
+                return
+            }
+            guard envelope.method == "input" || envelope.method == "select",
+                  payload.kind == "authPrompt",
+                  let prompt = payload.prompt else {
+                throw QuickPiError.message("Pi 登录提示无效")
+            }
+            let options: [AuthPrompt.Option]
+            if prompt.type == "select" {
+                guard let promptOptions = prompt.options else {
+                    throw QuickPiError.message("Pi 登录选择提示缺少选项")
+                }
+                options = promptOptions.map {
+                    AuthPrompt.Option(id: $0.id, label: $0.label, description: $0.description)
+                }
+            } else {
+                options = []
+            }
+            onEvent?(.authPrompt(AuthPrompt(
+                requestId: requestId,
+                type: prompt.type,
+                message: prompt.message,
+                placeholder: prompt.placeholder,
+                options: options
+            )))
+            return
         }
 
         guard ["input", "select", "confirm", "editor"].contains(envelope.method) else {

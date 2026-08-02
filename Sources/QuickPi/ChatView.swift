@@ -1317,14 +1317,15 @@ struct ChatView: View {
     }
 
     private var resultPanel: some View {
-        VStack(spacing: 0) {
+        let conversationAnswers = state.conversationAnswers
+        return VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 GeometryReader { viewport in
                     ScrollView {
                         VStack(spacing: 0) {
                             VStack(alignment: .leading, spacing: 0) {
                                 ForEach(
-                                    Array(state.conversationAnswers.enumerated()),
+                                    Array(conversationAnswers.enumerated()),
                                     id: \.element.id
                                 ) { index, answer in
                                     let toolGroups = toolActivityGroupsByCallID(in: answer.sections)
@@ -1334,6 +1335,8 @@ struct ChatView: View {
                                         }
                                         return false
                                     }
+
+                                    let answerText = answer.answerText
 
                                     VStack(alignment: .leading, spacing: 16) {
                                         if let question = answer.question {
@@ -1350,7 +1353,8 @@ struct ChatView: View {
                                                     section: section,
                                                     toolsByCallID: toolGroups,
                                                     baseURL: state.activeWorkingDirectoryURL,
-                                                    openFile: state.openLocalFile
+                                                    openFile: state.openLocalFile,
+                                                    respondToApproval: state.respondToOperationApproval
                                                 )
                                             }
 
@@ -1391,11 +1395,11 @@ struct ChatView: View {
                                                 || answer.usage.totalTokens > 0
                                                 || answer.stopReason == "length"
                                                 || answer.cloneEntryId != nil
-                                                || !answer.answerText.isEmpty {
+                                                || !answerText.isEmpty {
                                                 VStack(alignment: .leading, spacing: 4) {
                                                     answerMetadata(answer)
 
-                                                    if answer.cloneEntryId != nil || !answer.answerText.isEmpty {
+                                                    if answer.cloneEntryId != nil || !answerText.isEmpty {
                                                         HStack(spacing: 10) {
                                                             if let entryId = answer.cloneEntryId {
                                                                 Button {
@@ -1417,9 +1421,9 @@ struct ChatView: View {
                                                                 .help("从此回复克隆为新会话")
                                                             }
 
-                                                            if !answer.answerText.isEmpty {
+                                                            if !answerText.isEmpty {
                                                                 Button {
-                                                                    copy(answer.answerText)
+                                                                    copy(answerText)
                                                                 } label: {
                                                                     Image(systemName: "doc.on.doc")
                                                                         .font(.system(size: 12, weight: .medium))
@@ -1440,7 +1444,7 @@ struct ChatView: View {
                                         }
                                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                                        if index < state.conversationAnswers.count - 1 {
+                                        if index < conversationAnswers.count - 1 {
                                             Divider()
                                                 .opacity(0.7)
                                                 .padding(.top, 2)
@@ -1449,11 +1453,11 @@ struct ChatView: View {
                                     .padding(.top, 18)
                                     .padding(
                                         .bottom,
-                                        index == state.conversationAnswers.count - 1 ? 18 : 0
+                                        index == conversationAnswers.count - 1 ? 18 : 0
                                     )
                                     .id(answer.id)
                                     .onAppear {
-                                        guard answer.id == state.conversationAnswers.last?.id else {
+                                        guard answer.id == conversationAnswers.last?.id else {
                                             return
                                         }
                                         resultScrollTracker.isAtBottom = true
@@ -3546,6 +3550,7 @@ private struct AnswerSectionView: View {
     let toolsByCallID: [String: [ToolActivity]]
     let baseURL: URL
     let openFile: (URL) -> Void
+    let respondToApproval: (String, Bool) -> Void
 
     var body: some View {
         switch section.content {
@@ -3649,12 +3654,136 @@ private struct AnswerSectionView: View {
                     .foregroundStyle(presentation.color)
                 AnswerMarkdownView(source: notification.message, baseURL: baseURL)
             }
+        case .operationApproval(let approval):
+            OperationApprovalView(approval: approval) { approved in
+                respondToApproval(approval.requestId, approved)
+            }
         case .thinking(let text):
             ThinkingActivityView(text: text, baseURL: baseURL)
         case .tool(let tool):
             if let tools = toolsByCallID[tool.callId], tool.callId == tools.first?.callId {
                 ToolActivityGroupView(tools: tools)
             }
+        }
+    }
+}
+
+private struct OperationApprovalButtonStyle: ButtonStyle {
+    let approved: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: QuickPiTypography.settingsSize, weight: .medium))
+            .foregroundStyle(approved ? Color.white : Color.red)
+            .padding(.horizontal, 14)
+            .frame(minWidth: 104, minHeight: 32, maxHeight: 32)
+            .background(
+                approved
+                    ? Color.accentColor.opacity(configuration.isPressed ? 0.72 : 1)
+                    : Color.red.opacity(configuration.isPressed ? 0.10 : 0.04),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(
+                        approved ? Color.accentColor : Color.red.opacity(0.45),
+                        lineWidth: 1
+                    )
+            }
+    }
+}
+
+private struct OperationApprovalView: View {
+    let approval: OperationApproval
+    let onDecision: (Bool) -> Void
+
+    private var presentation: (title: String, symbol: String) {
+        switch approval.kind {
+        case .shell:
+            ("Shell 命令需要审批", "terminal")
+        case .write:
+            ("文件写入需要审批", "doc.badge.plus")
+        case .edit:
+            ("文件编辑需要审批", "square.and.pencil")
+        case .tool:
+            ("工具调用需要审批", "wrench.and.screwdriver")
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: presentation.symbol)
+                    .foregroundStyle(.orange)
+                    .frame(width: 18)
+                Text(presentation.title)
+                    .font(.system(size: QuickPiTypography.bodySize, weight: .semibold))
+                Text(approval.toolName)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                decisionLabel
+            }
+
+            Label(approval.workingDirectory, systemImage: "folder")
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(approval.workingDirectory)
+
+            ScrollView([.horizontal, .vertical]) {
+                Text(approval.detail)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: true, vertical: true)
+                    .padding(9)
+            }
+            .frame(maxWidth: .infinity, maxHeight: 180, alignment: .leading)
+            .background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 6))
+
+            if approval.decision == .pending {
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    Button {
+                        onDecision(false)
+                    } label: {
+                        Label("不通过", systemImage: "xmark")
+                    }
+                    .buttonStyle(OperationApprovalButtonStyle(approved: false))
+
+                    Button {
+                        onDecision(true)
+                    } label: {
+                        Label("通过", systemImage: "checkmark")
+                    }
+                    .buttonStyle(OperationApprovalButtonStyle(approved: true))
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.orange.opacity(0.28), lineWidth: 1)
+        }
+    }
+
+    @ViewBuilder
+    private var decisionLabel: some View {
+        switch approval.decision {
+        case .pending:
+            Label("等待决定", systemImage: "clock")
+                .foregroundStyle(.orange)
+        case .approved:
+            Label("已通过", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .rejected:
+            Label("未通过", systemImage: "xmark.circle.fill")
+                .foregroundStyle(.red)
         }
     }
 }

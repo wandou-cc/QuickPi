@@ -35,6 +35,86 @@ function notify(ctx, payload) {
   ctx.ui.notify(`${prefix}${JSON.stringify(payload)}`, "info");
 }
 
+function readOperationApprovalConfiguration() {
+  const raw = process.env.QUICK_PI_APPROVAL_CONFIG;
+  if (!raw) {
+    return {
+      enabled: false,
+      toolNames: [],
+      approveAllShellCommands: false,
+      shellCommandKeywords: [],
+    };
+  }
+  const configuration = JSON.parse(raw);
+  if (typeof configuration?.enabled !== "boolean"
+    || !Array.isArray(configuration.toolNames)
+    || !configuration.toolNames.every((name) => typeof name === "string")
+    || typeof configuration.approveAllShellCommands !== "boolean"
+    || !Array.isArray(configuration.shellCommandKeywords)
+    || !configuration.shellCommandKeywords.every((keyword) => typeof keyword === "string")) {
+    throw new Error("操作审批配置无效");
+  }
+  return configuration;
+}
+
+function normalizedShellText(value) {
+  return value.toLocaleLowerCase().replace(/\s+/gu, " ").trim();
+}
+
+function truncatedApprovalDetail(value) {
+  const limit = 20_000;
+  return value.length <= limit ? value : `${value.slice(0, limit)}\n\n[内容已截断]`;
+}
+
+function formattedToolInput(input) {
+  try {
+    return JSON.stringify(input, null, 2);
+  } catch {
+    return String(input);
+  }
+}
+
+function operationApprovalRequest(event, ctx, configuration) {
+  if (!configuration.enabled) {
+    return undefined;
+  }
+  const toolName = event.toolName.toLocaleLowerCase();
+  const input = event.input ?? {};
+  const configuredTools = new Set(configuration.toolNames.map((name) => name.toLocaleLowerCase()));
+  const configuredTool = configuredTools.has(toolName);
+  let matchesShellPolicy = false;
+  if (toolName === "bash") {
+    const command = typeof input.command === "string" ? input.command : "";
+    const normalizedCommand = normalizedShellText(command);
+    matchesShellPolicy = configuration.approveAllShellCommands
+      || configuration.shellCommandKeywords.some((keyword) => {
+        const normalizedKeyword = normalizedShellText(keyword);
+        return normalizedKeyword.length > 0 && normalizedCommand.includes(normalizedKeyword);
+      });
+  }
+  if (!configuredTool && !matchesShellPolicy) {
+    return undefined;
+  }
+
+  let kind = "tool";
+  let detail = formattedToolInput(input);
+  if (toolName === "bash") {
+    kind = "shell";
+    detail = typeof input.command === "string" ? input.command : detail;
+  } else if (toolName === "write") {
+    kind = "write";
+  } else if (toolName === "edit") {
+    kind = "edit";
+  }
+  return {
+    toolCallId: event.toolCallId,
+    toolName: event.toolName,
+    kind,
+    detail: truncatedApprovalDetail(detail),
+    workingDirectory: ctx.cwd,
+  };
+}
+
 function decodeCommitMessageRequest(value) {
   const encoded = value.trim();
   if (!encoded) {
@@ -498,6 +578,28 @@ export default async function quickPiExtension(pi) {
   if (!dataDirectory) {
     throw new Error("QUICK_PI_DATA_DIR 未配置");
   }
+  const approvalConfiguration = readOperationApprovalConfiguration();
+  pi.on("tool_call", async (event, ctx) => {
+    const approval = operationApprovalRequest(event, ctx, approvalConfiguration);
+    if (!approval) {
+      return undefined;
+    }
+    let approved = false;
+    try {
+      approved = await ctx.ui.confirm(
+        `${prefix}${JSON.stringify({ kind: "operationApproval", operationApproval: approval })}`,
+        approval.detail,
+        { signal: ctx.signal },
+      );
+    } catch {
+      approved = false;
+    }
+    if (approved !== true) {
+      return { block: true, reason: `用户未通过 ${event.toolName} 操作` };
+    }
+    return undefined;
+  });
+
   const modelDocument = JSON.parse(await readFile(join(dataDirectory, "models.json"), "utf8"));
   const credentials = await readCredentials(join(dataDirectory, "auth.json"));
   let providerIndex = 0;

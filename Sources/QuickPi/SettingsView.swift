@@ -3,6 +3,7 @@ import SwiftUI
 private enum SettingsPane {
     case general
     case personalization
+    case security
     case providers
 }
 
@@ -23,6 +24,13 @@ struct SettingsView: View {
     @State private var fillInputFromClipboardOnShortcut: Bool
     @State private var savingGeneral = false
     @State private var generalMessage: String?
+    @State private var approvalEnabled: Bool
+    @State private var approvalToolNames: String
+    @State private var approveAllShellCommands: Bool
+    @State private var shellCommandKeywords: String
+    @State private var savingSecurity = false
+    @State private var securityMessage: String?
+    @State private var securityMessageIsError = false
     @State private var agentInstructions = ""
     @State private var savedAgentInstructions = ""
     @State private var loadingAgentInstructions = true
@@ -54,6 +62,11 @@ struct SettingsView: View {
         _fillInputFromClipboardOnShortcut = State(
             initialValue: state.settings.fillInputFromClipboardOnShortcut
         )
+        let approval = state.settings.operationApproval
+        _approvalEnabled = State(initialValue: approval.enabled)
+        _approvalToolNames = State(initialValue: approval.toolNames.joined(separator: "\n"))
+        _approveAllShellCommands = State(initialValue: approval.approveAllShellCommands)
+        _shellCommandKeywords = State(initialValue: approval.shellCommandKeywords.joined(separator: "\n"))
     }
 
     private var isEditingProvider: Bool {
@@ -119,6 +132,26 @@ struct SettingsView: View {
                 .foregroundStyle(selectedPane == .personalization ? Color.accentColor : Color.primary)
 
                 Button {
+                    selectedPane = .security
+                } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: "checkmark.shield")
+                            .frame(width: 18)
+                        Text("安全")
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
+                    .contentShape(Rectangle())
+                    .background(
+                        selectedPane == .security ? Color.accentColor.opacity(0.12) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(selectedPane == .security ? Color.accentColor : Color.primary)
+
+                Button {
                     selectedPane = .providers
                 } label: {
                     HStack(spacing: 9) {
@@ -154,6 +187,8 @@ struct SettingsView: View {
                             Text("通用")
                         } else if selectedPane == .personalization {
                             Text("个性化")
+                        } else if selectedPane == .security {
+                            Text("安全")
                         } else if showingProviderForm {
                             Text(isEditingProvider ? "编辑 Provider" : "添加 Provider")
                         } else {
@@ -163,12 +198,33 @@ struct SettingsView: View {
                     .font(.title3.weight(.semibold))
 
                     if (selectedPane == .general && savingGeneral)
-                        || (selectedPane == .personalization && savingAgentInstructions) {
+                        || (selectedPane == .personalization && savingAgentInstructions)
+                        || (selectedPane == .security && savingSecurity) {
                         ProgressView()
                             .controlSize(.small)
                     }
 
                     Spacer()
+
+                    if selectedPane == .security {
+                        Button {
+                            applyOperationApprovalDraft(.defaults)
+                            securityMessage = nil
+                        } label: {
+                            Image(systemName: "arrow.counterclockwise")
+                        }
+                        .buttonStyle(SettingsIconButtonStyle())
+                        .disabled(savingSecurity)
+                        .help("恢复默认")
+
+                        Button {
+                            saveSecuritySettings()
+                        } label: {
+                            Label("保存", systemImage: "square.and.arrow.down")
+                        }
+                        .buttonStyle(SettingsActionButtonStyle(prominence: .primary))
+                        .disabled(savingSecurity || !state.canSaveAgentInstructions)
+                    }
 
                     if selectedPane == .providers {
                         Button {
@@ -205,6 +261,7 @@ struct SettingsView: View {
                     .buttonStyle(SettingsIconButtonStyle())
                     .disabled(
                         savingGeneral
+                            || savingSecurity
                             || savingAgentInstructions
                             || syncingModels
                             || savingProvider
@@ -220,6 +277,8 @@ struct SettingsView: View {
                     generalTab
                 } else if selectedPane == .personalization {
                     personalizationTab
+                } else if selectedPane == .security {
+                    securityTab
                 } else {
                     providersTab
                 }
@@ -231,7 +290,7 @@ struct SettingsView: View {
         .background(Color.quickPiWindowBackground)
         .preferredColorScheme(theme.colorScheme)
         .interactiveDismissDisabled(
-            savingGeneral || savingAgentInstructions || syncingModels || savingProvider
+            savingGeneral || savingSecurity || savingAgentInstructions || syncingModels || savingProvider
         )
         .task {
             loadAgentInstructions()
@@ -331,6 +390,62 @@ struct SettingsView: View {
         .scrollContentBackground(.hidden)
         .background(Color.quickPiWindowBackground)
         .disabled(savingGeneral)
+    }
+
+    private var securityTab: some View {
+        Form {
+            Section("操作审批") {
+                Toggle("启用操作审批", isOn: $approvalEnabled)
+            }
+
+            Section("工具") {
+                LabeledContent("逐次审批的工具名") {
+                    TextEditor(text: $approvalToolNames)
+                        .font(.system(size: QuickPiTypography.settingsSize, design: .monospaced))
+                        .scrollContentBackground(.hidden)
+                        .padding(6)
+                        .frame(width: 390)
+                        .frame(minHeight: 82, maxHeight: 110)
+                        .background(Color(nsColor: .textBackgroundColor))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                        }
+                        .accessibilityLabel("逐次审批的工具名，每行一个")
+                }
+            }
+
+            Section("Shell") {
+                Toggle("审批所有 Shell 命令", isOn: $approveAllShellCommands)
+                LabeledContent("危险命令关键字") {
+                    TextEditor(text: $shellCommandKeywords)
+                        .font(.system(size: QuickPiTypography.settingsSize, design: .monospaced))
+                        .scrollContentBackground(.hidden)
+                        .padding(6)
+                        .frame(width: 390)
+                        .frame(minHeight: 132, maxHeight: 180)
+                        .background(Color(nsColor: .textBackgroundColor))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                        }
+                        .accessibilityLabel("危险 Shell 命令关键字，每行一个")
+                        .disabled(approveAllShellCommands)
+                }
+            }
+
+            if let securityMessage {
+                Section {
+                    Text(securityMessage)
+                        .foregroundStyle(securityMessageIsError ? Color.red : Color.green)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+        .background(Color.quickPiWindowBackground)
+        .disabled(savingSecurity)
     }
 
     private var personalizationTab: some View {
@@ -671,6 +786,46 @@ struct SettingsView: View {
         .onChange(of: provider.kind) { _, _ in resetSyncedModels() }
         .onChange(of: provider.baseURL) { _, _ in resetSyncedModels() }
         .onChange(of: apiKey) { _, _ in resetSyncedModels() }
+    }
+
+    private func editableLines(in text: String) -> [String] {
+        text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func operationApprovalDraft() -> OperationApprovalConfiguration {
+        OperationApprovalConfiguration(
+            enabled: approvalEnabled,
+            toolNames: editableLines(in: approvalToolNames),
+            approveAllShellCommands: approveAllShellCommands,
+            shellCommandKeywords: editableLines(in: shellCommandKeywords)
+        )
+    }
+
+    private func applyOperationApprovalDraft(_ configuration: OperationApprovalConfiguration) {
+        approvalEnabled = configuration.enabled
+        approvalToolNames = configuration.toolNames.joined(separator: "\n")
+        approveAllShellCommands = configuration.approveAllShellCommands
+        shellCommandKeywords = configuration.shellCommandKeywords.joined(separator: "\n")
+    }
+
+    private func saveSecuritySettings() {
+        guard !savingSecurity else {
+            return
+        }
+        savingSecurity = true
+        securityMessage = nil
+        do {
+            try state.saveOperationApprovalSettings(operationApprovalDraft())
+            applyOperationApprovalDraft(state.settings.operationApproval)
+            securityMessage = "已保存"
+            securityMessageIsError = false
+        } catch {
+            securityMessage = error.localizedDescription
+            securityMessageIsError = true
+        }
+        savingSecurity = false
     }
 
     // Reads the native Pi context file once when the settings window opens.

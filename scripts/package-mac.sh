@@ -120,7 +120,31 @@ if [ ! -d "$PROJECT_ROOT/.build/release/Sparkle.framework" ]; then
   exit 1
 fi
 ditto "$PROJECT_ROOT/.build/release/Sparkle.framework" "$FRAMEWORKS_PATH/Sparkle.framework"
+SPARKLE_FRAMEWORK_PATH="$FRAMEWORKS_PATH/Sparkle.framework"
+SPARKLE_VERSION_PATH="$SPARKLE_FRAMEWORK_PATH/Versions/B"
+thin_sparkle_executable() {
+  EXECUTABLE_PATH=$1
+  if [ ! -f "$EXECUTABLE_PATH" ]; then
+    echo "Sparkle executable is missing: $EXECUTABLE_PATH" >&2
+    exit 1
+  fi
+  lipo "$EXECUTABLE_PATH" -thin "$MACHINE_ARCH" -output "$EXECUTABLE_PATH.thin"
+  mv "$EXECUTABLE_PATH.thin" "$EXECUTABLE_PATH"
+}
+thin_sparkle_executable "$SPARKLE_VERSION_PATH/Sparkle"
+thin_sparkle_executable "$SPARKLE_VERSION_PATH/Autoupdate"
+thin_sparkle_executable "$SPARKLE_VERSION_PATH/Updater.app/Contents/MacOS/Updater"
+thin_sparkle_executable "$SPARKLE_VERSION_PATH/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
+thin_sparkle_executable "$SPARKLE_VERSION_PATH/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+rm -rf \
+  "$SPARKLE_FRAMEWORK_PATH/Headers" \
+  "$SPARKLE_FRAMEWORK_PATH/PrivateHeaders" \
+  "$SPARKLE_FRAMEWORK_PATH/Modules" \
+  "$SPARKLE_VERSION_PATH/Headers" \
+  "$SPARKLE_VERSION_PATH/PrivateHeaders" \
+  "$SPARKLE_VERSION_PATH/Modules"
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$CONTENTS_PATH/MacOS/QuickPi"
+strip -x "$CONTENTS_PATH/MacOS/QuickPi"
 
 sips -z 16 16 "$PROJECT_ROOT/resources/icon.png" --out "$ICONSET_PATH/icon_16x16.png" >/dev/null
 sips -z 32 32 "$PROJECT_ROOT/resources/icon.png" --out "$ICONSET_PATH/icon_16x16@2x.png" >/dev/null

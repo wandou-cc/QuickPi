@@ -382,12 +382,19 @@ final class ConfigurationStoreTests: XCTestCase {
                     ]
                 ),
             ],
-            fillInputFromClipboardOnShortcut: true
+            fillInputFromClipboardOnShortcut: true,
+            operationApproval: OperationApprovalConfiguration(
+                enabled: true,
+                toolNames: ["write", "deploy"],
+                approveAllShellCommands: true,
+                shellCommandKeywords: ["sudo"]
+            )
         )
 
         XCTAssertEqual(try store.save(settings), settings)
         XCTAssertEqual(try store.load().workspacePath, settings.workspacePath)
         XCTAssertTrue(try store.load().fillInputFromClipboardOnShortcut)
+        XCTAssertEqual(try store.load().operationApproval, settings.operationApproval)
         let storedSettings = try XCTUnwrap(
             try JSONSerialization.jsonObject(
                 with: Data(contentsOf: directory.appendingPathComponent("settings.json"))
@@ -396,6 +403,11 @@ final class ConfigurationStoreTests: XCTestCase {
         XCTAssertNil(storedSettings["terminalAccess"])
         XCTAssertNil(storedSettings["fileSystemAccess"])
         XCTAssertEqual(storedSettings["fillInputFromClipboardOnShortcut"] as? Bool, true)
+        let storedApproval = try XCTUnwrap(storedSettings["operationApproval"] as? [String: Any])
+        XCTAssertEqual(storedApproval["enabled"] as? Bool, true)
+        XCTAssertEqual(storedApproval["toolNames"] as? [String], ["write", "deploy"])
+        XCTAssertEqual(storedApproval["approveAllShellCommands"] as? Bool, true)
+        XCTAssertEqual(storedApproval["shellCommandKeywords"] as? [String], ["sudo"])
         try store.writeModels(for: try store.load())
 
         let modelsURL = directory.appendingPathComponent("pi/models.json")
@@ -483,6 +495,7 @@ final class ConfigurationStoreTests: XCTestCase {
 
         XCTAssertNil(try store.load().workspacePath)
         XCTAssertFalse(try store.load().fillInputFromClipboardOnShortcut)
+        XCTAssertEqual(try store.load().operationApproval, .defaults)
     }
 
     // Keeps existing Provider settings readable while leaving undeclared reasoning disabled.
