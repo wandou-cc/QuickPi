@@ -20,7 +20,7 @@ final class SessionStateTests: XCTestCase {
             ["new", "worktree", "settings", "copy", "name", "session", "compact", "clone", "branch", "export"]
         )
         XCTAssertTrue(state.slashCommandSuggestions.allSatisfy { $0.source == .app })
-        XCTAssertEqual(state.inputBarHeight, 154)
+        XCTAssertEqual(state.inputBarHeight, 192)
         XCTAssertEqual(state.slashCommandMenuHeight, 185)
 
         state.draft = "/settings"
@@ -72,8 +72,8 @@ final class SessionStateTests: XCTestCase {
             presentSettings: {}
         )
 
-        XCTAssertEqual(state.inputBarHeight, 154)
-        XCTAssertEqual(state.inputEditorBarHeight, 116)
+        XCTAssertEqual(state.inputBarHeight, 192)
+        XCTAssertEqual(state.inputEditorBarHeight, 154)
 
         let editor = PromptTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 96))
         editor.string = "第一行\n第二行\n第三行\n第四行\n第五行"
@@ -82,16 +82,16 @@ final class SessionStateTests: XCTestCase {
 
         state.setInputEditorHeight(measuredHeight)
         XCTAssertEqual(state.inputEditorHeight, measuredHeight)
-        XCTAssertEqual(state.inputBarHeight, 58 + measuredHeight)
-        XCTAssertEqual(state.inputEditorBarHeight, 20 + measuredHeight)
+        XCTAssertEqual(state.inputBarHeight, 96 + measuredHeight)
+        XCTAssertEqual(state.inputEditorBarHeight, 58 + measuredHeight)
 
         state.setInputEditorHeight(1_000)
-        XCTAssertEqual(state.inputBarHeight, 228)
-        XCTAssertEqual(state.inputEditorBarHeight, 190)
+        XCTAssertEqual(state.inputBarHeight, 266)
+        XCTAssertEqual(state.inputEditorBarHeight, 228)
 
         state.setInputEditorHeight(1)
-        XCTAssertEqual(state.inputBarHeight, 154)
-        XCTAssertEqual(state.inputEditorBarHeight, 116)
+        XCTAssertEqual(state.inputBarHeight, 192)
+        XCTAssertEqual(state.inputEditorBarHeight, 154)
     }
 
     // Verifies that an image paste enters the existing attachment pipeline and becomes normalized JPEG data.
@@ -121,7 +121,7 @@ final class SessionStateTests: XCTestCase {
         }
         XCTAssertEqual(mimeType, "image/jpeg")
         XCTAssertNotNil(NSImage(data: data))
-        XCTAssertEqual(state.inputBarHeight, 206)
+        XCTAssertEqual(state.inputBarHeight, 244)
         XCTAssertNil(state.runtimeError)
     }
 
@@ -881,7 +881,7 @@ final class SessionStateTests: XCTestCase {
         }
         XCTAssertEqual(notification.kind, .info)
         XCTAssertTrue(state.showsResultPanel)
-        XCTAssertEqual(state.inputBarHeight, 154)
+        XCTAssertEqual(state.inputBarHeight, 192)
     }
 
     // Keeps fire-and-forget plugin output when an idle session later receives a fresh Pi process.
@@ -994,7 +994,7 @@ final class SessionStateTests: XCTestCase {
         XCTAssertTrue(richTaskLines[0].runs.first?.style.dimmed == true)
         XCTAssertEqual(state.extensionTitle, "Plugin workspace")
         XCTAssertEqual(state.draft, "prefilled")
-        XCTAssertEqual(state.inputBarHeight, 198)
+        XCTAssertEqual(state.inputBarHeight, 236)
 
         try runtime.consumeExtensionRequest(Data(
             #"{"type":"extension_ui_request","id":"queue","method":"notify","message":"quickpi:{\"kind\":\"managedQueueChanged\",\"queuedMessages\":[{\"id\":\"queue-1\",\"text\":\"待编辑\",\"delivery\":\"steer\",\"attachmentNames\":[],\"editable\":true}]}","notifyType":"info"}"#.utf8
@@ -1051,7 +1051,7 @@ final class SessionStateTests: XCTestCase {
         XCTAssertTrue(planRichLines[0].runs[1].style.dimmed)
         XCTAssertTrue(planRichLines[0].runs[1].style.strikethrough)
         XCTAssertTrue(planRichLines[1].runs[0].style.dimmed)
-        XCTAssertEqual(state.inputBarHeight, 154)
+        XCTAssertEqual(state.inputBarHeight, 192)
 
         try runtime.consumeExtensionRequest(Data(
             #"{"type":"extension_ui_request","id":"clear-plan-status","method":"setStatus","statusKey":"plan-mode"}"#.utf8

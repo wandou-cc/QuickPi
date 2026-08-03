@@ -78,11 +78,11 @@ struct PromptChoicePanel: View {
         HStack(alignment: .top, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(title)
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.system(size: QuickPiTypography.titleSize, weight: .semibold))
                     .fixedSize(horizontal: false, vertical: true)
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle)
-                        .font(.system(size: 13))
+                        .font(.system(size: QuickPiTypography.controlSize))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -91,7 +91,7 @@ struct PromptChoicePanel: View {
 
             Button(action: onCancel) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: QuickPiTypography.metadataSize, weight: .semibold))
                     .frame(width: 26, height: 26)
             }
             .buttonStyle(.plain)
@@ -116,7 +116,7 @@ struct PromptChoiceRow: View {
         Button(action: action) {
             HStack(spacing: 14) {
                 Text("\(number)")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: QuickPiTypography.controlSize, weight: .semibold))
                     .foregroundStyle(selected || hovered ? Color.accentColor : Color.secondary)
                     .frame(width: 34, height: 34)
                     .background(
@@ -126,12 +126,12 @@ struct PromptChoiceRow: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text(title)
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(.system(size: QuickPiTypography.controlSize, weight: .semibold))
                             .foregroundStyle(Color.primary)
                             .fixedSize(horizontal: false, vertical: true)
                         if recommended {
                             Text("推荐")
-                                .font(.system(size: 10, weight: .semibold))
+                                .font(.system(size: QuickPiTypography.metadataSize, weight: .semibold))
                                 .foregroundStyle(Color.accentColor)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
@@ -142,14 +142,14 @@ struct PromptChoiceRow: View {
                     }
                     if let description, !description.isEmpty {
                         Text(description)
-                            .font(.system(size: 12))
+                            .font(.system(size: QuickPiTypography.metadataSize))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 Image(systemName: selected ? "checkmark" : "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: QuickPiTypography.metadataSize, weight: .semibold))
                     .foregroundStyle(selected || hovered ? Color.accentColor : Color.secondary.opacity(0.55))
             }
             .padding(.horizontal, 14)

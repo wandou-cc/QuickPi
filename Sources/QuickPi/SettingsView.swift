@@ -195,7 +195,7 @@ struct SettingsView: View {
                             Text("Provider")
                         }
                     }
-                    .font(.title3.weight(.semibold))
+                    .font(.system(size: QuickPiTypography.titleSize, weight: .semibold))
 
                     if (selectedPane == .general && savingGeneral)
                         || (selectedPane == .personalization && savingAgentInstructions)
@@ -622,7 +622,7 @@ struct SettingsView: View {
                 Link(destination: URL(string: "https://codeingforce.com")!) {
                     HStack(spacing: 12) {
                         Image(systemName: "network")
-                            .font(.title2)
+                            .font(.system(size: 17))
                             .foregroundStyle(.orange)
                             .frame(width: 28)
 

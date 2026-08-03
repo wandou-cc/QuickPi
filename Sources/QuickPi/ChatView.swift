@@ -527,189 +527,12 @@ struct ChatView: View {
                     .frame(height: 52)
                 }
 
-                HStack(spacing: 8) {
-                Button {
-                    chooseAttachments()
-                } label: {
-                    Image(systemName: "paperclip")
-                }
-                .buttonStyle(.plain)
-                .frame(width: 30, height: 30)
-                .foregroundStyle(.secondary)
-                .help("添加附件")
-
-                ZStack(alignment: .topLeading) {
-                    PromptEditor(
-                        text: Binding(
-                            get: { state.draft },
-                            set: { state.draft = $0 }
-                        ),
-                        isFocused: $promptFocused,
-                        onHeightChange: state.setInputEditorHeight,
-                        onPasteImages: { providers in
-                            Task { await state.addPastedImages(providers: providers) }
-                        },
-                        onSubmit: {
-                            let suggestions = state.slashCommandSuggestions
-                            if suggestions.isEmpty {
-                                Task { await state.send() }
-                            } else if state.draftMatchesSlashCommand {
-                                Task { await state.send() }
-                            } else {
-                                selectSlashCommand(
-                                    suggestions[min(selectedSlashCommandIndex, suggestions.count - 1)]
-                                )
-                            }
-                        },
-                        onMoveSuggestion: { offset in
-                            let suggestions = state.slashCommandSuggestions
-                            guard !suggestions.isEmpty else {
-                                return false
-                            }
-                            let nextIndex = (
-                                selectedSlashCommandIndex + suggestions.count + offset
-                            ) % suggestions.count
-                            selectedSlashCommandIndex = nextIndex
-                            slashCommandScrollRequest = SlashCommandScrollRequest(
-                                commandName: suggestions[nextIndex].name
-                            )
-                            return true
-                        }
-                    )
-
-                    if state.draft.isEmpty {
-                        Text("问点什么")
-                            .font(.system(size: chatMessageFontSize))
-                            .foregroundStyle(.tertiary)
-                            .padding(.leading, 6)
-                            .padding(.top, 10)
-                            .allowsHitTesting(false)
-                    }
-                }
-                .frame(minWidth: 120)
-                .frame(height: state.inputEditorHeight)
-                .layoutPriority(1)
-
-                Divider()
-                    .frame(height: 18)
-
-                Button {
-                    modelMenuPresented.toggle()
-                } label: {
-                    HStack(spacing: 4) {
-                        if state.runtimeStarting {
-                            ProgressView()
-                                .controlSize(.mini)
-                        }
-                        Text(state.selectedModel.map { model in
-                            state.supportsThinking
-                                ? "\(model.name) · \(state.thinkingLevel.title)"
-                                : model.name
-                        } ?? "选择模型")
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .layoutPriority(1)
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 9, weight: .semibold))
-                            .fixedSize()
-                    }
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
+                promptEditorArea
                     .padding(.horizontal, 8)
-                    .frame(width: 140, height: 30)
-                }
-                .buttonStyle(.plain)
-                .frame(width: 140)
-                .disabled(
-                    !state.runtimeReady
-                        || state.hasRunningSessions
-                        || state.sessionChanging
-                        || state.gitOperationRunning
-                )
-                .help(
-                    state.selectedModel.map {
-                        state.supportsThinking
-                            ? "\($0.providerName) · \($0.name) · 推理强度：\(state.thinkingLevel.title)"
-                            : "\($0.providerName) · \($0.name)"
-                    }
-                        ?? "选择模型"
-                )
-                .popover(
-                    isPresented: $modelMenuPresented,
-                    attachmentAnchor: .rect(.bounds),
-                    arrowEdge: .top
-                ) {
-                    modelMenu
-                }
 
-                if state.isAnswering
-                    && !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    HStack(spacing: 6) {
-                        Button {
-                            Task { await state.send(steering: true) }
-                        } label: {
-                            Label("插队", systemImage: "arrowshape.turn.up.right.fill")
-                                .font(.caption.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.plain)
-                        .frame(width: 60, height: 30)
-                        .foregroundStyle(.orange)
-                        .disabled(state.promptSubmissionRunning)
-                        .help("在当前工具调用结束后优先发送")
-
-                        Button {
-                            Task { await state.send() }
-                        } label: {
-                            Label("排队", systemImage: "clock")
-                                .font(.caption.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.plain)
-                        .frame(width: 60, height: 30)
-                        .foregroundStyle(Color.accentColor)
-                        .disabled(state.promptSubmissionRunning)
-                        .help("当前回答完成后发送")
-                    }
-                    .fixedSize(horizontal: true, vertical: false)
-                } else {
-                    Button {
-                        if state.isAnswering {
-                            Task { await state.abort() }
-                        } else {
-                            Task { await state.send() }
-                        }
-                    } label: {
-                        if state.promptSubmissionRunning || state.extensionCommandRunning {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else if state.isAnswering {
-                            Image(systemName: "stop.circle.fill")
-                                .font(.system(size: 20))
-                        } else {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .font(.system(size: 20))
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .frame(width: 30, height: 30)
-                    .foregroundStyle(state.isAnswering ? Color.red : Color.accentColor)
-                    .disabled(
-                        !state.runtimeReady
-                            || state.promptSubmissionRunning
-                            || state.sessionChanging
-                            || state.gitOperationRunning
-                            || (!state.isAnswering
-                                && (state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                    || state.isBusy))
-                    )
-                    .help(state.isAnswering ? "停止回答" : "发送")
-                }
-
-            }
-                .padding(.horizontal, 8)
-                .frame(minHeight: 44)
+                composerToolbar
+                    .padding(.horizontal, 8)
+                    .frame(height: 38)
             }
             .background(
                 Color.quickPiControlBackground,
@@ -717,14 +540,12 @@ struct ChatView: View {
             )
             .overlay {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(
-                        promptFocused ? Color.accentColor.opacity(0.5) : Color.primary.opacity(0.12),
-                        lineWidth: promptFocused ? 1.5 : 1
-                    )
+                    .stroke(Color.primary.opacity(0.12), lineWidth: 1)
             }
-            .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .frame(maxWidth: state.showsResultPanel ? 680 : .infinity)
+            .containerRelativeFrame(.horizontal) { availableWidth, _ in
+                availableWidth * (state.showsResultPanel ? 0.85 : 0.98)
+            }
             .frame(maxWidth: .infinity, alignment: .center)
 
             ForEach(state.extensionWidgets.filter {
@@ -749,6 +570,262 @@ struct ChatView: View {
         .frame(height: state.inputEditorBarHeight)
     }
 
+    private var promptEditorArea: some View {
+        ZStack(alignment: .topLeading) {
+            PromptEditor(
+                text: Binding(
+                    get: { state.draft },
+                    set: { state.draft = $0 }
+                ),
+                isFocused: $promptFocused,
+                onHeightChange: state.setInputEditorHeight,
+                onPasteImages: { providers in
+                    Task { await state.addPastedImages(providers: providers) }
+                },
+                onSubmit: {
+                    let suggestions = state.slashCommandSuggestions
+                    if suggestions.isEmpty || state.draftMatchesSlashCommand {
+                        Task { await state.send() }
+                    } else {
+                        selectSlashCommand(
+                            suggestions[min(selectedSlashCommandIndex, suggestions.count - 1)]
+                        )
+                    }
+                },
+                onMoveSuggestion: { offset in
+                    let suggestions = state.slashCommandSuggestions
+                    guard !suggestions.isEmpty else {
+                        return false
+                    }
+                    let nextIndex = (
+                        selectedSlashCommandIndex + suggestions.count + offset
+                    ) % suggestions.count
+                    selectedSlashCommandIndex = nextIndex
+                    slashCommandScrollRequest = SlashCommandScrollRequest(
+                        commandName: suggestions[nextIndex].name
+                    )
+                    return true
+                }
+            )
+
+            if state.draft.isEmpty {
+                Text(state.conversationAnswers.isEmpty ? "问点什么" : "继续提出修改")
+                    .font(.system(size: chatMessageFontSize))
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 6)
+                    .padding(.top, 10)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(minWidth: 120)
+        .frame(height: state.inputEditorHeight)
+        .layoutPriority(1)
+    }
+
+    private var composerToolbar: some View {
+        HStack(spacing: 8) {
+            Button {
+                chooseAttachments()
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 15, weight: .medium))
+            }
+            .buttonStyle(.plain)
+            .frame(width: 30, height: 30)
+            .foregroundStyle(.secondary)
+            .help("添加附件")
+
+            Menu {
+                Button {
+                    setOperationApprovalEnabled(true)
+                } label: {
+                    Label(
+                        "需要审批",
+                        systemImage: state.settings.operationApproval.enabled
+                            ? "checkmark"
+                            : "checkmark.shield"
+                    )
+                }
+                Button {
+                    setOperationApprovalEnabled(false)
+                } label: {
+                    Label(
+                        "完全访问",
+                        systemImage: state.settings.operationApproval.enabled
+                            ? "exclamationmark.shield"
+                            : "checkmark"
+                    )
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: state.settings.operationApproval.enabled
+                        ? "checkmark.shield"
+                        : "exclamationmark.shield")
+                    Text(state.settings.operationApproval.enabled ? "需要审批" : "完全访问")
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .font(.system(size: QuickPiTypography.controlSize, weight: .semibold))
+                .padding(.horizontal, 4)
+                .frame(height: 30)
+                .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .foregroundStyle(state.settings.operationApproval.enabled ? Color.orange : Color.red)
+            .disabled(
+                state.hasRunningSessions
+                    || state.runtimeStarting
+                    || state.sessionChanging
+                    || state.gitOperationRunning
+            )
+            .help(
+                state.settings.operationApproval.enabled
+                    ? "当前需要审批，点击切换访问权限"
+                    : "当前为完全访问，点击切换访问权限"
+            )
+
+            Spacer(minLength: 8)
+
+            modelPickerButton
+            submitControls
+        }
+    }
+
+    private func setOperationApprovalEnabled(_ enabled: Bool) {
+        var configuration = state.settings.operationApproval
+        guard configuration.enabled != enabled else {
+            return
+        }
+        configuration.enabled = enabled
+        do {
+            try state.saveOperationApprovalSettings(configuration)
+        } catch {
+            state.runtimeError = error.localizedDescription
+        }
+    }
+
+    private var modelPickerButton: some View {
+        Button {
+            modelMenuPresented.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                if state.runtimeStarting {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+                Text(state.selectedModel.map { model in
+                    state.supportsThinking
+                        ? "\(model.name) · \(state.thinkingLevel.title)"
+                        : model.name
+                } ?? "选择模型")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .layoutPriority(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .fixedSize()
+            }
+            .font(.system(size: QuickPiTypography.controlSize, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6)
+            .frame(width: 160, height: 30)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(width: 160)
+        .disabled(
+            !state.runtimeReady
+                || state.hasRunningSessions
+                || state.sessionChanging
+                || state.gitOperationRunning
+        )
+        .help(
+            state.selectedModel.map {
+                state.supportsThinking
+                    ? "\($0.providerName) · \($0.name) · 推理强度：\(state.thinkingLevel.title)"
+                    : "\($0.providerName) · \($0.name)"
+            }
+                ?? "选择模型"
+        )
+        .popover(
+            isPresented: $modelMenuPresented,
+            attachmentAnchor: .rect(.bounds),
+            arrowEdge: .top
+        ) {
+            modelMenu
+        }
+    }
+
+    @ViewBuilder
+    private var submitControls: some View {
+        if state.isAnswering
+            && !state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            HStack(spacing: 6) {
+                Button {
+                    Task { await state.send(steering: true) }
+                } label: {
+                    Label("插队", systemImage: "arrowshape.turn.up.right.fill")
+                        .font(.system(size: QuickPiTypography.controlSize, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.plain)
+                .frame(width: 60, height: 30)
+                .foregroundStyle(.orange)
+                .disabled(state.promptSubmissionRunning)
+                .help("在当前工具调用结束后优先发送")
+
+                Button {
+                    Task { await state.send() }
+                } label: {
+                    Label("排队", systemImage: "clock")
+                        .font(.system(size: QuickPiTypography.controlSize, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.plain)
+                .frame(width: 60, height: 30)
+                .foregroundStyle(Color.accentColor)
+                .disabled(state.promptSubmissionRunning)
+                .help("当前回答完成后发送")
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        } else {
+            Button {
+                if state.isAnswering {
+                    Task { await state.abort() }
+                } else {
+                    Task { await state.send() }
+                }
+            } label: {
+                if state.promptSubmissionRunning || state.extensionCommandRunning {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if state.isAnswering {
+                    Image(systemName: "stop.circle.fill")
+                        .font(.system(size: 22))
+                } else {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 22))
+                }
+            }
+            .buttonStyle(.plain)
+            .frame(width: 30, height: 30)
+            .foregroundStyle(state.isAnswering ? Color.red : Color.accentColor)
+            .disabled(
+                !state.runtimeReady
+                    || state.promptSubmissionRunning
+                    || state.sessionChanging
+                    || state.gitOperationRunning
+                    || (!state.isAnswering
+                        && (state.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || state.isBusy))
+            )
+            .help(state.isAnswering ? "停止回答" : "发送")
+        }
+    }
+
     private func inputAttachmentView(_ attachment: PendingAttachment) -> some View {
         HStack(spacing: 7) {
             switch attachment.content {
@@ -771,7 +848,7 @@ struct ChatView: View {
             }
 
             Text(attachment.name)
-                .font(.caption)
+                .font(.system(size: QuickPiTypography.metadataSize))
                 .lineLimit(2)
                 .frame(maxWidth: 116, alignment: .leading)
 
@@ -804,19 +881,23 @@ struct ChatView: View {
                             HStack(spacing: 12) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("/\(command.name)")
-                                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                        .font(.system(
+                                            size: QuickPiTypography.controlSize,
+                                            weight: .semibold,
+                                            design: .monospaced
+                                        ))
                                         .foregroundStyle(.primary)
                                         .lineLimit(1)
                                     if let description = command.description, !description.isEmpty {
                                         Text(description)
-                                            .font(.caption)
+                                            .font(.system(size: QuickPiTypography.metadataSize))
                                             .foregroundStyle(.secondary)
                                             .lineLimit(1)
                                     }
                                 }
                                 Spacer(minLength: 12)
                                 Text(command.source.title)
-                                    .font(.caption2.weight(.medium))
+                                    .font(.system(size: QuickPiTypography.metadataSize, weight: .medium))
                                     .foregroundStyle(.tertiary)
                             }
                             .padding(.horizontal, 10)
@@ -869,7 +950,7 @@ struct ChatView: View {
             ScrollView(.vertical) {
                 if state.modelOptions.isEmpty {
                     Text("未配置模型")
-                        .font(.caption)
+                        .font(.system(size: QuickPiTypography.metadataSize))
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, minHeight: 48)
                 } else {
@@ -882,24 +963,24 @@ struct ChatView: View {
                                 HStack(spacing: 8) {
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text(model.name)
-                                            .font(.system(size: 14, weight: .medium))
+                                            .font(.system(size: QuickPiTypography.controlSize, weight: .medium))
                                             .foregroundStyle(.primary)
                                             .lineLimit(1)
                                         Text(model.providerName)
-                                            .font(.caption2)
+                                            .font(.system(size: QuickPiTypography.metadataSize))
                                             .foregroundStyle(.secondary)
                                             .lineLimit(1)
                                     }
                                     Spacer(minLength: 8)
                                     if model.supportsReasoning {
                                         Image(systemName: "brain")
-                                            .font(.caption)
+                                            .font(.system(size: QuickPiTypography.metadataSize))
                                             .foregroundStyle(.secondary)
                                             .help("支持推理强度")
                                     }
                                     if state.settings.selectedModel == model.selection {
                                         Image(systemName: "checkmark")
-                                            .font(.caption.weight(.semibold))
+                                            .font(.system(size: QuickPiTypography.metadataSize, weight: .semibold))
                                             .foregroundStyle(Color.accentColor)
                                     }
                                 }
@@ -921,7 +1002,7 @@ struct ChatView: View {
                 Divider()
                 HStack(spacing: 10) {
                     Label("推理强度", systemImage: "brain")
-                        .font(.caption)
+                        .font(.system(size: QuickPiTypography.metadataSize))
                         .foregroundStyle(.secondary)
                     Spacer()
                     Picker("推理强度", selection: Binding(
@@ -995,7 +1076,7 @@ struct ChatView: View {
                     Image(systemName: "chevron.down")
                         .font(.system(size: 9, weight: .semibold))
                 }
-                .font(.caption.weight(.medium))
+                .font(.system(size: QuickPiTypography.topBarSize, weight: .medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 9)
                 .frame(width: 116, height: 28, alignment: .leading)
@@ -1021,7 +1102,7 @@ struct ChatView: View {
                     Image(systemName: "chevron.down")
                         .font(.system(size: 9, weight: .semibold))
                 }
-                .font(.caption.weight(.medium))
+                .font(.system(size: QuickPiTypography.topBarSize, weight: .medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 9)
                 .frame(width: 116, height: 28, alignment: .leading)
@@ -1039,7 +1120,7 @@ struct ChatView: View {
                 VStack(spacing: 0) {
                     if state.sessions.isEmpty {
                         Text("暂无会话")
-                            .font(.caption)
+                            .font(.system(size: QuickPiTypography.metadataSize))
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, minHeight: 44)
                     } else {
@@ -1072,7 +1153,7 @@ struct ChatView: View {
                                                         .lineLimit(1)
                                                     if let worktree = state.worktreeLabel(for: session) {
                                                         Label(worktree, systemImage: "arrow.triangle.branch")
-                                                            .font(.caption2)
+                                                            .font(.system(size: QuickPiTypography.metadataSize))
                                                             .foregroundStyle(.secondary)
                                                             .lineLimit(1)
                                                     }
@@ -1145,7 +1226,7 @@ struct ChatView: View {
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(.secondary)
                     }
-                    .font(.caption.weight(.medium))
+                    .font(.system(size: QuickPiTypography.topBarSize, weight: .medium))
                     .padding(.horizontal, 9)
                     .frame(width: 104, height: 28, alignment: .leading)
                     .background(
@@ -1164,7 +1245,7 @@ struct ChatView: View {
                             Spacer()
                             PlanStatusTextView(status: planStatus)
                         }
-                        .font(.caption.weight(.medium))
+                        .font(.system(size: QuickPiTypography.metadataSize, weight: .medium))
                         .padding(.horizontal, 12)
                         .frame(height: 40)
 
@@ -1193,7 +1274,7 @@ struct ChatView: View {
                             .frame(height: min(CGFloat(planWidget.lines.count) * 36 + 24, 360))
                         } else {
                             Text("尚无执行进度")
-                                .font(.caption)
+                                .font(.system(size: QuickPiTypography.metadataSize))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, minHeight: 52)
                         }
@@ -1208,7 +1289,7 @@ struct ChatView: View {
             if !extensionStatuses.isEmpty {
                 let statusText = extensionStatuses.map(\.text).joined(separator: " · ")
                 Label(statusText, systemImage: "puzzlepiece.extension")
-                    .font(.caption)
+                    .font(.system(size: QuickPiTypography.topBarSize))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .frame(maxWidth: 160, alignment: .leading)
@@ -1238,7 +1319,7 @@ struct ChatView: View {
                     Image(systemName: "chevron.down")
                         .font(.system(size: 9, weight: .semibold))
                 }
-                .font(.caption.weight(.medium))
+                .font(.system(size: QuickPiTypography.topBarSize, weight: .medium))
                 .padding(.horizontal, 8)
                 .frame(width: 104, height: 28, alignment: .leading)
                 .background(
@@ -1282,7 +1363,7 @@ struct ChatView: View {
                     Image(systemName: "plus")
                     Text("新建会话")
                 }
-                .font(.caption.weight(.medium))
+                .font(.system(size: QuickPiTypography.topBarSize, weight: .medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 10)
                 .frame(width: 96, height: 30)
@@ -1376,13 +1457,13 @@ struct ChatView: View {
 
                                             if let retry = answer.retryMessage {
                                                 Label(retry, systemImage: "arrow.clockwise")
-                                                    .font(.caption)
+                                                    .font(.system(size: QuickPiTypography.metadataSize))
                                                     .foregroundStyle(.orange)
                                                     .textSelection(.enabled)
                                             }
                                             if let error = answer.error {
                                                 Label(error, systemImage: "exclamationmark.circle")
-                                                    .font(.caption)
+                                                    .font(.system(size: QuickPiTypography.metadataSize))
                                                     .foregroundStyle(.red)
                                                     .textSelection(.enabled)
                                             } else if answer.status == .stopped {
@@ -1473,7 +1554,7 @@ struct ChatView: View {
 
                                 if let runtimeError = state.runtimeError {
                                     Label(runtimeError, systemImage: "exclamationmark.triangle")
-                                        .font(.caption)
+                                        .font(.system(size: QuickPiTypography.metadataSize))
                                         .foregroundStyle(.red)
                                         .textSelection(.enabled)
                                 }
@@ -1566,7 +1647,7 @@ struct ChatView: View {
                         messageAttachmentsView(message.attachments)
                     } else if !message.attachmentNames.isEmpty {
                         Label(message.attachmentNames.joined(separator: " · "), systemImage: "paperclip")
-                            .font(.caption)
+                            .font(.system(size: QuickPiTypography.metadataSize))
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -1591,7 +1672,7 @@ struct ChatView: View {
                             ? "arrowshape.turn.up.right.fill"
                             : "clock"
                     )
-                    .font(.caption)
+                    .font(.system(size: QuickPiTypography.metadataSize))
                     .foregroundStyle(message.isSteering ? Color.orange : Color.secondary)
 
                     if isEditing {
@@ -1682,7 +1763,7 @@ struct ChatView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                     }
                     Text(attachment.name)
-                        .font(.caption2)
+                        .font(.system(size: QuickPiTypography.metadataSize))
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                         .frame(width: 72, alignment: .leading)
@@ -2053,7 +2134,7 @@ struct GitActionsView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(state.activeWorkingDirectoryURL.lastPathComponent)
-                    .font(.system(size: QuickPiTypography.settingsSize, weight: .semibold))
+                    .font(.system(size: QuickPiTypography.titleSize, weight: .semibold))
                     .lineLimit(1)
 
                 HStack(spacing: 6) {
@@ -3040,7 +3121,7 @@ private struct SystemStatusView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .font(.caption2.weight(.medium))
+            .font(.system(size: QuickPiTypography.topBarSize, weight: .medium))
             .monospacedDigit()
             .lineLimit(1)
             .padding(.horizontal, 8)
@@ -3064,7 +3145,7 @@ private struct SystemStatusView: View {
         .popover(isPresented: $detailsPresented, arrowEdge: .top) {
             VStack(alignment: .leading, spacing: 12) {
                 Label("系统状态", systemImage: "gauge")
-                    .font(.headline)
+                    .font(.system(size: QuickPiTypography.titleSize, weight: .semibold))
 
                 if let snapshot = monitor.snapshot {
                     let uptimeMinutes = Int(snapshot.uptime / 60)
@@ -3160,7 +3241,7 @@ private struct SystemStatusView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .font(.caption)
+            .font(.system(size: QuickPiTypography.metadataSize))
             .monospacedDigit()
             .padding(16)
             .frame(width: 360)
@@ -3236,7 +3317,7 @@ private struct QuestionnairePromptView: View {
     private var header: some View {
         HStack(alignment: .top, spacing: 20) {
             Text(question.prompt)
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: QuickPiTypography.titleSize, weight: .semibold))
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -3249,7 +3330,7 @@ private struct QuestionnairePromptView: View {
                     move(to: questionIndex - 1)
                 }
                 Text("\(questionIndex + 1) of \(questions.count)")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: QuickPiTypography.controlSize, weight: .medium))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
                     .frame(minWidth: 44)
@@ -3317,7 +3398,7 @@ private struct QuestionnairePromptView: View {
                             .frame(width: 34, height: 34)
                             .background(Color.primary.opacity(0.05), in: Circle())
                         Text(customAnswerLabel)
-                            .font(.system(size: 14, weight: .medium))
+                            .font(.system(size: QuickPiTypography.controlSize, weight: .medium))
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         Image(systemName: "chevron.right")
@@ -3457,7 +3538,7 @@ private struct ExtensionPromptView: View {
     private var inputPrompt: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(prompt.title)
-                .font(.headline)
+                .font(.system(size: QuickPiTypography.titleSize, weight: .semibold))
 
             if let message = prompt.message {
                 Text(message)
@@ -3466,7 +3547,7 @@ private struct ExtensionPromptView: View {
 
             if prompt.method == "editor" {
                 TextEditor(text: $value)
-                    .font(.system(.body, design: .monospaced))
+                    .font(.system(size: QuickPiTypography.codeSize, design: .monospaced))
                     .padding(6)
                     .background(
                         .primary.opacity(0.04),
@@ -3588,7 +3669,7 @@ private struct AnswerSectionView: View {
                     EmptyView()
                 case .invalid:
                     Label("插件提供的 details.qrUrl 无效", systemImage: "exclamationmark.triangle")
-                        .font(.caption)
+                        .font(.system(size: QuickPiTypography.metadataSize))
                         .foregroundStyle(.red)
                 case .url(let qrURL):
                     let qrImage: CGImage? = {
@@ -3617,14 +3698,14 @@ private struct AnswerSectionView: View {
                             .accessibilityLabel("登录二维码")
                     } else {
                         Label("无法生成二维码", systemImage: "exclamationmark.triangle")
-                            .font(.caption)
+                            .font(.system(size: QuickPiTypography.metadataSize))
                             .foregroundStyle(.red)
                     }
 
                     Link(destination: qrURL) {
                         Label("打开备用地址", systemImage: "arrow.up.right.square")
                     }
-                    .font(.caption)
+                    .font(.system(size: QuickPiTypography.metadataSize))
                 }
                 if let details = message.details {
                     DisclosureGroup {
@@ -3635,7 +3716,7 @@ private struct AnswerSectionView: View {
                             .textSelection(.enabled)
                     } label: {
                         Text("插件详情")
-                            .font(.caption.weight(.medium))
+                            .font(.system(size: QuickPiTypography.metadataSize, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -3943,12 +4024,12 @@ private struct ToolActivityView: View {
             if isExpanded {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("输入")
-                        .font(.caption.weight(.semibold))
+                        .font(.system(size: QuickPiTypography.metadataSize, weight: .semibold))
                         .foregroundStyle(.secondary)
                     monospaced(tool.input)
                     if !tool.output.isEmpty {
                         Text("输出")
-                            .font(.caption.weight(.semibold))
+                            .font(.system(size: QuickPiTypography.metadataSize, weight: .semibold))
                             .foregroundStyle(.secondary)
                         monospaced(tool.output)
                     }
@@ -3993,7 +4074,7 @@ private let planMarkdownTheme = Theme()
     }
     .code {
         FontFamilyVariant(.monospaced)
-        FontSize(.em(0.92))
+        FontSize(QuickPiTypography.codeSize)
         BackgroundColor(Color.primary.opacity(0.055))
     }
     .strong {
@@ -4133,11 +4214,11 @@ private extension ExtensionRichText {
 private let answerMarkdownTheme = Theme()
     .text {
         ForegroundColor(Color.primary.opacity(0.92))
-        FontSize(chatMessageFontSize)
+        FontSize(QuickPiTypography.bodySize)
     }
     .code {
         FontFamilyVariant(.monospaced)
-        FontSize(.em(0.88))
+        FontSize(QuickPiTypography.codeSize)
         ForegroundColor(Color.primary.opacity(0.88))
         BackgroundColor(Color.primary.opacity(0.055))
     }
@@ -4153,7 +4234,7 @@ private let answerMarkdownTheme = Theme()
             .markdownMargin(top: 18, bottom: 8)
             .markdownTextStyle {
                 FontWeight(.semibold)
-                FontSize(.em(1.35))
+                FontSize(QuickPiTypography.titleSize)
             }
     }
     .heading2 { configuration in
@@ -4162,7 +4243,7 @@ private let answerMarkdownTheme = Theme()
             .markdownMargin(top: 16, bottom: 8)
             .markdownTextStyle {
                 FontWeight(.semibold)
-                FontSize(.em(1.2))
+                FontSize(QuickPiTypography.titleSize)
             }
     }
     .heading3 { configuration in
@@ -4171,7 +4252,7 @@ private let answerMarkdownTheme = Theme()
             .markdownMargin(top: 14, bottom: 6)
             .markdownTextStyle {
                 FontWeight(.semibold)
-                FontSize(.em(1.08))
+                FontSize(QuickPiTypography.titleSize)
             }
     }
     .heading4 { configuration in
@@ -4179,7 +4260,7 @@ private let answerMarkdownTheme = Theme()
             .markdownMargin(top: 12, bottom: 6)
             .markdownTextStyle {
                 FontWeight(.semibold)
-                FontSize(.em(1))
+                FontSize(QuickPiTypography.titleSize)
             }
     }
     .heading5 { configuration in
@@ -4187,7 +4268,7 @@ private let answerMarkdownTheme = Theme()
             .markdownMargin(top: 12, bottom: 6)
             .markdownTextStyle {
                 FontWeight(.semibold)
-                FontSize(.em(0.95))
+                FontSize(QuickPiTypography.titleSize)
                 ForegroundColor(.secondary)
             }
     }
@@ -4196,7 +4277,7 @@ private let answerMarkdownTheme = Theme()
             .markdownMargin(top: 12, bottom: 6)
             .markdownTextStyle {
                 FontWeight(.semibold)
-                FontSize(.em(0.9))
+                FontSize(QuickPiTypography.titleSize)
                 ForegroundColor(.secondary)
             }
     }
@@ -4244,7 +4325,11 @@ private let answerMarkdownTheme = Theme()
         VStack(alignment: .leading, spacing: 0) {
             if let language = configuration.language {
                 Text(language)
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .font(.system(
+                        size: QuickPiTypography.metadataSize,
+                        weight: .medium,
+                        design: .monospaced
+                    ))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .padding(.horizontal, 12)
@@ -4256,7 +4341,7 @@ private let answerMarkdownTheme = Theme()
                     .relativeLineSpacing(.em(0.24))
                     .markdownTextStyle {
                         FontFamilyVariant(.monospaced)
-                        FontSize(.em(0.86))
+                        FontSize(QuickPiTypography.codeSize)
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)

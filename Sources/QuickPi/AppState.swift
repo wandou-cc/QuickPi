@@ -109,6 +109,7 @@ final class AppState: ObservableObject {
     private var pendingRuntimeEvents: [ObjectIdentifier: [PiRuntimeEvent]] = [:]
     private var runtimeGeneration = 0
     private var gitStatusGeneration = 0
+    private var activeGitStatusWorkspacePath: String?
     private var pendingRuntimeUpdates: [String: [PendingRuntimeUpdate]] = [:]
     private var pendingRuntimeUpdateTasks: [String: Task<Void, Never>] = [:]
 
@@ -420,13 +421,13 @@ final class AppState: ObservableObject {
         sessionExecutions[id]?.unreadCompletion ?? false
     }
 
-    // Matches the SwiftUI bands used by the input bar so AppKit can resize without clipping content.
+    // Matches the SwiftUI bands used by the two-row composer so AppKit never clips its toolbar.
     var inputBarHeight: CGFloat {
         inputEditorBarHeight + 38
     }
 
     var inputEditorBarHeight: CGFloat {
-        var height = inputEditorHeight + 20
+        var height = inputEditorHeight + 58
         if !attachments.isEmpty {
             height += 52
         }
@@ -2141,19 +2142,24 @@ final class AppState: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
-    // Refreshes the branch and change summary for the active session without retaining stale results.
+    // Refreshes the branch and change summary without clearing a still-valid summary mid-refresh.
     func refreshGitStatus() async {
         gitStatusGeneration &+= 1
         let generation = gitStatusGeneration
         guard activeSessionID != nil else {
             activeGitStatus = nil
+            activeGitStatusWorkspacePath = nil
             activeGitStatusError = "当前没有活动会话"
             activeGitStatusLoading = false
+            notifyPanel()
             return
         }
 
         let workspaceURL = activeWorkingDirectoryURL
-        activeGitStatus = nil
+        if activeGitStatusWorkspacePath != workspaceURL.path {
+            activeGitStatus = nil
+            activeGitStatusWorkspacePath = nil
+        }
         activeGitStatusError = nil
         activeGitStatusLoading = true
         do {
@@ -2163,17 +2169,21 @@ final class AppState: ObservableObject {
                 return
             }
             activeGitStatus = status
+            activeGitStatusWorkspacePath = workspaceURL.path
         } catch {
             guard generation == gitStatusGeneration,
                   workspaceURL.path == activeWorkingDirectoryURL.path else {
                 return
             }
+            activeGitStatus = nil
+            activeGitStatusWorkspacePath = nil
             activeGitStatusError = error.localizedDescription
         }
         guard generation == gitStatusGeneration else {
             return
         }
         activeGitStatusLoading = false
+        notifyPanel()
     }
 
     // Lists local branches from the active session's exact working directory.
@@ -3300,6 +3310,9 @@ final class AppState: ObservableObject {
                 status: isError ? .failed : .completed,
                 sessionID: sessionID
             )
+            if !isError, sessionID == activeSessionID {
+                Task { await refreshGitStatus() }
+            }
         case let .assistantMetadata(provider, model, usage, stopReason):
             updateSession(sessionID) { execution in
                 execution.answer?.provider = provider
